@@ -402,8 +402,6 @@ def stream_procmon_events(file_path: str, compression: Optional[str]) -> Iterato
     """
     global LOADED_PROCESSES # Access the globally loaded processes
     if LOADED_PROCESSES is None:
-        # Attempt to load processes if not already loaded? Or just fail?
-        # For simplicity, assume load_and_validate_file was called successfully before.
         raise RuntimeError("Process list was not loaded before streaming events.")
 
     open_func: Any = open
@@ -415,22 +413,7 @@ def stream_procmon_events(file_path: str, compression: Optional[str]) -> Iterato
     logger.info(f"Streaming events from{comp_str} XML file: {file_path}")
 
     try:
-        # --- Potential Integration Point for aiofiles ---
-        # Replace open_func with aiofiles.open and use async iteration if parser supports it
-        # Example (conceptual):
-        # async with aiofiles.open(file_path, mode="rb") as f_stream:
-        #    async for event in async_xml_parser(f_stream, LOADED_PROCESSES):
-        #        yield event, LOADED_PROCESSES
-        # This requires an async-compatible XML iterparse implementation.
-        # Stick with synchronous I/O for now.
         with open_func(file_path, "rb") as f_stream:
-            # We need to re-parse the file to get the event iterator,
-            # but this time we pass the *already loaded* processes.
-            # The _parse_xml_stream function will skip process parsing if processlist_parsed is True.
-            # However, the current _parse_xml_stream always reparses processes first.
-            # Let's simplify: create a dedicated event streaming function.
-
-            # --- Dedicated Event Streamer ---
             event_iterator, _ = _parse_xml_stream(f_stream, parse_events=True)
             if event_iterator is None:
                  logger.error("Failed to get event iterator from _parse_xml_stream for streaming.")
@@ -438,7 +421,7 @@ def stream_procmon_events(file_path: str, compression: Optional[str]) -> Iterato
 
             # Yield each event along with the *globally loaded* processes_dict
             for event in event_iterator:
-                yield event, LOADED_PROCESSES # Use the globally stored processes
+                yield event, LOADED_PROCESSES
 
     except FileNotFoundError:
         logger.error(f"File not found during streaming: {file_path}")
@@ -739,6 +722,7 @@ async def query_events(
         filtered_event_summaries = []
         count = 0
         processed_count = 0
+        start_time = time.time() # For progress reporting timing
 
         # --- Pre-compile Regex and Parse Times ---
         path_regex = re.compile(filter_path_regex) if filter_path_regex else None
@@ -770,10 +754,20 @@ async def query_events(
         filter_stack_module_path_lower = filter_stack_module_path.lower() if filter_stack_module_path else None
 
         # --- Stream and Filter ---
+        stream_interrupted = False
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             processed_count += 1
+            # --- Progress Reporting ---
             if processed_count % PROGRESS_REPORT_INTERVAL == 0:
-                 await ctx.info(f" Query scanned {processed_count} events...")
+                try:
+                    elapsed = time.time() - start_time
+                    await ctx.info(f" Query scanned {processed_count} events... ({elapsed:.1f}s)")
+                except Exception as progress_err:
+                     # Log error but continue processing if possible
+                     logger.warning(f"Failed to send progress update: {progress_err}")
+                     # Potentially stop if connection seems permanently lost?
+                     # For now, just log and continue. The final result send might fail.
+                     # stream_interrupted = True # Flag could be used to stop early
 
             if count >= limit:
                 logger.debug(f"Query limit ({limit}) reached during streaming.")
@@ -860,9 +854,16 @@ async def query_events(
         await ctx.error(f"Invalid Regex pattern provided: {e}")
         raise ValueError(f"Invalid regex pattern: {e}") from e
     except Exception as e:
+        # Catch potential errors during streaming or sending final result
+        logger.error(f"Error during query_events execution: {e}", exc_info=True)
         await ctx.error(f"Failed to query XML file {LOADED_FILENAME} via streaming: {e}")
-        logger.debug("Exception details:", exc_info=True)
-        raise RuntimeError(f"Internal error querying XML file via streaming: {e}")
+        # Don't raise here, allow potential partial results or just log
+        # Re-raise if it's critical like file not found during stream
+        if isinstance(e, (FileNotFoundError, PermissionError, RuntimeError)):
+             raise
+        else: # For other errors, return potentially partial results if any
+             return filtered_event_summaries
+
 
 @tool_decorator
 async def get_event_details(sequence_number: int, ctx: Context) -> Dict[str, Any]:
@@ -891,6 +892,7 @@ async def get_event_details(sequence_number: int, ctx: Context) -> Dict[str, Any
         await ctx.info(f"Streaming file {LOADED_FILENAME} to find sequence number {sequence_number}...")
         start_stream_time = time.time()
         processed_count = 0
+        stream_interrupted = False
 
         # Stream events to find the matching sequence number
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
@@ -902,8 +904,12 @@ async def get_event_details(sequence_number: int, ctx: Context) -> Dict[str, Any
                 break # Stop streaming once found
             # Log progress occasionally for long searches
             if processed_count % PROGRESS_REPORT_INTERVAL == 0:
-                 await ctx.info(f" Scanned {processed_count} events...")
-
+                try:
+                    elapsed = time.time() - start_stream_time
+                    await ctx.info(f" Scanned {processed_count} events... ({elapsed:.1f}s)")
+                except Exception as progress_err:
+                    logger.warning(f"Failed to send progress update while finding event {sequence_number}: {progress_err}")
+                    stream_interrupted = True # Flag potential issue
 
         end_stream_time = time.time()
         logger.info(f"Scan for sequence number {sequence_number} took {end_stream_time - start_stream_time:.2f} seconds, scanned {processed_count} events.")
@@ -972,6 +978,7 @@ async def get_event_stack_trace(sequence_number: int, ctx: Context) -> List[Dict
         await ctx.info(f"Streaming file {LOADED_FILENAME} to find sequence number {sequence_number} for stack trace...")
         start_stream_time = time.time()
         processed_count = 0
+        stream_interrupted = False
 
         # Stream events to find the matching sequence number
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
@@ -980,7 +987,13 @@ async def get_event_stack_trace(sequence_number: int, ctx: Context) -> List[Dict
             if event_seq_num is not None and event_seq_num == sequence_number:
                 found_event = event
                 break
-            if processed_count % PROGRESS_REPORT_INTERVAL == 0: await ctx.info(f" Scanned {processed_count} events...")
+            if processed_count % PROGRESS_REPORT_INTERVAL == 0:
+                try:
+                    elapsed = time.time() - start_stream_time
+                    await ctx.info(f" Scanned {processed_count} events... ({elapsed:.1f}s)")
+                except Exception as progress_err:
+                    logger.warning(f"Failed to send progress update while finding event {sequence_number}: {progress_err}")
+                    stream_interrupted = True
 
         end_stream_time = time.time()
         logger.info(f"Scan for sequence number {sequence_number} took {end_stream_time - start_stream_time:.2f} seconds, scanned {processed_count} events.")
@@ -1129,19 +1142,33 @@ async def count_events_by_process(ctx: Context) -> Dict[str, int]:
         event_counts = defaultdict(int)
         total_events = 0
         start_time = time.time()
+        stream_interrupted = False
 
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             total_events += 1
             process_name = safe_get_attributes(event, ['process_name']).get('process_name', 'Unknown') or 'Unknown'
             event_counts[process_name] += 1
             if total_events % PROGRESS_REPORT_INTERVAL == 0:
-                elapsed = time.time() - start_time
-                await ctx.info(f" Counted {total_events} events... ({elapsed:.1f}s)")
+                try:
+                    elapsed = time.time() - start_time
+                    await ctx.info(f" Counted {total_events} events... ({elapsed:.1f}s)")
+                except Exception as progress_err:
+                    logger.warning(f"Failed to send progress update during count: {progress_err}")
+                    stream_interrupted = True # Flag potential issue, maybe break early?
 
         elapsed = time.time() - start_time
         await ctx.info(f"Counted {total_events} total events for {len(event_counts)} processes in {LOADED_FILENAME} ({elapsed:.2f}s).")
         logger.debug(f"Event counts by process: {dict(event_counts)}")
-        return dict(event_counts)
+        # Only return result if stream wasn't likely interrupted during progress send
+        # Although the final send might still fail if connection dropped near the end
+        if not stream_interrupted:
+            return dict(event_counts)
+        else:
+            await ctx.warning("Operation completed, but progress updates failed. Client might have disconnected.")
+            # Decide whether to return potentially incomplete data or raise error
+            # Let's return the data we gathered.
+            return dict(event_counts)
+
     except Exception as e:
         await ctx.error(f"Failed to count events by process via streaming: {e}")
         logger.debug("Exception details:", exc_info=True)
@@ -1163,12 +1190,17 @@ async def summarize_operations_by_process(process_name_filter: str, ctx: Context
         event_count_for_process = 0
         total_events_scanned = 0
         start_time = time.time()
+        stream_interrupted = False
 
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             total_events_scanned += 1
             if total_events_scanned % PROGRESS_REPORT_INTERVAL == 0:
-                 elapsed = time.time() - start_time
-                 await ctx.info(f" Scanned {total_events_scanned} events for '{process_name_filter}'... ({elapsed:.1f}s)")
+                try:
+                    elapsed = time.time() - start_time
+                    await ctx.info(f" Scanned {total_events_scanned} events for '{process_name_filter}'... ({elapsed:.1f}s)")
+                except Exception as progress_err:
+                     logger.warning(f"Failed to send progress update during summarize: {progress_err}")
+                     stream_interrupted = True
 
             process_name = safe_get_attributes(event, ['process_name']).get('process_name', '') or ''
             if process_name == process_name_filter: # Case-sensitive match
@@ -1179,7 +1211,13 @@ async def summarize_operations_by_process(process_name_filter: str, ctx: Context
         elapsed = time.time() - start_time
         await ctx.info(f"Summarized {len(operation_counts)} ops for '{process_name_filter}' ({event_count_for_process} events found after scanning {total_events_scanned}) in {LOADED_FILENAME} ({elapsed:.2f}s).")
         if event_count_for_process == 0: await ctx.warning(f"No events found for process name '{process_name_filter}'.")
-        return dict(operation_counts)
+
+        if not stream_interrupted:
+             return dict(operation_counts)
+        else:
+             await ctx.warning("Operation completed, but progress updates failed. Client might have disconnected.")
+             return dict(operation_counts)
+
     except Exception as e:
         await ctx.error(f"Failed to summarize operations for '{process_name_filter}' via streaming: {e}")
         logger.debug("Exception details:", exc_info=True)
@@ -1201,6 +1239,7 @@ async def find_events_by_result(result_filter: str, limit: int = 50, *, ctx: Con
         count = 0
         processed_count = 0
         start_time = time.time()
+        stream_interrupted = False
 
         # Pre-process filter
         filter_result_lower_str=None; filter_result_int=None; is_hex_filter=False
@@ -1212,8 +1251,12 @@ async def find_events_by_result(result_filter: str, limit: int = 50, *, ctx: Con
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             processed_count += 1
             if processed_count % PROGRESS_REPORT_INTERVAL == 0:
-                 elapsed = time.time() - start_time
-                 await ctx.info(f" Scanned {processed_count} events for result '{result_filter}'... ({elapsed:.1f}s)")
+                try:
+                    elapsed = time.time() - start_time
+                    await ctx.info(f" Scanned {processed_count} events for result '{result_filter}'... ({elapsed:.1f}s)")
+                except Exception as progress_err:
+                     logger.warning(f"Failed to send progress update during find_by_result: {progress_err}")
+                     stream_interrupted = True
 
             if count >= limit: break # Stop after finding enough
 
@@ -1243,6 +1286,7 @@ async def find_events_by_result(result_filter: str, limit: int = 50, *, ctx: Con
 
         elapsed = time.time() - start_time
         await ctx.info(f"Found {len(filtered_event_summaries)} events matching result '{result_filter}' after scanning {processed_count} events ({elapsed:.2f}s).")
+        # Return results even if progress updates failed
         return filtered_event_summaries
     except Exception as e:
         await ctx.error(f"Failed to find events by result '{result_filter}' via streaming: {e}")
@@ -1332,12 +1376,17 @@ async def get_timing_statistics(
         stats = defaultdict(lambda: {'min': float('inf'), 'max': float('-inf'), 'sum': 0.0, 'count': 0})
         total_events = 0
         start_time = time.time()
+        stream_interrupted = False
 
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             total_events += 1
             if total_events % PROGRESS_REPORT_INTERVAL == 0:
-                elapsed = time.time() - start_time
-                await ctx.info(f" Processed {total_events} events for timing stats... ({elapsed:.1f}s)")
+                try:
+                    elapsed = time.time() - start_time
+                    await ctx.info(f" Processed {total_events} events for timing stats... ({elapsed:.1f}s)")
+                except Exception as progress_err:
+                    logger.warning(f"Failed to send progress update during timing stats: {progress_err}")
+                    stream_interrupted = True
 
             duration = safe_get_attributes(event, ['duration']).get('duration')
             if duration is None: # Skip events without valid duration
@@ -1373,7 +1422,12 @@ async def get_timing_statistics(
 
         elapsed = time.time() - start_time
         await ctx.info(f"Calculated timing statistics for {len(output_stats)} groups after processing {total_events} events ({elapsed:.2f}s).")
-        return output_stats
+
+        if not stream_interrupted:
+             return output_stats
+        else:
+             await ctx.warning("Operation completed, but progress updates failed. Client might have disconnected.")
+             return output_stats
 
     except Exception as e:
         await ctx.error(f"Failed to calculate timing statistics: {e}")
