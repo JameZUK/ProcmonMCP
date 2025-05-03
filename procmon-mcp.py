@@ -73,8 +73,6 @@ class StringInterner:
         self.str_to_id: Dict[str, int] = {}
         self.id_to_str: List[str] = []
         self.next_id: int = 0
-        # Add common values upfront? e.g., 'SUCCESS', 'Unknown'
-        # self.get_id('Unknown') # Example
 
     def get_id(self, s: Optional[str]) -> Optional[int]:
         """Gets the integer ID for a string, adding it if new. Returns None for None input."""
@@ -117,7 +115,6 @@ class StackFrame:
 
     def to_optimized_list(self, path_interner: StringInterner, location_interner: StringInterner) -> list:
         """Converts StackFrame to a more compact list representation for storage."""
-        # Example: [depth, address_str, path_id, location_id]
         return [
             self.depth,
             self.address, # Keep address as string
@@ -210,6 +207,64 @@ def _clear_elem(elem: ET_impl.Element):
                 else: break
             except (IndexError, AttributeError): break
 
+def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo]:
+    """
+    Parses only the <processlist> from the XML stream and returns the process dictionary.
+    Stops parsing after the </processlist> tag.
+    """
+    processes_dict: Dict[int, ProcessInfo] = {}
+    parsing_stage = "seeking_procmon"
+    tags_of_interest = ('process', 'processlist', 'procmon') # Only need process tags
+    try:
+        context = ET_impl.iterparse(source_stream, events=('end',), tag=tags_of_interest)
+    except Exception as e:
+        logger.error(f"Unexpected error initializing XML parser for process list: {e}", exc_info=True)
+        raise RuntimeError("Failed to initialize XML parser for process list") from e
+
+    try:
+        for event_type, elem in context:
+            if parsing_stage == "seeking_procmon":
+                 if elem.tag == 'procmon': # Found the end of the root, shouldn't happen first
+                     logger.warning("Found end of procmon before processlist.")
+                     break
+                 # Assume we are inside procmon if we get process or processlist
+                 parsing_stage = "seeking_processlist"
+
+            if parsing_stage == "seeking_processlist":
+                if elem.tag == 'process':
+                    parsing_stage = "parsing_processlist" # Fallthrough to parse
+                elif elem.tag == 'processlist':
+                     # Found end of processlist while seeking it? Means it was empty.
+                     logger.info("Found empty <processlist>.")
+                     _clear_elem(elem)
+                     break # Stop parsing processes
+
+            if parsing_stage == "parsing_processlist":
+                if elem.tag == 'process':
+                    try:
+                        proc_info = ProcessInfo.from_xml_element(elem)
+                        if proc_info.process_index is not None and proc_info.process_index >= 0:
+                            processes_dict[proc_info.process_index] = proc_info
+                        else: logger.warning(f"Parsed process element with invalid index.")
+                    except Exception as e: logger.warning(f"Failed to parse <process> element: {e}", exc_info=False)
+                    _clear_elem(elem)
+                elif elem.tag == 'processlist':
+                    # Finished parsing the process list normally
+                    logger.debug(f"Finished parsing <processlist> tag.")
+                    _clear_elem(elem)
+                    break # Stop parsing after processlist is done
+
+            # Stop if we somehow reach the end of the document early
+            if elem.tag == 'procmon':
+                 logger.warning("Reached end of <procmon> while parsing processes.")
+                 break
+
+    except ET_impl.XMLSyntaxError as e: logger.error(f"XML Parse Error during process parsing: {e}"); raise
+    except Exception as e: logger.error(f"Unexpected error during process parsing: {e}", exc_info=True); raise
+
+    return processes_dict
+
+
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -224,7 +279,6 @@ def _parse_xml_stream_for_loading(
         Optimized event dictionaries.
     """
     parsing_stage = "seeking_eventlist" # Start assuming processes are done
-    eventlist_entered = False
     tags_of_interest = ('event', 'eventlist', 'procmon') # Only need event-related tags now
     try:
         context = ET_impl.iterparse(source_stream, events=('end',), tag=tags_of_interest)
@@ -236,55 +290,66 @@ def _parse_xml_stream_for_loading(
     start_time = time.time()
     try:
         for event_type, elem in context:
-            if elem.tag == 'event':
-                try:
-                    # 1. Parse XML element into temporary ProcmonEvent object
-                    temp_event = ProcmonEvent.from_xml_element(elem, processes)
+            # Skip elements until we are inside the eventlist
+            if parsing_stage == "seeking_eventlist":
+                 if elem.tag == 'eventlist':
+                      logger.debug("Entered <eventlist> for event loading.")
+                      parsing_stage = "parsing_events"
+                      _clear_elem(elem) # Clear the eventlist tag itself
+                      continue # Move to next element
+                 elif elem.tag == 'procmon': # Reached end before finding eventlist
+                      logger.warning("Reached end of <procmon> before finding <eventlist>.")
+                      break
+                 # Ignore other tags like 'process' if they somehow appear here
+                 _clear_elem(elem)
+                 continue
 
-                    # 2. Convert ProcmonEvent to optimized dictionary using interners
-                    opt_event: Dict[str, Any] = {}
-                    # Store numerical fields directly
-                    opt_event['seq'] = temp_event.sequence_number # Use short key 'seq'
-                    opt_event['pid'] = temp_event.pid
-                    opt_event['tid'] = temp_event.tid
-                    opt_event['ppid'] = temp_event.parent_pid # Short key 'ppid'
-                    opt_event['dur'] = temp_event.duration # Short key 'dur'
-                    # Store timestamp as float (Unix timestamp, assumes UTC or consistent local)
-                    ts = temp_event.timestamp # Access property to parse
-                    opt_event['ts'] = ts.replace(tzinfo=timezone.utc).timestamp() if ts else None
+            if parsing_stage == "parsing_events":
+                if elem.tag == 'event':
+                    try:
+                        # 1. Parse XML element into temporary ProcmonEvent object
+                        # Pass processes dict for enrichment during parsing
+                        temp_event = ProcmonEvent.from_xml_element(elem, processes)
 
-                    # Store interned strings using IDs
-                    opt_event['op_id'] = interners['operation'].get_id(temp_event.operation)
-                    opt_event['path_id'] = interners['path'].get_id(temp_event.path)
-                    opt_event['res_id'] = interners['result'].get_id(temp_event.result)
-                    opt_event['cat_id'] = interners['category'].get_id(temp_event.category)
-                    opt_event['pname_id'] = interners['process_name'].get_id(temp_event.process_name)
-                    # Keep detail string for now, interning might not save much if unique
-                    opt_event['detail'] = temp_event.detail
+                        # 2. Convert ProcmonEvent to optimized dictionary using interners
+                        opt_event: Dict[str, Any] = {}
+                        opt_event['seq'] = temp_event.sequence_number
+                        opt_event['pid'] = temp_event.pid
+                        opt_event['tid'] = temp_event.tid
+                        opt_event['ppid'] = temp_event.parent_pid
+                        opt_event['dur'] = temp_event.duration
+                        ts = temp_event.timestamp # Access property to parse
+                        opt_event['ts'] = ts.replace(tzinfo=timezone.utc).timestamp() if ts else None
+                        opt_event['op_id'] = interners['operation'].get_id(temp_event.operation)
+                        opt_event['path_id'] = interners['path'].get_id(temp_event.path)
+                        opt_event['res_id'] = interners['result'].get_id(temp_event.result)
+                        opt_event['cat_id'] = interners['category'].get_id(temp_event.category)
+                        opt_event['pname_id'] = interners['process_name'].get_id(temp_event.process_name)
+                        opt_event['detail'] = temp_event.detail # Keep detail string
 
-                    # Store stack efficiently (list of lists: [depth, addr, path_id, loc_id])
-                    if temp_event.stack:
-                        opt_event['stack'] = [
-                            frame.to_optimized_list(interners['stack_path'], interners['stack_location'])
-                            for frame in temp_event.stack
-                        ]
-                    else:
-                        opt_event['stack'] = None
+                        if temp_event.stack:
+                            opt_event['stack'] = [
+                                frame.to_optimized_list(interners['stack_path'], interners['stack_location'])
+                                for frame in temp_event.stack
+                            ]
+                        else:
+                            opt_event['stack'] = None
 
-                    yield opt_event
-                    event_count += 1
-                    if event_count % PROGRESS_REPORT_INTERVAL == 0:
-                         elapsed = time.time() - start_time
-                         logger.info(f" Loaded {event_count} events... ({elapsed:.1f}s)")
+                        yield opt_event
+                        event_count += 1
+                        if event_count % PROGRESS_REPORT_INTERVAL == 0:
+                             elapsed = time.time() - start_time
+                             logger.info(f" Loaded {event_count} events... ({elapsed:.1f}s)")
 
-                except Exception as e: logger.warning(f"Failed to parse/convert <event> element: {e}", exc_info=False)
-                _clear_elem(elem) # Clear element after processing
-            elif elem.tag == 'eventlist':
-                logger.info(f"Finished processing <eventlist>.")
-                _clear_elem(elem)
-            elif elem.tag == 'procmon':
-                logger.debug("Reached end of <procmon> during event loading.")
-                break # Stop iteration
+                    except Exception as e: logger.warning(f"Failed to parse/convert <event> element: {e}", exc_info=False)
+                    _clear_elem(elem) # Clear event element after processing
+                elif elem.tag == 'eventlist':
+                    logger.info(f"Finished processing <eventlist>.")
+                    _clear_elem(elem)
+                    # Continue parsing until </procmon> in case of trailing elements
+                elif elem.tag == 'procmon':
+                    logger.debug("Reached end of <procmon> during event loading.")
+                    break # Stop iteration
 
         logger.info(f"Total events loaded and optimized: {event_count}")
 
@@ -390,8 +455,9 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
         # --- Pass 1: Parse Processes Only ---
         logger.info("Parsing process list...")
         with open_func(abs_full_path, "rb") as f_stream:
-             _, processes_dict = _parse_xml_stream(f_stream, parse_events=False)
-             if processes_dict is None: processes_dict = {}; logger.error("Failed to parse process dictionary.")
+             # Call the dedicated process parsing function
+             processes_dict = _parse_xml_processes_only(f_stream)
+             if processes_dict is None: processes_dict = {}; logger.error("Failed to parse process dictionary.") # Should not happen if func raises error
         logger.info(f"Finished parsing process list: {len(processes_dict)} processes found.")
 
         # --- Pass 2: Parse Events and Optimize ---
@@ -422,14 +488,19 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
     except FileNotFoundError as e: logger.error(f"File not found: {abs_full_path}"); raise
     except PermissionError as e: logger.error(f"Permission denied: {abs_full_path}"); raise
     except ET_impl.XMLSyntaxError as e: logger.error(f"XML Syntax Error in {filename_relative}: {e}", exc_info=True); raise RuntimeError(f"Invalid XML: {e}") from e
-    except (gzip.BadGzipFile, bz2.BZ2Error, lzma.LZMAError) as e: logger.error(f"Decompression error for {filename_relative}: {e}"); raise RuntimeError(f"Decompression failed: {e}") from e
+    # Corrected Exception Handling for Decompression
+    except (gzip.BadGzipFile, OSError, lzma.LZMAError) as e: # Catch OSError for bz2, keep others specific
+         logger.error(f"Decompression or I/O error for {filename_relative}: {e}")
+         # Check if it's specifically a bz2 error if needed, otherwise treat as general decompression/IO error
+         if isinstance(e, bz2.BZ2File) and 'Not a bzip2 file' in str(e): # Example check
+             raise RuntimeError(f"File '{filename_relative}' is not a valid BZ2 file.") from e
+         raise RuntimeError(f"Decompression or file read failed for '{filename_relative}'.") from e
     except Exception as e:
          logger.error(f"Error loading/optimizing file {filename_relative}: {e}", exc_info=True)
          LOADED_FILENAME = None; LOADED_FILE_TYPE = None; LOADED_COMPRESSION = None; LOADED_PROCESSES = None; LOADED_EVENTS = None; GLOBAL_INTERNERS = {}
          raise RuntimeError(f"Failed to load/optimize file: {e}") from e
 
 # --- Helper to Safely Get Attributes (Not needed for optimized dicts) ---
-# We will access dictionary keys directly in tools now.
 
 # --- Helper to get string from ID ---
 def get_string(interner_name: str, id_val: Optional[int]) -> Optional[str]:
@@ -558,11 +629,19 @@ async def query_events(
         # Time parsing
         try:
             if isinstance(filter_start_time, str):
-                start_ts = datetime.strptime(filter_start_time, PROCMON_TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+                # Parse only time part if no date is present
+                dt_obj = datetime.strptime(filter_start_time, PROCMON_TIMESTAMP_FORMAT)
+                start_ts = (dt_obj.hour * 3600 + dt_obj.minute * 60 + dt_obj.second + dt_obj.microsecond / 1e6)
+                # Note: This comparison assumes all events fall on the same day or uses relative time.
+                # For absolute timestamps, store full float timestamp in event_dict['ts']
+                logger.warning("Comparing only time part for string timestamp filters.")
             elif isinstance(filter_start_time, (int, float)):
                 start_ts = float(filter_start_time)
+
             if isinstance(filter_end_time, str):
-                end_ts = datetime.strptime(filter_end_time, PROCMON_TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+                dt_obj = datetime.strptime(filter_end_time, PROCMON_TIMESTAMP_FORMAT)
+                end_ts = (dt_obj.hour * 3600 + dt_obj.minute * 60 + dt_obj.second + dt_obj.microsecond / 1e6)
+                logger.warning("Comparing only time part for string timestamp filters.")
             elif isinstance(filter_end_time, (int, float)):
                 end_ts = float(filter_end_time)
         except ValueError as e:
@@ -574,11 +653,7 @@ async def query_events(
         operation_id_filter = get_id("operation", filter_operation) if filter_operation else None
         result_id_filter: Optional[int] = None
         if filter_result:
-             # Handle hex result filter before lookup
              if filter_result.lower().startswith("0x"):
-                  # Convert hex to string representation if needed, or handle numerically?
-                  # For simplicity, treat hex as a string variant for now.
-                  # A more robust solution might store results numerically if possible.
                   result_id_filter = get_id("result", filter_result) # Lookup hex string
              else:
                   result_id_filter = get_id("result", filter_result)
@@ -589,7 +664,17 @@ async def query_events(
         filter_stack_module_path_lower = filter_stack_module_path.lower() if filter_stack_module_path else None
 
         # --- Iterate and Filter In-Memory Data ---
+        processed_count = 0
         for idx, event_dict in enumerate(LOADED_EVENTS):
+            processed_count += 1
+            if processed_count % (PROGRESS_REPORT_INTERVAL * 2) == 0: # Report less often
+                 try:
+                     elapsed = time.time() - start_time
+                     await ctx.info(f" Query scanned {processed_count}/{len(LOADED_EVENTS)} events... ({elapsed:.1f}s)")
+                 except Exception as progress_err:
+                      logger.warning(f"Failed to send progress update during query: {progress_err}")
+
+
             if count >= limit: break
 
             match = True # Assume match
@@ -605,8 +690,15 @@ async def query_events(
                 event_ts = event_dict.get('ts')
                 if event_ts is None: match = False # Cannot compare
                 else:
-                    if start_ts and event_ts < start_ts: match = False
-                    if match and end_ts and event_ts > end_ts: match = False
+                    # Adjust comparison based on whether filter was time string or full timestamp
+                    current_event_time_val = event_ts
+                    if isinstance(filter_start_time, str) or isinstance(filter_end_time, str):
+                         # If filter was time string, compare only time part of event
+                         event_dt_obj = datetime.fromtimestamp(event_ts, timezone.utc)
+                         current_event_time_val = (event_dt_obj.hour * 3600 + event_dt_obj.minute * 60 + event_dt_obj.second + event_dt_obj.microsecond / 1e6)
+
+                    if start_ts and current_event_time_val < start_ts: match = False
+                    if match and end_ts and current_event_time_val > end_ts: match = False
 
             # Contains / Regex / Stack filters require converting IDs back to strings
             if match and (filter_path_contains_lower or filter_process_contains_lower or path_regex or process_regex or detail_regex or filter_stack_module_path_lower):
@@ -699,7 +791,9 @@ async def get_event_details(event_index: int, ctx: Context) -> Dict[str, Any]:
         details['parent_pid'] = event_dict.get('ppid')
         details['duration'] = event_dict.get('dur')
         details['detail'] = event_dict.get('detail')
-        details['timestamp'] = str(datetime.fromtimestamp(event_dict['ts'], timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT)) if event_dict.get('ts') else None
+        ts_float = event_dict.get('ts')
+        details['timestamp'] = str(datetime.fromtimestamp(ts_float, timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT)) if ts_float else None
+        details['timestamp_unix'] = ts_float # Also include raw timestamp
 
         # Convert IDs back to strings
         details['operation'] = get_string("operation", event_dict.get('op_id'))
@@ -708,18 +802,35 @@ async def get_event_details(event_index: int, ctx: Context) -> Dict[str, Any]:
         details['category'] = get_string("category", event_dict.get('cat_id'))
         details['process_name'] = get_string("process_name", event_dict.get('pname_id'))
 
-        # Add enriched process info (lookup based on PID might be needed if process_index wasn't stored)
-        # For now, assume basic process info is covered by the pname_id conversion above.
-        # A full process details summary would require looking up the process by PID in LOADED_PROCESSES.
-        details['process_details_summary'] = {"pid": details['pid'], "process_name": details['process_name']} # Simplified
+        # Add enriched process info by looking up process object via PID
+        process_obj: Optional[ProcessInfo] = None
+        if details['pid'] is not None:
+             # Find the process object (could be optimized if processes were dict keyed by PID)
+             for proc in LOADED_PROCESSES.values():
+                  if proc.pid == details['pid']:
+                       process_obj = proc
+                       break
+
+        if process_obj:
+             details['process_details_summary'] = {
+                  'pid': process_obj.pid, 'process_name': process_obj.process_name,
+                  'image_path': process_obj.image_path, 'parent_pid': process_obj.parent_pid,
+                  'command_line': process_obj.command_line, 'user_sid': process_obj.user_sid,
+                  'is_64bit_process': process_obj.is_64bit, 'integrity': process_obj.integrity,
+                  'owner': process_obj.owner, 'create_time': process_obj.create_time # Add more fields from ProcessInfo
+             }
+             details['user_sid'] = process_obj.user_sid # Ensure top-level field is populated
+             details['is_64bit_process'] = process_obj.is_64bit
+        else:
+             details['process_details_summary'] = {"pid": details['pid'], "process_name": details['process_name']} # Simplified
+             details['user_sid'] = None
+             details['is_64bit_process'] = None
+
 
         # Note: We don't store all original fields in the optimized dict (e.g., completion_time, relative_time)
-        # Add them back as None or retrieve if stored.
         details['completion_time'] = None
         details['relative_time'] = None
-        # Add other fields derived from process list if needed (requires lookup)
-        details['user_sid'] = None # Example: Needs process lookup
-        details['is_64bit_process'] = None # Example: Needs process lookup
+
 
         await ctx.info(f"Successfully retrieved details for event index {event_index}.")
         return details
