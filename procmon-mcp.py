@@ -427,20 +427,45 @@ else:
          description="Mock Tool: Analyzes pre-loaded Procmon XML files via streaming."
     )
 
-# --- Security Helper (remains the same) ---
+# --- Security Helper (Updated) ---
 def get_secure_path(filename: str) -> str:
-    if not ALLOWED_DIR_CONFIG: raise RuntimeError("Internal Error: Allowed directory configuration is missing.")
-    if not filename or '..' in filename or os.path.isabs(filename): raise ValueError("Invalid filename format or potential path traversal.")
-    if os.path.sep in filename or (os.altsep and os.altsep in filename): raise ValueError("Invalid relative filename format: No directory separators allowed.")
+    """
+    Validates filename relative to ALLOWED_FILE_DIR and returns full path if safe.
+    Relies on abspath and commonpath for security, allowing formats like '.\file.xml'.
+    """
+    if not ALLOWED_DIR_CONFIG:
+        raise RuntimeError("Internal Error: Allowed directory configuration is missing.")
+    if not filename:
+        raise ValueError("Filename cannot be empty.")
+    # Prevent absolute paths explicitly passed by the user
+    if os.path.isabs(filename):
+         raise ValueError("Invalid filename format: Absolute paths are not allowed.")
+
+    # Construct the path using the allowed directory and the relative filename
+    # os.path.join handles separators correctly
     full_path = os.path.join(ALLOWED_DIR_CONFIG, filename)
+
+    # Normalize both the allowed directory and the constructed path
     normalized_allowed_dir = os.path.abspath(ALLOWED_DIR_CONFIG)
     normalized_full_path = os.path.abspath(full_path)
+
     logger.debug(f"Checking path: {normalized_full_path} against allowed: {normalized_allowed_dir}")
-    if os.path.commonpath([normalized_allowed_dir, normalized_full_path]) != normalized_allowed_dir: raise PermissionError(f"Access denied: File '{filename}' resolves outside allowed directory.")
-    if not os.path.exists(normalized_full_path): raise FileNotFoundError(f"File not found: {filename} (in {ALLOWED_DIR_CONFIG})")
-    if not os.path.isfile(normalized_full_path): raise ValueError(f"Path exists but is not a file: {filename}")
+
+    # Use commonpath to ensure the resulting path is within the allowed directory
+    # This handles '..' and other relative path components safely.
+    common_prefix = os.path.commonpath([normalized_allowed_dir, normalized_full_path])
+    if common_prefix != normalized_allowed_dir:
+          raise PermissionError(f"Access denied: File '{filename}' resolves outside the allowed directory ('{normalized_allowed_dir}'). Resolved path: '{normalized_full_path}'")
+
+    # Final checks
+    if not os.path.exists(normalized_full_path):
+        raise FileNotFoundError(f"File not found: {filename} (resolves to {normalized_full_path})")
+    if not os.path.isfile(normalized_full_path):
+        raise ValueError(f"Path exists but is not a file: {filename} (resolves to {normalized_full_path})")
+
     logger.debug(f"Path validated: {normalized_full_path}")
-    return normalized_full_path
+    return normalized_full_path # Return the absolute, validated path
+
 
 # --- Loading Helper (Loads ONLY processes) ---
 def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Dict[int, ProcessInfo], str, Optional[str]]:
@@ -459,12 +484,14 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Di
     """
     global LOADED_FILENAME, LOADED_FILE_TYPE, LOADED_COMPRESSION, LOADED_PROCESSES
 
-    full_path = get_secure_path(filename_relative)
-    fname_lower = filename_relative.lower()
+    # Use the updated get_secure_path which returns absolute path
+    # We still need the relative filename for storing globally
+    abs_full_path = get_secure_path(filename_relative)
+    fname_lower = filename_relative.lower() # Use relative name for extension checks
     file_type: str = "xml"
     compression: Optional[str] = None
 
-    # Determine compression type
+    # Determine compression type based on relative filename
     if fname_lower.endswith(".xml"): compression = None
     elif fname_lower.endswith(".xml.gz"): compression = 'gz'
     elif fname_lower.endswith(".xml.bz2"): compression = 'bz2'
@@ -484,19 +511,18 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Di
         elif compression == 'xz': open_func = lzma.open
 
         comp_str = f" ({compression} compressed)" if compression else ""
-        logger.info(f"Validating and parsing process list from{comp_str} XML file: {full_path}")
+        logger.info(f"Validating and parsing process list from{comp_str} XML file: {abs_full_path}")
 
-        with open_func(full_path, "rb") as f_stream:
+        with open_func(abs_full_path, "rb") as f_stream: # Use absolute path here
              # Use parse_events=False to only get processes
              _, processes_dict = _parse_xml_stream(f_stream, parse_events=False)
-             if processes_dict is None: # Should not happen with parse_events=False
+             if processes_dict is None:
                   processes_dict = {}
                   logger.error("Failed to parse process dictionary.")
-                  # Decide if this is critical - maybe raise error?
-                  # raise RuntimeError("Failed to parse process information from file.")
+                  # raise RuntimeError("Failed to parse process information from file.") # Optionally make this fatal
 
         # Store globally for tools to access
-        LOADED_FILENAME = filename_relative # Store relative name
+        LOADED_FILENAME = filename_relative # Store original relative name
         LOADED_FILE_TYPE = file_type
         LOADED_COMPRESSION = compression
         LOADED_PROCESSES = processes_dict # Store the parsed processes
@@ -508,13 +534,11 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Di
         raise RuntimeError(f"Failed to parse XML file '{filename_relative}': Invalid XML.") from e
     except Exception as e:
          logger.error(f"Error during initial processing of file {filename_relative}: {e}", exc_info=True)
-         # Reset global state on error?
          LOADED_FILENAME = None; LOADED_FILE_TYPE = None; LOADED_COMPRESSION = None; LOADED_PROCESSES = None
          raise RuntimeError(f"Failed to load or parse file '{filename_relative}': {e}") from e
 
     end_time = time.time()
     logger.info(f"File validation and process list parsing took {end_time - start_time:.2f} seconds.")
-    # Return processes, type, compression for confirmation (though stored globally)
     return processes_dict, file_type, compression
 
 
@@ -553,21 +577,12 @@ def safe_get_attributes(obj: Any, attributes: List[str]) -> Dict[str, Any]:
 
 # --- Helper to get absolute path for streaming ---
 def _get_stream_file_path() -> str:
-    """Gets the absolute path of the globally loaded file."""
+    """Gets the absolute path of the globally loaded file for streaming."""
     if not LOADED_FILENAME or not ALLOWED_DIR_CONFIG:
          raise RuntimeError("File path information not loaded globally.")
-    # Re-validate or reconstruct the path securely
-    # Using basename ensures we don't accidentally use stored relative paths with '..' etc.
-    # Although get_secure_path should prevent loading such files initially.
     try:
-        # Reconstruct the path using the stored relative name and allowed dir
-        # Assume get_secure_path already validated the filename format
-        abs_path = os.path.abspath(os.path.join(ALLOWED_DIR_CONFIG, os.path.basename(LOADED_FILENAME)))
-        # Minimal re-validation
-        if not os.path.isfile(abs_path):
-             raise FileNotFoundError(f"Loaded file path seems invalid now: {abs_path}")
-        if os.path.commonpath([os.path.abspath(ALLOWED_DIR_CONFIG), abs_path]) != os.path.abspath(ALLOWED_DIR_CONFIG):
-             raise PermissionError("Loaded file path resolves outside allowed directory.")
+        # Re-run security check using the stored relative name to get abs path
+        abs_path = get_secure_path(LOADED_FILENAME)
         return abs_path
     except Exception as e:
         raise RuntimeError(f"Could not resolve secure path for streaming: {e}") from e
@@ -749,7 +764,9 @@ async def get_event_details(sequence_number: int, ctx: Context) -> Dict[str, Any
         # Stream events to find the matching sequence number
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             processed_count += 1
-            if event.sequence_number == sequence_number:
+            # Ensure sequence_number is compared as int
+            event_seq_num = getattr(event, 'sequence_number', None)
+            if event_seq_num is not None and event_seq_num == sequence_number:
                 found_event = event
                 break # Stop streaming once found
             # Log progress occasionally for long searches
@@ -825,7 +842,9 @@ async def get_event_stack_trace(sequence_number: int, ctx: Context) -> List[Dict
         # Stream events to find the matching sequence number
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             processed_count += 1
-            if event.sequence_number == sequence_number:
+            # Ensure sequence_number is compared as int
+            event_seq_num = getattr(event, 'sequence_number', None)
+            if event_seq_num is not None and event_seq_num == sequence_number:
                 found_event = event
                 break
             if processed_count % 500000 == 0: await ctx.info(f" Scanned {processed_count} events...")
