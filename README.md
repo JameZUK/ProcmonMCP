@@ -36,7 +36,7 @@ This project was inspired by the approach taken in the [GhidraMCP project](https
 
 2.  **Clone the Repository (Optional):**
     ```bash
-    git clone [https://github.com/JameZUK/ProcmonMCP](https://github.com/JameZUK/ProcmonMCP)
+    git clone https://github.com/JameZUK/ProcmonMCP
     cd ProcmonMCP
     ```
 
