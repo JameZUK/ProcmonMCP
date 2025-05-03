@@ -1,15 +1,40 @@
+# -*- coding: utf-8 -*-
 import os
 import logging
 import argparse
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Iterator, IO
 import io
 import asyncio
 import time # For timing the loading
 from collections import defaultdict # For counting
+import dataclasses # For XML data structures
+
+# Standard library compression formats
+import gzip
+import bz2
+import lzma
+
+# --- XML Parser Choice ---
+LXML_AVAILABLE = False
+try:
+    from lxml import etree as ET_impl # Use lxml etree as the primary implementation
+    LXML_AVAILABLE = True
+    # Logger defined after basicConfig below
+except ImportError:
+    import xml.etree.ElementTree as ET_impl # Fallback to standard library
+    # Logger defined after basicConfig below
 
 # --- Basic Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__) # Define logger after basicConfig
+
+# Log XML parser choice after logger is defined
+if LXML_AVAILABLE:
+    logger.info("Using lxml library for XML parsing (recommended).")
+else:
+    logger.warning("lxml library not found. Falling back to standard xml.etree.ElementTree for XML parsing.")
+    logger.warning("For better performance and memory efficiency with large XML files, install lxml: pip install lxml")
+
 
 # --- MCP SDK Imports ---
 try:
@@ -31,264 +56,552 @@ except ImportError:
         async def error(self, msg): logger.error(f"(async mock ctx): {msg}")
         async def warning(self, msg): logger.warning(f"(async mock ctx): {msg}")
 
-# --- Procmon Parser Import ---
-try:
-    import procmon_parser
-    from procmon_parser import ProcmonLogsReader, load_configuration, Rule
-    PROCMON_PARSER_AVAILABLE = True
-    logger.info("procmon-parser library found.")
-except ImportError:
-    PROCMON_PARSER_AVAILABLE = False
-    logger.error("procmon-parser not found. Please install it (pip install procmon-parser).")
-    # Mocks using correct structure based on latest understanding
-    class MockPMLData: # Wrapper for loaded PML data
-        def __init__(self):
-            self.header = self._create_mock_header()
-            self.processes = self._create_mock_processes()
-            self.events = self._create_mock_events()
+# XML parser code is integrated
+PROCMON_XML_PARSER_AVAILABLE = True
 
-        def _create_mock_header(self):
-            header = type('MockHeader', (object,), {})()
-            header.os_version = "10.0.22621"; header.computer_name = "MOCK-PC"; header.is_64bit_os = True
-            header.total_events = 15; header.major_version = 10; header.minor_version = 0
-            header.build_number = 22621; header.system_root = "C:\\Windows"
-            header.number_of_processors = 8; header.total_physical_memory = 16 * 1024**3
-            return header
+# --- XML Parser Data Structures ---
+@dataclasses.dataclass
+class StackFrame:
+    """Represents a single frame in a call stack parsed from a <frame> element."""
+    depth: Optional[int] = None
+    address: Optional[str] = None
+    path: Optional[str] = None
+    location: Optional[str] = None
 
-        def _create_mock_processes(self):
-            procs = []
-            pid_map = {}
-            for pid_val in [1000, 1004, 1008]:
-                 proc = type('MockProcess', (object,), {})()
-                 proc.pid = pid_val
-                 proc.parent_pid = 500 if proc.pid != 1000 else 100
-                 proc.image_path = f"C:\\Program Files\\App_{proc.pid}\\process_{(proc.pid-1000)//4}.exe"
-                 proc.command_line = f"{proc.image_path} -arg{proc.pid}"
-                 proc.user_sid = f"S-1-5-21-..."
-                 proc.authentication_id = 0xABCD + ((proc.pid-1000)//4 % 3)
-                 proc.session_id = 1
-                 proc.is_64bit = True
-                 proc.process_name = f"process_{(proc.pid-1000)//4}.exe"
-                 proc.create_time = None; proc.exit_time = None
-                 proc.modules = [
-                     type('MockModule', (object,), {'path': proc.image_path, 'address': 0x7FF00000 + proc.pid, 'size': 0x1000})(),
-                     type('MockModule', (object,), {'path': 'C:\\Windows\\System32\\ntdll.dll', 'address': 0x7FF10000, 'size': 0x20000})()
-                 ]
-                 procs.append(proc)
-                 pid_map[proc.pid] = proc
-            if 500 not in pid_map:
-                 proc = type('MockProcess', (object,), {})()
-                 proc.pid = 500; proc.parent_pid = 10; proc.process_name = "parent_500.exe"; proc.image_path = "C:\\Windows\\System32\\parent_500.exe"
-                 procs.append(proc); pid_map[500] = proc
-            if 100 not in pid_map:
-                 proc = type('MockProcess', (object,), {})()
-                 proc.pid = 100; proc.parent_pid = 4; proc.process_name = "parent_100.exe"; proc.image_path = "C:\\Windows\\System32\\parent_100.exe"
-                 procs.append(proc); pid_map[100] = proc
-            if 4 not in pid_map:
-                 proc = type('MockProcess', (object,), {})()
-                 proc.pid = 4; proc.parent_pid = 0; proc.process_name = "System"; proc.image_path = "System"
-                 procs.append(proc); pid_map[4] = proc
-            self._temp_pid_map = pid_map
-            return procs
+    @classmethod
+    def from_xml_element(cls, elem: ET_impl.Element) -> 'StackFrame':
+        depth_text = elem.findtext('depth')
+        try: depth = int(depth_text) if depth_text and depth_text.isdigit() else None
+        except (ValueError, TypeError): depth = None
+        address = elem.findtext('address')
+        path = elem.findtext('path')
+        location = elem.findtext('location')
+        return cls(depth=depth, address=address, path=path, location=location)
 
-        def _create_mock_events(self):
-            events = []
-            for idx in range(15):
-                event = type('MockEvent', (object,), {})()
-                event.pid = 1000 + (idx % 3) * 4
-                event.tid = 5000 + idx * 10
-                event.operation = ["CreateFile", "WriteFile", "RegQueryKey", "TCP Send"][idx % 4]
-                event.path = f"C:\\path\\to\\file_{idx}.tmp" if idx % 2 == 0 else "HKLM\\Software\\Mock"
-                if idx < 5 : event.result = 0xC0000022 # Simulate ACCESS_DENIED code
-                elif idx < 10: event.result = 0 # Simulate SUCCESS code
-                else: event.result = ["SUCCESS", "NAME NOT FOUND", "PATH NOT FOUND"][idx % 3] # Simulate string results
-                event.duration = 0.001 * idx
-                event.timestamp = f"2025-05-02 09:{50+idx//60}:{idx%60}.{100+idx*15}"
-                event.detail = f"Detail string for event {idx}"
-                event.stacktrace = [0x7FF00000 + i*0x10 + idx*0x100 for i in range(5 + idx % 5)]
-                event.process = self._temp_pid_map.get(event.pid)
-                event.process_name = getattr(event.process, 'process_name', 'Unknown') if event.process else 'Unknown'
-                event.parent_pid = getattr(event.process, 'parent_pid', None) if event.process else None
-                event.session_id = 1
-                event.authentication_id = 0xABCD + (idx%3)
-                event.user_sid = f"S-1-5-21-..."
-                event.is_64bit_process = True
-                event.category = ["File System", "Registry", "Network"][idx % 3]
-                events.append(event)
-            del self._temp_pid_map
-            return events
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert StackFrame to dictionary for tool output."""
+        return dataclasses.asdict(self)
 
-    def mock_load_configuration(stream): return {"DestructiveFilter": 0,"FilterRules": [{'column': 'Process Name', 'relation': 'is', 'value': 'System', 'action': 'Exclude'},{'column': 'Process Name', 'relation': 'is', 'value': 'Procmon64.exe', 'action': 'Exclude'}],"HighlightBackColor": 16777215,"HighlightForeColor": 0}
-    class Rule: pass
+@dataclasses.dataclass
+class ProcessInfo:
+    """Represents information about a single process from the <processlist>."""
+    process_index: Optional[int] = None
+    process_id: Optional[int] = None
+    parent_process_id: Optional[int] = None
+    parent_process_index: Optional[int] = None
+    authentication_id: Optional[str] = None
+    create_time: Optional[str] = None
+    finish_time: Optional[str] = None
+    is_virtualized: Optional[bool] = None
+    is_64bit: Optional[bool] = None
+    integrity: Optional[str] = None
+    owner: Optional[str] = None
+    process_name: Optional[str] = None
+    image_path: Optional[str] = None
+    command_line: Optional[str] = None
+    company_name: Optional[str] = None
+    version: Optional[str] = None
+    description: Optional[str] = None
+
+    @property
+    def pid(self): return self.process_id
+    @property
+    def parent_pid(self): return self.parent_process_id
+    @property
+    def user_sid(self): return self.owner
+
+    @staticmethod
+    def _safe_find_text(elem: ET_impl.Element, tag: str) -> Optional[str]:
+        child = elem.find(tag)
+        return child.text.strip() if child is not None and child.text else None
+    @staticmethod
+    def _safe_text_to_int(text: Optional[str]) -> Optional[int]:
+        if text is None: return None
+        text = text.strip()
+        if text.startswith('0x'):
+            try: return int(text, 16)
+            except (ValueError, TypeError): return None
+        elif text.isdigit() or (text.startswith('-') and text[1:].isdigit()):
+            try: return int(text)
+            except (ValueError, TypeError): return None
+        else: return None
+    @staticmethod
+    def _safe_text_to_bool(text: Optional[str]) -> Optional[bool]:
+        if text:
+            text = text.strip()
+            if text == '1': return True
+            if text == '0': return False
+        return None
+
+    @classmethod
+    def from_xml_element(cls, elem: ET_impl.Element) -> 'ProcessInfo':
+        data = {}
+        data['process_index'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ProcessIndex'))
+        data['process_id'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ProcessId'))
+        data['parent_process_id'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ParentProcessId'))
+        data['parent_process_index'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ParentProcessIndex'))
+        data['authentication_id'] = cls._safe_find_text(elem, 'AuthenticationId')
+        data['create_time'] = cls._safe_find_text(elem, 'CreateTime')
+        data['finish_time'] = cls._safe_find_text(elem, 'FinishTime')
+        data['is_virtualized'] = cls._safe_text_to_bool(cls._safe_find_text(elem, 'IsVirtualized'))
+        data['is_64bit'] = cls._safe_text_to_bool(cls._safe_find_text(elem, 'Is64bit'))
+        data['integrity'] = cls._safe_find_text(elem, 'Integrity')
+        data['owner'] = cls._safe_find_text(elem, 'Owner')
+        data['process_name'] = cls._safe_find_text(elem, 'ProcessName')
+        data['image_path'] = cls._safe_find_text(elem, 'ImagePath')
+        data['command_line'] = cls._safe_find_text(elem, 'CommandLine')
+        data['company_name'] = cls._safe_find_text(elem, 'CompanyName')
+        data['version'] = cls._safe_find_text(elem, 'Version')
+        data['description'] = cls._safe_find_text(elem, 'Description')
+        return cls(**data)
+
+@dataclasses.dataclass
+class ProcmonEvent:
+    """Represents a single event record parsed from Procmon XML data."""
+    time_of_day: Optional[str] = None
+    process_name: Optional[str] = None
+    pid: Optional[int] = None
+    operation: Optional[str] = None
+    path: Optional[str] = None
+    result: Optional[str] = None
+    detail: Optional[str] = None
+    category: Optional[str] = None
+    duration: Optional[float] = None
+    completion_time: Optional[str] = None
+    relative_time: Optional[float] = None
+    sequence_number: Optional[int] = None # Crucial for finding specific events
+    process_index: Optional[int] = None
+    stack: Optional[List[StackFrame]] = None
+    tid: Optional[int] = None
+    image_path: Optional[str] = None
+    command_line: Optional[str] = None
+    parent_pid: Optional[int] = None
+    session_id: Optional[int] = None
+    user: Optional[str] = None
+    architecture: Optional[str] = None
+    integrity: Optional[str] = None
+    virtualized: Optional[bool] = None
+    authentication_id: Optional[str] = None
+
+    @property
+    def timestamp(self): return self.time_of_day
+    @property
+    def user_sid(self): return self.user
+    @property
+    def is_64bit_process(self): return self.architecture == '64-bit' if self.architecture else None
+
+    @staticmethod
+    def _safe_find_text(elem: ET_impl.Element, tag: str) -> Optional[str]:
+        child = elem.find(tag)
+        return child.text.strip() if child is not None and child.text else None
+    @staticmethod
+    def _safe_get_attrib(elem: ET_impl.Element, attrib: str) -> Optional[str]:
+        val = elem.get(attrib)
+        return val.strip() if val else None
+    @staticmethod
+    def _safe_text_to_int(text: Optional[str]) -> Optional[int]:
+        if text is None: return None
+        text = text.strip()
+        if text.isdigit() or (text.startswith('-') and text[1:].isdigit()):
+            try: return int(text)
+            except (ValueError, TypeError): return None
+        else: return None
+    @staticmethod
+    def _safe_text_to_float(text: Optional[str]) -> Optional[float]:
+        if text is None: return None
+        try: return float(text.strip())
+        except (ValueError, TypeError): return None
+
+    @classmethod
+    def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo]) -> 'ProcmonEvent':
+        data: Dict[str, Any] = {}
+        data['time_of_day'] = cls._safe_find_text(elem, 'Time_of_Day')
+        data['process_name'] = cls._safe_find_text(elem, 'Process_Name')
+        data['operation'] = cls._safe_find_text(elem, 'Operation')
+        data['path'] = cls._safe_find_text(elem, 'Path')
+        data['result'] = cls._safe_find_text(elem, 'Result')
+        data['detail'] = cls._safe_find_text(elem, 'Detail')
+        data['category'] = cls._safe_find_text(elem, 'Category')
+        data['completion_time'] = cls._safe_find_text(elem, 'Completion_Time')
+        data['pid'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'PID'))
+        data['duration'] = cls._safe_text_to_float(cls._safe_find_text(elem, 'Duration'))
+        data['relative_time'] = cls._safe_text_to_float(cls._safe_find_text(elem, 'Relative_Time'))
+        data['sequence_number'] = cls._safe_text_to_int(cls._safe_get_attrib(elem, 'SequenceNumber'))
+        data['process_index'] = cls._safe_text_to_int(cls._safe_get_attrib(elem, 'ProcessIndex'))
+
+        stack_elem = elem.find('stack')
+        if stack_elem is not None:
+            stack_frames: List[StackFrame] = []
+            for frame_elem in stack_elem.findall('frame'):
+                try: stack_frames.append(StackFrame.from_xml_element(frame_elem))
+                except Exception as e: logger.warning(f"Failed to parse stack frame: {e}", exc_info=False)
+            data['stack'] = stack_frames if stack_frames else None
+        else: data['stack'] = None
+
+        process_info = processes.get(data['process_index']) if data['process_index'] is not None else None
+        if process_info:
+            data['pid'] = process_info.process_id if process_info.process_id is not None else data['pid']
+            data['process_name'] = process_info.process_name if process_info.process_name else data['process_name']
+            data['image_path'] = process_info.image_path
+            data['command_line'] = process_info.command_line
+            data['parent_pid'] = process_info.parent_process_id
+            data['user'] = process_info.owner
+            data['architecture'] = '64-bit' if process_info.is_64bit else ('32-bit' if process_info.is_64bit is False else None)
+            data['integrity'] = process_info.integrity
+            data['virtualized'] = process_info.is_virtualized
+            data['authentication_id'] = process_info.authentication_id
+        else:
+            data['image_path'],data['command_line'],data['parent_pid'],data['user'] = None,None,None,None
+            data['architecture'],data['integrity'],data['virtualized'],data['authentication_id'] = None,None,None,None
+
+        data['tid'] = None
+        if data['detail']:
+            detail_parts = data['detail'].split(',')
+            for part in detail_parts:
+                part = part.strip()
+                if part.lower().startswith('tid:'):
+                    try: data['tid'] = int(part.split(':')[1].strip()); break
+                    except (IndexError, ValueError, TypeError): data['tid'] = None
+        data['session_id'] = None
+        return cls(**data)
+
+# --- XML Parsing Logic ---
+def _clear_elem(elem: ET_impl.Element):
+    """Helper to clear element memory using lxml/ET specific methods."""
+    elem.clear()
+    if LXML_AVAILABLE:
+        while elem.getprevious() is not None:
+            try:
+                parent = elem.getparent()
+                if parent is not None: del parent[0]
+                else: break
+            except (IndexError, AttributeError): break
+
+def _parse_xml_stream(source_stream: IO[bytes], parse_events: bool = True) -> Tuple[Optional[Iterator[ProcmonEvent]], Dict[int, ProcessInfo]]:
+    """
+    Internal helper function to parse XML from a byte stream using iterparse (lxml preferred).
+
+    Parses the <processlist> first to build a dictionary for enrichment.
+    Optionally yields <event> elements via a generator based on `parse_events` flag.
+
+    Args:
+        source_stream: A readable binary stream providing the XML content.
+        parse_events: If True, yields events. If False, stops after parsing processes.
+
+    Returns:
+        A tuple containing:
+          - An iterator yielding ProcmonEvent objects (or None if parse_events is False).
+          - A dictionary mapping process index to ProcessInfo objects parsed from <processlist>.
+
+    Raises:
+        ET_impl.XMLSyntaxError: If the XML is malformed.
+        ValueError: If the root <procmon> tag is missing or structure is invalid.
+    """
+    processes_dict: Dict[int, ProcessInfo] = {}
+    parsing_stage = "seeking_procmon"
+    processlist_parsed = False
+    eventlist_entered = False
+    tags_of_interest = ('process', 'event', 'processlist', 'eventlist', 'procmon')
+    context = ET_impl.iterparse(source_stream, events=('end',), tag=tags_of_interest)
+
+    def event_generator() -> Iterator[ProcmonEvent]:
+        nonlocal parsing_stage, eventlist_entered
+        event_count = 0
+        try:
+            for event_type, elem in context:
+                if elem.tag == 'event':
+                    if not processlist_parsed: logger.warning("Encountered <event> before <processlist> fully parsed.")
+                    try:
+                        yield ProcmonEvent.from_xml_element(elem, processes_dict)
+                        event_count += 1
+                        # Reduce logging frequency for streaming
+                        if event_count % 250000 == 0: logger.info(f"Streamed {event_count} events...")
+                    except Exception as e: logger.warning(f"Failed to parse <event> element: {e}", exc_info=False)
+                    _clear_elem(elem)
+                elif elem.tag == 'eventlist':
+                    logger.info(f"Finished streaming <eventlist>.")
+                    parsing_stage = "done"; _clear_elem(elem)
+                elif elem.tag == 'procmon':
+                    logger.debug("Reached end of <procmon> during event generation.")
+                    parsing_stage = "done"; break
+                elif elem.tag in tags_of_interest: _clear_elem(elem)
+            logger.info(f"Total events successfully streamed: {event_count}")
+        except ET_impl.XMLSyntaxError as e: logger.error(f"XML Parse Error during event stream: {e}"); raise
+        except Exception as e: logger.error(f"Unexpected error during event stream: {e}", exc_info=True); raise
+
+    try:
+        for event_type, elem in context:
+            if parsing_stage == "seeking_procmon": parsing_stage = "seeking_processlist"
+            if parsing_stage == "seeking_processlist":
+                if elem.tag == 'process': parsing_stage = "parsing_processlist" # Fallthrough
+                elif elem.tag == 'processlist': processlist_parsed = True; parsing_stage = "seeking_eventlist"; _clear_elem(elem); break # Break to start events if requested
+                elif elem.tag == 'eventlist': logger.warning("Found <eventlist> before <processlist>."); parsing_stage = "seeking_eventlist"; eventlist_entered = True; _clear_elem(elem); break
+                elif elem.tag == 'event': logger.warning("Found <event> before <processlist>."); parsing_stage = "seeking_eventlist"; eventlist_entered = True; break
+            if parsing_stage == "parsing_processlist":
+                if elem.tag == 'process':
+                    try:
+                        proc_info = ProcessInfo.from_xml_element(elem)
+                        if proc_info.process_index is not None and proc_info.process_index >= 0: processes_dict[proc_info.process_index] = proc_info
+                        else: logger.warning(f"Parsed process element with invalid index.")
+                    except Exception as e: logger.warning(f"Failed to parse <process> element: {e}", exc_info=False)
+                    _clear_elem(elem)
+                elif elem.tag == 'processlist':
+                    logger.info(f"Finished parsing <processlist>. Found {len(processes_dict)} processes.")
+                    processlist_parsed = True; parsing_stage = "seeking_eventlist"; _clear_elem(elem); break # Break to start events if requested
+            if elem.tag == 'procmon': logger.debug("Reached end of <procmon> during process phase."); parsing_stage = "done"; break
+
+        # Decide what to return based on parse_events flag and final state
+        if parse_events and (parsing_stage == "seeking_eventlist" or parsing_stage == "generating_events"):
+            return event_generator(), processes_dict
+        elif parse_events and parsing_stage == "done" and not eventlist_entered:
+             logger.info("No <eventlist> found/processed."); return iter([]), processes_dict # Return empty iterator
+        elif not parse_events:
+             logger.info("Stopped parsing after process list as requested.")
+             return None, processes_dict # Return None for iterator
+        else: # Should not happen
+             logger.warning(f"XML parsing ended unexpectedly: {parsing_stage}."); return None, processes_dict
+
+    except ET_impl.XMLSyntaxError as e: logger.error(f"XML Parse Error during initial processing: {e}"); raise
+    except Exception as e: logger.error(f"Unexpected error during initial XML processing: {e}", exc_info=True); raise
+
+def stream_procmon_events(file_path: str, compression: Optional[str]) -> Iterator[Tuple[ProcmonEvent, Dict[int, ProcessInfo]]]:
+    """
+    Opens a Procmon XML file (plain or compressed) and yields events one by one.
+    Parses the process list first and includes it with each yielded event for context.
+
+    Args:
+        file_path: Absolute path to the XML file.
+        compression: Compression type ('gz', 'bz2', 'xz', or None).
+
+    Yields:
+        Tuple[ProcmonEvent, Dict[int, ProcessInfo]]: The event and the full process dictionary.
+
+    Raises:
+        FileNotFoundError, ValueError, RuntimeError, ET_impl.XMLSyntaxError
+    """
+    open_func: Any = open
+    if compression == 'gz': open_func = gzip.open
+    elif compression == 'bz2': open_func = bz2.open
+    elif compression == 'xz': open_func = lzma.open
+
+    comp_str = f" ({compression} compressed)" if compression else ""
+    logger.info(f"Streaming events from{comp_str} XML file: {file_path}")
+
+    try:
+        with open_func(file_path, "rb") as f_stream:
+            # Use parse_events=True to get the event generator
+            event_iterator, processes_dict = _parse_xml_stream(f_stream, parse_events=True)
+            if event_iterator is None: # Should not happen if parse_events=True
+                 logger.error("Failed to get event iterator from _parse_xml_stream")
+                 return # Return empty iterator
+
+            # Yield each event along with the *same* processes_dict
+            for event in event_iterator:
+                yield event, processes_dict # Yield event and the *complete* process map
+
+    except Exception as e:
+        logger.error(f"Error streaming events from {file_path}: {e}", exc_info=True)
+        # Re-raise specific errors if needed, otherwise wrap
+        if isinstance(e, (FileNotFoundError, ValueError, ET_impl.XMLSyntaxError)):
+            raise
+        else:
+            raise RuntimeError(f"Failed to stream events from '{file_path}'") from e
+
 
 # --- Global State ---
 ALLOWED_DIR_CONFIG: Optional[str] = None
 LOADED_FILENAME: Optional[str] = None
-LOADED_FILE_TYPE: Optional[str] = None
-LOADED_DATA: Optional[Dict[str, Any]] = None
+LOADED_FILE_TYPE: Optional[str] = None # Should always be 'xml' if loaded
+LOADED_COMPRESSION: Optional[str] = None # Store compression type
+LOADED_PROCESSES: Optional[Dict[int, ProcessInfo]] = None # Store only processes
 
 # --- Setup MCP ---
 if MCP_SDK_AVAILABLE:
     mcp = FastMCP(
-        "ProcmonParserTool",
-        description="A tool to analyze a specific, pre-loaded Procmon PML log file or PMC configuration file with detailed data access."
+        "ProcmonXmlTool",
+        description="A tool to analyze a specific, pre-loaded Procmon XML log file (plain or compressed) via streaming."
     )
 else:
     mcp = MockMCP(
-         "ProcmonParserTool (Mock)",
-         description="Mock Tool: Analyzes pre-loaded Procmon files."
+         "ProcmonXmlTool (Mock)",
+         description="Mock Tool: Analyzes pre-loaded Procmon XML files via streaming."
     )
 
-
-# --- Security Helper ---
+# --- Security Helper (remains the same) ---
 def get_secure_path(filename: str) -> str:
-    """Validates filename relative to ALLOWED_FILE_DIR and returns full path if safe."""
     if not ALLOWED_DIR_CONFIG: raise RuntimeError("Internal Error: Allowed directory configuration is missing.")
-    if not filename or '..' in filename or os.path.isabs(filename) or '\\' in filename : raise ValueError("Invalid relative filename format or potential path traversal.")
+    if not filename or '..' in filename or os.path.isabs(filename): raise ValueError("Invalid filename format or potential path traversal.")
+    if os.path.sep in filename or (os.altsep and os.altsep in filename): raise ValueError("Invalid relative filename format: No directory separators allowed.")
     full_path = os.path.join(ALLOWED_DIR_CONFIG, filename)
     normalized_allowed_dir = os.path.abspath(ALLOWED_DIR_CONFIG)
     normalized_full_path = os.path.abspath(full_path)
     logger.debug(f"Checking path: {normalized_full_path} against allowed: {normalized_allowed_dir}")
-    if not normalized_full_path.startswith(normalized_allowed_dir): raise PermissionError(f"Access denied: File '{filename}' resolves outside the allowed directory.")
+    if os.path.commonpath([normalized_allowed_dir, normalized_full_path]) != normalized_allowed_dir: raise PermissionError(f"Access denied: File '{filename}' resolves outside allowed directory.")
     if not os.path.exists(normalized_full_path): raise FileNotFoundError(f"File not found: {filename} (in {ALLOWED_DIR_CONFIG})")
     if not os.path.isfile(normalized_full_path): raise ValueError(f"Path exists but is not a file: {filename}")
     logger.debug(f"Path validated: {normalized_full_path}")
     return normalized_full_path
 
-# --- Loading Helper ---
-def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Dict[str, Any], str]:
-    """Loads PML/PMC data into standardized dictionary structures."""
-    if not PROCMON_PARSER_AVAILABLE:
-        raise RuntimeError("Cannot load file: procmon-parser library is not installed.")
+# --- Loading Helper (Loads ONLY processes) ---
+def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Dict[int, ProcessInfo], str, Optional[str]]:
+    """
+    Validates XML file path, determines compression, parses and returns ONLY the process list.
+    Stores filename and compression type globally for later streaming by tools.
+
+    Returns:
+        Tuple containing:
+            - Dictionary of ProcessInfo objects keyed by process_index.
+            - File type ('xml').
+            - Compression type (str or None).
+
+    Raises:
+        FileNotFoundError, ValueError, PermissionError, RuntimeError, ET_impl.XMLSyntaxError
+    """
+    global LOADED_FILENAME, LOADED_FILE_TYPE, LOADED_COMPRESSION, LOADED_PROCESSES
 
     full_path = get_secure_path(filename_relative)
-    file_ext = os.path.splitext(filename_relative)[1].lower()
+    fname_lower = filename_relative.lower()
+    file_type: str = "xml"
+    compression: Optional[str] = None
+
+    # Determine compression type
+    if fname_lower.endswith(".xml"): compression = None
+    elif fname_lower.endswith(".xml.gz"): compression = 'gz'
+    elif fname_lower.endswith(".xml.bz2"): compression = 'bz2'
+    elif fname_lower.endswith(".xml.xz"): compression = 'xz'
+    elif fname_lower.endswith(".gz"): compression = 'gz'; logger.warning(f"Assuming '.gz' file contains XML.")
+    elif fname_lower.endswith(".bz2"): compression = 'bz2'; logger.warning(f"Assuming '.bz2' file contains XML.")
+    elif fname_lower.endswith(".xz"): compression = 'xz'; logger.warning(f"Assuming '.xz' file contains XML.")
+    else: raise ValueError(f"Unsupported file extension: {fname_lower}. Expecting .xml, .xml.gz, .xml.bz2, .xml.xz.")
 
     start_time = time.time()
-    loaded_data: Dict[str, Any] = {}
+    processes_dict: Dict[int, ProcessInfo] = {}
 
-    with open(full_path, "rb") as f:
-        if file_ext == ".pml":
-            logger.info(f"Loading PML file using ProcmonLogsReader: {full_path}")
-            pml_reader = ProcmonLogsReader(f)
+    try:
+        open_func: Any = open
+        if compression == 'gz': open_func = gzip.open
+        elif compression == 'bz2': open_func = bz2.open
+        elif compression == 'xz': open_func = lzma.open
 
-            try:
-                loaded_data['header'] = getattr(pml_reader, 'header', None)
-                if loaded_data['header']: logger.info("Extracted header information.")
-                else: logger.warning("Could not extract header information from PML reader.")
-            except Exception as e:
-                 logger.error(f"Error accessing PML header: {e}", exc_info=True)
-                 loaded_data['header'] = None
+        comp_str = f" ({compression} compressed)" if compression else ""
+        logger.info(f"Validating and parsing process list from{comp_str} XML file: {full_path}")
 
-            logger.info("Iterating through PML reader to extract events and processes...")
-            events_list = []
-            process_list = []
-            seen_pids = set()
-            event_count = 0
-            try:
-                for event in pml_reader:
-                    events_list.append(event)
-                    event_count += 1
-                    process_obj = getattr(event, 'process', None)
-                    if process_obj:
-                        pid = safe_get_attributes(process_obj, ['pid']).get('pid')
-                        if pid is not None and pid not in seen_pids:
-                            process_list.append(process_obj)
-                            seen_pids.add(pid)
-                            logger.debug(f"Stored new process object for PID {pid}")
-                    if event_count % 10000 == 0: logger.info(f"Processed {event_count} events...")
-            except Exception as e: logger.error(f"Error iterating through PML reader: {e}", exc_info=True)
+        with open_func(full_path, "rb") as f_stream:
+             # Use parse_events=False to only get processes
+             _, processes_dict = _parse_xml_stream(f_stream, parse_events=False)
+             if processes_dict is None: # Should not happen with parse_events=False
+                  processes_dict = {}
+                  logger.error("Failed to parse process dictionary.")
+                  # Decide if this is critical - maybe raise error?
+                  # raise RuntimeError("Failed to parse process information from file.")
 
-            loaded_data['events'] = events_list
-            loaded_data['processes'] = process_list
-            logger.info(f"Finished extracting PML data: {len(events_list)} events, {len(process_list)} unique processes.")
-            file_type = 'pml'
+        # Store globally for tools to access
+        LOADED_FILENAME = filename_relative # Store relative name
+        LOADED_FILE_TYPE = file_type
+        LOADED_COMPRESSION = compression
+        LOADED_PROCESSES = processes_dict # Store the parsed processes
 
-        elif file_ext == ".pmc":
-            logger.info(f"Loading PMC file using load_configuration: {full_path}")
-            loaded_data = load_configuration(f)
-            file_type = 'pmc'
-        else:
-            raise ValueError(f"Unsupported file type: {file_ext}. Only .pml and .pmc are supported.")
+        logger.info(f"Successfully parsed process list: {len(processes_dict)} processes found.")
+
+    except ET_impl.XMLSyntaxError as e:
+        logger.error(f"XML Syntax Error processing file {filename_relative}: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to parse XML file '{filename_relative}': Invalid XML.") from e
+    except Exception as e:
+         logger.error(f"Error during initial processing of file {filename_relative}: {e}", exc_info=True)
+         # Reset global state on error?
+         LOADED_FILENAME = None; LOADED_FILE_TYPE = None; LOADED_COMPRESSION = None; LOADED_PROCESSES = None
+         raise RuntimeError(f"Failed to load or parse file '{filename_relative}': {e}") from e
 
     end_time = time.time()
-    logger.info(f"File loading and processing took {end_time - start_time:.2f} seconds.")
-    return loaded_data, file_type
+    logger.info(f"File validation and process list parsing took {end_time - start_time:.2f} seconds.")
+    # Return processes, type, compression for confirmation (though stored globally)
+    return processes_dict, file_type, compression
 
-# --- Helper to Safely Get Attributes (Improved Casing Checks) ---
+
+# --- Helper to Safely Get Attributes ---
+# (Implementation remains the same as previous version, focused on XML dataclasses)
 def safe_get_attributes(obj: Any, attributes: List[str]) -> Dict[str, Any]:
-    """
-    Safely gets multiple attributes from an object, checking common casing variations.
-    Returns a dictionary with lowercase keys matching the input attributes list.
-    Args:
-        obj: The object to get attributes from.
-        attributes: A list of desired attribute names (preferably lowercase).
-    """
     result = {}
-    if obj is None:
-        return {attr: None for attr in attributes}
-
+    if obj is None: return {attr: None for attr in attributes}
     for attr_lower in attributes:
-        value = None
-        possible_names = [
-            attr_lower,
-            attr_lower.capitalize(),
-            attr_lower.title().replace("_",""),
-            attr_lower.replace("_", " ").title(),
-        ]
-        if attr_lower == "stacktrace": possible_names.append("stacktrace")
-        if attr_lower == "process_name": possible_names.append("Process Name")
-        if attr_lower == "pid": possible_names.append("Pid")
-
-        possible_names = list(dict.fromkeys(possible_names))
-
-        for name_attempt in possible_names:
-            if hasattr(obj, name_attempt):
-                value = getattr(obj, name_attempt, None)
-                if value is not None:
-                    break
-
+        value = None; found = False
+        if hasattr(obj, attr_lower):
+            try: value = getattr(obj, attr_lower); found = True
+            except Exception: pass
+        if not found:
+            possible_names = [ attr_lower.capitalize(), attr_lower.title().replace("_", ""), f"{attr_lower.replace('_', ' ').title().replace(' ', '')}", ]
+            if attr_lower == "pid": possible_names.append("ProcessId")
+            if attr_lower == "parent_pid": possible_names.append("ParentProcessId")
+            if attr_lower == "timestamp": possible_names.append("Time_of_Day")
+            if attr_lower == "user_sid": possible_names.append("Owner")
+            if attr_lower == "is_64bit_process": possible_names.append("is_64bit")
+            if attr_lower == "stack": possible_names.append("stacktrace") # Allow getting raw stack obj if needed
+            possible_names = list(dict.fromkeys(possible_names))
+            for name_attempt in possible_names:
+                 if hasattr(obj, name_attempt):
+                     try: value = getattr(obj, name_attempt); found = True; break
+                     except Exception: pass
         if isinstance(value, (bytes, bytearray)):
             try: result[attr_lower] = value.decode('utf-8', errors='replace')
             except Exception: result[attr_lower] = repr(value)
-        elif not isinstance(value, (str, int, float, bool, list, dict, type(None))):
+        elif attr_lower == 'stack' and isinstance(value, list) and value and isinstance(value[0], StackFrame):
+             result[attr_lower] = value # Return list of StackFrame objects
+        elif value is not None and not isinstance(value, (str, int, float, bool, list, dict)):
              result[attr_lower] = str(value)
-        else:
-            result[attr_lower] = value
+        else: result[attr_lower] = value
     return result
 
+# --- Helper to get absolute path for streaming ---
+def _get_stream_file_path() -> str:
+    """Gets the absolute path of the globally loaded file."""
+    if not LOADED_FILENAME or not ALLOWED_DIR_CONFIG:
+         raise RuntimeError("File path information not loaded globally.")
+    # Re-validate or reconstruct the path securely
+    # Using basename ensures we don't accidentally use stored relative paths with '..' etc.
+    # Although get_secure_path should prevent loading such files initially.
+    try:
+        # Reconstruct the path using the stored relative name and allowed dir
+        # Assume get_secure_path already validated the filename format
+        abs_path = os.path.abspath(os.path.join(ALLOWED_DIR_CONFIG, os.path.basename(LOADED_FILENAME)))
+        # Minimal re-validation
+        if not os.path.isfile(abs_path):
+             raise FileNotFoundError(f"Loaded file path seems invalid now: {abs_path}")
+        if os.path.commonpath([os.path.abspath(ALLOWED_DIR_CONFIG), abs_path]) != os.path.abspath(ALLOWED_DIR_CONFIG):
+             raise PermissionError("Loaded file path resolves outside allowed directory.")
+        return abs_path
+    except Exception as e:
+        raise RuntimeError(f"Could not resolve secure path for streaming: {e}") from e
 
-# --- MCP Tools ---
+
+# --- MCP Tools (Refactored for Streaming) ---
 tool_decorator = mcp.tool() if MCP_SDK_AVAILABLE else lambda func: func
-
-# --- Tool Functions ---
 
 @tool_decorator
 async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
     """
-    Returns a basic summary of the pre-loaded Procmon file (PML or PMC).
-    Accesses the data loaded into memory at server startup.
-    Returns:
-        A dictionary containing summary information (filename, type, counts).
-        Errors if no file is loaded.
+    Returns a basic summary of the pre-loaded Procmon XML file (based on process list).
     """
     await ctx.info(f"Request received for summary of pre-loaded file.")
-    if not LOADED_DATA or not LOADED_FILENAME or not LOADED_FILE_TYPE:
-        await ctx.error("No Procmon file was pre-loaded at server startup using --load-file.")
-        raise RuntimeError("Operation failed: No Procmon file is pre-loaded.")
+    # Check if process list was loaded
+    if not LOADED_PROCESSES or not LOADED_FILENAME or not LOADED_FILE_TYPE:
+        await ctx.error("No Procmon XML file process list was pre-loaded via --load-file.")
+        raise RuntimeError("Operation failed: No Procmon file process data is loaded.")
+    if LOADED_FILE_TYPE != 'xml': # Should be redundant now
+        await ctx.error(f"Loaded file type is '{LOADED_FILE_TYPE}', not 'xml'.")
+        raise RuntimeError(f"Operation failed: Expected XML file type.")
 
-    summary = {"loaded_filename": LOADED_FILENAME, "file_type": LOADED_FILE_TYPE}
+    summary = {
+        "loaded_filename": LOADED_FILENAME,
+        "file_type": LOADED_FILE_TYPE,
+        "compression": LOADED_COMPRESSION,
+        "process_count": len(LOADED_PROCESSES),
+        "event_count": "N/A (Streamed)", # Indicate events are not pre-counted
+        "os_version": "N/A (XML)",
+        "computer_name": "N/A (XML)",
+        "is_64bit_os": None
+    }
     try:
-        if LOADED_FILE_TYPE == 'pml':
-            summary["event_count"] = len(LOADED_DATA.get('events', []))
-            summary["process_count"] = len(LOADED_DATA.get('processes', []))
-            header = LOADED_DATA.get('header')
-            if header:
-                 summary.update(safe_get_attributes(header, ['os_version', 'computer_name', 'is_64bit_os']))
-        elif LOADED_FILE_TYPE == 'pmc':
-            summary["filter_rule_count"] = len(LOADED_DATA.get('FilterRules', []))
-            summary["destructive_filter"] = LOADED_DATA.get('DestructiveFilter')
-
+        # Could potentially derive some info from process list if needed
         await ctx.info(f"Successfully generated summary for {LOADED_FILENAME}.")
         return summary
     except Exception as e:
@@ -297,7 +610,7 @@ async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
         raise RuntimeError(f"Internal error generating summary: {e}")
 
 @tool_decorator
-async def query_loaded_pml_events(
+async def query_events(
     filter_process: Optional[str] = None,
     filter_operation: Optional[str] = None,
     filter_result: Optional[str] = None,
@@ -308,90 +621,88 @@ async def query_loaded_pml_events(
     ctx: Context
 ) -> List[Dict[str, Any]]:
     """
-    Queries events from the pre-loaded PML file, returning summaries including the event index.
-    Filtering by process name relies on the name associated with the event's linked process object.
-    Use the returned 'event_index' with 'get_pml_event_details' and 'get_pml_event_stack_trace' for more info.
+    Queries events by streaming the pre-loaded XML file, returning summaries.
+    Use 'get_event_details' and 'get_event_stack_trace' with the event's 'sequence_number' for more info.
 
     Args:
-        filter_process: Optional exact process name to filter events by (case-insensitive). For non-ASCII names, try using Unicode escape sequences (e.g., '\\uXXXX\\uYYYY.exe').
-        filter_operation: Optional operation name to filter events by (case-insensitive).
-        filter_result: Optional result string (or hex '0x...' code) to filter events by (case-insensitive string match, or exact integer match for hex).
-        filter_path_contains: Optional string that must be contained in the event path (case-insensitive).
-        filter_process_contains: Optional string that must be contained in the process name (case-insensitive). For non-ASCII names, try using Unicode escape sequences.
+        filter_process: Optional exact process name (case-insensitive).
+        filter_operation: Optional operation name (case-insensitive).
+        filter_result: Optional result string or hex '0x...' code.
+        filter_path_contains: Optional string contained in the path (case-insensitive).
+        filter_process_contains: Optional string contained in the process name (case-insensitive).
         limit: Maximum number of event summaries to return.
 
     Returns:
-        A list of dictionaries, each summarizing a matching Procmon event including its 'event_index'. Returns an empty list if no events match.
+        List of dictionaries, each summarizing a matching event including 'sequence_number'.
     """
-    await ctx.info(f"Request received to query PML summaries. Filters: Process='{filter_process}', Op='{filter_operation}', Result='{filter_result}', PathContains='{filter_path_contains}', ProcessContains='{filter_process_contains}', Limit={limit}")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error(f"Query failed: The pre-loaded file '{LOADED_FILENAME}' is not a PML file or no file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    await ctx.info(f"Request received to query event summaries via streaming. Filters: Process='{filter_process}', Op='{filter_operation}', Result='{filter_result}', PathContains='{filter_path_contains}', ProcessContains='{filter_process_contains}', Limit={limit}")
+    if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error(f"Query failed: No XML file is loaded or file type is incorrect ({LOADED_FILE_TYPE}).")
+        raise TypeError("Operation requires an XML file to be pre-loaded.")
+    if LOADED_PROCESSES is None: # Check if processes were loaded
+         await ctx.warning("Process list not loaded; event enrichment might be incomplete.")
+         # Allow to proceed, but enrichment in ProcmonEvent.from_xml_element will use empty dict
 
     try:
+        abs_path = _get_stream_file_path()
         filtered_event_summaries = []
         count = 0
-        events_list = LOADED_DATA.get('events', [])
-        logger.debug(f"Starting event query on {len(events_list)} events.")
 
-        # Pre-process filter_result
-        filter_result_lower_str = None
-        filter_result_int = None
-        is_hex_filter = False
+        # Pre-process filters (same as before)
+        filter_result_lower_str = None; filter_result_int = None; is_hex_filter = False
         if filter_result:
             filter_result_lower = filter_result.lower()
             if filter_result_lower.startswith("0x"):
-                try:
-                    filter_result_int = int(filter_result_lower, 16)
-                    is_hex_filter = True
-                    logger.debug(f"Interpreting result_filter '{filter_result}' as hex integer: {filter_result_int}")
-                except ValueError:
-                    logger.warning(f"Could not parse result_filter '{filter_result}' as hex, treating as string.")
-                    filter_result_lower_str = filter_result_lower
-            else:
-                filter_result_lower_str = filter_result_lower
+                try: filter_result_int = int(filter_result_lower, 16); is_hex_filter = True
+                except ValueError: filter_result_lower_str = filter_result_lower
+            else: filter_result_lower_str = filter_result_lower
+        filter_process_lower = filter_process.lower() if filter_process else None
+        filter_operation_lower = filter_operation.lower() if filter_operation else None
+        filter_path_contains_lower = filter_path_contains.lower() if filter_path_contains else None
+        filter_process_contains_lower = filter_process_contains.lower() if filter_process_contains else None
 
-        for idx, event in enumerate(events_list):
+        # Stream events
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION): # Ignore processes dict yielded
             if count >= limit:
-                logger.debug(f"Query limit ({limit}) reached.")
+                logger.debug(f"Query limit ({limit}) reached during streaming.")
                 break
 
-            # Get attributes
-            process_obj = getattr(event, 'process', None)
-            process_name = safe_get_attributes(process_obj, ['process_name']).get('process_name', '') or ''
-            event_attrs = safe_get_attributes(event, ['operation', 'result', 'path', 'pid', 'timestamp'])
+            # Apply filters directly on the streamed event object
+            # Use safe_get_attributes for consistent access
+            event_attrs = safe_get_attributes(event, ['process_name', 'operation', 'result', 'path', 'pid', 'timestamp', 'sequence_number'])
+            process_name = event_attrs.get('process_name', '') or ''
             operation = event_attrs.get('operation', '') or ''
             result_val = event_attrs.get('result', '')
             path = event_attrs.get('path', '') or ''
-            pid = event_attrs.get('pid')
-            if pid is None and process_obj: pid = safe_get_attributes(process_obj, ['pid']).get('pid')
-            timestamp = event_attrs.get('timestamp')
 
-            result_str = str(result_val)
-
-            # Apply filters
             match = True
-            if filter_process is not None and process_name.lower() != filter_process.lower():
-                match = False
-            if match and filter_operation is not None and operation.lower() != filter_operation.lower():
-                match = False
+            if filter_process_lower is not None and process_name.lower() != filter_process_lower: match = False
+            if match and filter_operation_lower is not None and operation.lower() != filter_operation_lower: match = False
             if match and filter_result is not None:
+                # Apply result filter logic (same as before)
                 if is_hex_filter:
-                    if isinstance(result_val, int) and result_val == filter_result_int: match = True
-                    else: match = False
+                    event_result_int = None
+                    if isinstance(result_val, int): event_result_int = result_val
+                    elif isinstance(result_val, str):
+                         if result_val.lower().startswith("0x"):
+                              try: event_result_int = int(result_val, 16)
+                              except ValueError: pass
+                         elif result_val.isdigit() or (result_val.startswith('-') and result_val[1:].isdigit()):
+                              try: event_result_int = int(result_val)
+                              except ValueError: pass
+                    if event_result_int is None or event_result_int != filter_result_int: match = False
                 else:
-                    if result_str.lower() != filter_result_lower_str: match = False
-            if match and filter_path_contains is not None and filter_path_contains.lower() not in path.lower():
-                match = False
-            if match and filter_process_contains is not None and filter_process_contains.lower() not in process_name.lower():
-                match = False
+                    if str(result_val).lower() != filter_result_lower_str: match = False
+            if match and filter_path_contains_lower is not None and filter_path_contains_lower not in path.lower(): match = False
+            if match and filter_process_contains_lower is not None and filter_process_contains_lower not in process_name.lower(): match = False
 
             if match:
+                 # Create summary dict
                  event_summary = {
-                     'event_index': idx,
-                     'timestamp': str(timestamp),
+                     'sequence_number': event_attrs.get('sequence_number'), # Use sequence number instead of index
+                     'timestamp': str(event_attrs.get('timestamp')),
                      'process_name': process_name,
-                     'pid': pid,
+                     'pid': event_attrs.get('pid'),
                      'operation': operation,
                      'path': path,
                      'result': result_val,
@@ -399,528 +710,428 @@ async def query_loaded_pml_events(
                  filtered_event_summaries.append(event_summary)
                  count += 1
 
-        await ctx.info(f"Found {len(filtered_event_summaries)} matching event summaries in {LOADED_FILENAME}.")
+        await ctx.info(f"Found {len(filtered_event_summaries)} matching event summaries via streaming {LOADED_FILENAME}.")
         return filtered_event_summaries
 
     except Exception as e:
-        await ctx.error(f"Failed to query pre-loaded PML file {LOADED_FILENAME}: {e}")
+        await ctx.error(f"Failed to query XML file {LOADED_FILENAME} via streaming: {e}")
         logger.debug("Exception details:", exc_info=True)
-        raise RuntimeError(f"Internal error querying PML file: {e}")
-
+        raise RuntimeError(f"Internal error querying XML file via streaming: {e}")
 
 @tool_decorator
-async def get_loaded_pmc_rules(ctx: Context) -> List[Dict[str, Any]]:
+async def get_event_details(sequence_number: int, ctx: Context) -> Dict[str, Any]:
     """
-    Returns the filter rules from the loaded Procmon Configuration (PMC) file data.
-    Fails if the pre-loaded file is not a PMC file.
-    Returns:
-        A list of dictionaries, where each dictionary represents a filter rule.
-    """
-    await ctx.info(f"Request received for rules from pre-loaded PMC file.")
-    if LOADED_FILE_TYPE != 'pmc' or not LOADED_DATA:
-        await ctx.error(f"Get rules failed: The pre-loaded file '{LOADED_FILENAME}' is not a PMC file or no file is loaded.")
-        raise TypeError("Operation requires a PMC file to be pre-loaded.")
+    Retrieves detailed properties for a specific event by its SequenceNumber
+    by streaming the loaded XML file.
 
-    pmc_config_dict = LOADED_DATA
-    try:
-        rules_raw = pmc_config_dict.get('FilterRules', [])
-        rules_processed = []
-        if not rules_raw:
-             logger.debug("No filter rules found in PMC data.")
-        elif isinstance(rules_raw[0], dict):
-             logger.debug("PMC rules are already dictionaries.")
-             rules_processed = rules_raw
-        else:
-             logger.debug("Converting PMC rule objects to dictionaries.")
-             rule_attributes = ['column', 'relation', 'value', 'action']
-             for rule_obj in rules_raw:
-                 rules_processed.append(safe_get_attributes(rule_obj, rule_attributes))
-
-        await ctx.info(f"Extracted {len(rules_processed)} rules from pre-loaded file {LOADED_FILENAME}.")
-        return rules_processed
-    except Exception as e:
-        await ctx.error(f"Failed to get rules from pre-loaded PMC file {LOADED_FILENAME}: {e}")
-        logger.debug("Exception details:", exc_info=True)
-        raise RuntimeError(f"Internal error processing PMC file: {e}")
-
-@tool_decorator
-async def get_pml_event_details(event_index: int, ctx: Context) -> Dict[str, Any]:
-    """
-    Retrieves detailed properties for a specific event from the loaded PML data, referenced by its index.
-    Uses 'query_loaded_pml_events' first to find the index of the event.
     Args:
-        event_index: The zero-based index of the event in the loaded event list.
+        sequence_number: The SequenceNumber of the event to retrieve.
+
     Returns:
-        A dictionary containing available properties of the specified event (e.g., timestamp, pid, tid, operation, path, result, detail, category). Includes a summary of the linked process.
+        A dictionary containing available properties of the specified event. Includes enriched process info.
+        Raises ValueError if the sequence number is not found.
     """
-    await ctx.info(f"Request received for details of event index: {event_index}")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error(f"Get details failed: The pre-loaded file '{LOADED_FILENAME}' is not a PML file or no file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    await ctx.info(f"Request received for details of event sequence number: {sequence_number}")
+    if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error(f"Get details failed: No XML file is loaded or file type incorrect.")
+        raise TypeError("Operation requires an XML file to be pre-loaded.")
+    if LOADED_PROCESSES is None:
+         await ctx.warning("Process list not loaded; event enrichment might be incomplete.")
 
     try:
-        events = LOADED_DATA.get('events', [])
-        if not 0 <= event_index < len(events):
-            await ctx.error(f"Invalid event index: {event_index}. Must be between 0 and {len(events)-1}.")
-            raise IndexError(f"Event index {event_index} is out of bounds.")
+        abs_path = _get_stream_file_path()
+        found_event: Optional[ProcmonEvent] = None
 
-        event = events[event_index]
-        logger.debug(f"Retrieving details for event object at index {event_index}: {vars(event) if hasattr(event, '__dict__') else event}")
+        await ctx.info(f"Streaming file {LOADED_FILENAME} to find sequence number {sequence_number}...")
+        start_stream_time = time.time()
+        processed_count = 0
 
+        # Stream events to find the matching sequence number
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            processed_count += 1
+            if event.sequence_number == sequence_number:
+                found_event = event
+                break # Stop streaming once found
+            # Log progress occasionally for long searches
+            if processed_count % 500000 == 0:
+                 await ctx.info(f" Scanned {processed_count} events...")
+
+
+        end_stream_time = time.time()
+        logger.info(f"Scan for sequence number {sequence_number} took {end_stream_time - start_stream_time:.2f} seconds, scanned {processed_count} events.")
+
+        if not found_event:
+            await ctx.error(f"Event with SequenceNumber {sequence_number} not found in {LOADED_FILENAME}.")
+            raise ValueError(f"Event with SequenceNumber {sequence_number} not found.")
+
+        # Get details from the found event object
         event_attributes = [
-            'timestamp', 'pid', 'tid', 'parent_pid',
-            'operation', 'path', 'result', 'duration', 'detail', 'category',
-            'user_sid', 'session_id', 'authentication_id', 'is_64bit_process',
+            'timestamp', 'pid', 'tid', 'parent_pid', 'operation', 'path', 'result', 'duration',
+            'detail', 'category', 'user_sid', 'session_id', 'authentication_id',
+            'is_64bit_process', 'process_name', 'image_path', 'command_line', 'architecture',
+            'integrity', 'virtualized', 'sequence_number', 'relative_time', 'completion_time',
+            'stack' # Get raw stack for stack trace tool
         ]
-        details = safe_get_attributes(event, event_attributes)
-        details['event_index'] = event_index
+        details = safe_get_attributes(found_event, event_attributes)
+        details['sequence_number'] = sequence_number # Ensure it's there
 
-        process_obj = getattr(event, 'process', None)
-        if process_obj:
-            process_attrs = safe_get_attributes(process_obj, ['pid', 'process_name', 'image_path', 'parent_pid'])
-            details['process_name'] = process_attrs.get('process_name')
-            details['process_details_summary'] = process_attrs
-            if details.get('pid') is None and process_attrs.get('pid') is not None:
-                 details['pid'] = process_attrs.get('pid')
-            if details.get('parent_pid') is None and process_attrs.get('parent_pid') is not None:
-                 details['parent_pid'] = process_attrs.get('parent_pid')
-        else:
-             details['process_name'] = 'Unknown'
-             details['process_details_summary'] = None
+        # Create process summary
+        process_summary_fields = ['pid', 'process_name', 'image_path', 'parent_pid', 'command_line', 'user_sid', 'is_64bit_process', 'architecture', 'integrity', 'virtualized']
+        details['process_details_summary'] = {k: details.get(k) for k in process_summary_fields if k in details and details[k] is not None}
 
-        await ctx.info(f"Successfully retrieved details for event index {event_index}.")
-        logger.debug(f"Event details retrieved: {details}")
+        # Remove raw stack object from general details
+        if 'stack' in details: del details['stack']
+
+        # Ensure key fields are present
+        for key in ['pid', 'process_name', 'operation', 'path', 'result', 'timestamp']:
+             if key not in details: details[key] = None
+
+        await ctx.info(f"Successfully retrieved details for event sequence number {sequence_number}.")
         return details
 
-    except IndexError as e:
-        logger.debug(f"IndexError retrieving event details for index {event_index}.")
-        raise e
+    except ValueError as e: # Catch specific ValueError for not found
+         raise e
     except Exception as e:
-        await ctx.error(f"Failed to get details for event {event_index} in {LOADED_FILENAME}: {e}")
+        await ctx.error(f"Failed to get details for event sequence {sequence_number} in {LOADED_FILENAME}: {e}")
         logger.debug("Exception details:", exc_info=True)
-        raise RuntimeError(f"Internal error retrieving event details: {e}")
+        raise RuntimeError(f"Internal error retrieving event details via streaming: {e}")
 
 @tool_decorator
-async def get_pml_event_stack_trace(event_index: int, ctx: Context) -> List[str]:
+async def get_event_stack_trace(sequence_number: int, ctx: Context) -> List[Dict[str, Any]]:
     """
-    Retrieves the call stack trace for a specific event from the loaded PML data.
-    Uses 'query_loaded_pml_events' first to find the event index. Accesses the 'stacktrace' attribute of the event object.
+    Retrieves the detailed call stack trace for a specific event by its SequenceNumber
+    by streaming the loaded XML file.
+
     Args:
-        event_index: The zero-based index of the event in the loaded event list.
+        sequence_number: The SequenceNumber of the event.
+
     Returns:
-        A list of strings, each representing a memory address in hexadecimal format (e.g., "0x7FFA...") from the call stack. Returns an empty list if no stack trace is available or parsed.
+        A list of dictionaries, each representing a stack frame ('depth', 'address', 'path', 'location').
+        Empty list if no stack trace or event not found.
     """
-    await ctx.info(f"Request received for stack trace of event index: {event_index}")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error(f"Get stack trace failed: The pre-loaded file '{LOADED_FILENAME}' is not a PML file or no file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    await ctx.info(f"Request received for stack trace of event sequence number: {sequence_number}")
+    if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error(f"Get stack trace failed: No XML file is loaded or file type incorrect.")
+        raise TypeError("Operation requires an XML file to be pre-loaded.")
 
     try:
-        events = LOADED_DATA.get('events', [])
-        if not 0 <= event_index < len(events):
-            await ctx.error(f"Invalid event index: {event_index}. Must be between 0 and {len(events)-1}.")
-            raise IndexError(f"Event index {event_index} is out of bounds.")
+        abs_path = _get_stream_file_path()
+        found_event: Optional[ProcmonEvent] = None
 
-        event = events[event_index]
-        stack_trace_raw = safe_get_attributes(event, ['stacktrace']).get('stacktrace', [])
-        if not isinstance(stack_trace_raw, list):
-             stack_trace_raw = []
-        logger.debug(f"Raw stack trace for event {event_index}: {stack_trace_raw}")
-        stack_trace_hex = [f"0x{addr:X}" for addr in stack_trace_raw if isinstance(addr, int)]
+        await ctx.info(f"Streaming file {LOADED_FILENAME} to find sequence number {sequence_number} for stack trace...")
+        start_stream_time = time.time()
+        processed_count = 0
 
-        await ctx.info(f"Successfully retrieved stack trace (length: {len(stack_trace_hex)}) for event index {event_index}.")
-        logger.debug(f"Formatted stack trace: {stack_trace_hex}")
-        return stack_trace_hex
+        # Stream events to find the matching sequence number
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            processed_count += 1
+            if event.sequence_number == sequence_number:
+                found_event = event
+                break
+            if processed_count % 500000 == 0: await ctx.info(f" Scanned {processed_count} events...")
 
-    except IndexError as e:
-        logger.debug(f"IndexError retrieving stack trace for index {event_index}.")
-        raise e
+        end_stream_time = time.time()
+        logger.info(f"Scan for sequence number {sequence_number} took {end_stream_time - start_stream_time:.2f} seconds, scanned {processed_count} events.")
+
+        detailed_stack = []
+        if found_event:
+            stack_frames_raw = getattr(found_event, 'stack', None)
+            if isinstance(stack_frames_raw, list):
+                for frame in stack_frames_raw:
+                    if isinstance(frame, StackFrame):
+                        detailed_stack.append(frame.to_dict())
+                    else: logger.warning(f"Non-StackFrame object in stack for event {sequence_number}: {frame}")
+            elif stack_frames_raw is not None:
+                 logger.warning(f"Stack trace for event {sequence_number} is not a list: {type(stack_frames_raw)}")
+        else:
+             await ctx.warning(f"Event with SequenceNumber {sequence_number} not found, cannot retrieve stack trace.")
+             # Return empty list if event not found
+
+        await ctx.info(f"Successfully retrieved stack trace (length: {len(detailed_stack)}) for event sequence number {sequence_number}.")
+        logger.debug(f"Detailed stack trace for event {sequence_number}: {detailed_stack}")
+        return detailed_stack
+
     except Exception as e:
-        await ctx.error(f"Failed to get stack trace for event {event_index} in {LOADED_FILENAME}: {e}")
+        await ctx.error(f"Failed to get stack trace for event sequence {sequence_number} in {LOADED_FILENAME}: {e}")
         logger.debug("Exception details:", exc_info=True)
-        raise RuntimeError(f"Internal error retrieving event stack trace: {e}")
-
+        raise RuntimeError(f"Internal error retrieving event stack trace via streaming: {e}")
 
 @tool_decorator
-async def list_pml_processes(ctx: Context) -> List[Dict[str, Any]]:
+async def list_processes(ctx: Context) -> List[Dict[str, Any]]:
     """
-    Lists summary information for all unique processes found in the loaded PML file data.
-    Use 'get_pml_process_details' with a PID from this list to get full details.
-    Fails if the pre-loaded file is not a PML file.
+    Lists summary information (pid, process_name, image_path) for all unique processes
+    found in the pre-parsed process list from the loaded XML file.
+
     Returns:
-        A list of dictionaries, each summarizing a unique process (pid, process_name, image_path).
+        A list of dictionaries, each summarizing a unique process.
     """
-    await ctx.info("Request received to list processes from pre-loaded PML file.")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error(f"List processes failed: The pre-loaded file '{LOADED_FILENAME}' is not a PML file or no file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    await ctx.info(f"Request received to list processes from pre-loaded process list.")
+    if LOADED_PROCESSES is None or not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error(f"List processes failed: Process list not loaded or file type incorrect.")
+        raise TypeError("Operation requires an XML file's process list to be pre-loaded.")
 
     try:
-        process_list = LOADED_DATA.get('processes', [])
-        logger.debug(f"Found {len(process_list)} processes in process list.")
+        process_list = list(LOADED_PROCESSES.values()) # Get list of ProcessInfo objects
+        logger.debug(f"Listing {len(process_list)} processes from loaded data.")
         process_summaries = []
         summary_attributes = ['pid', 'process_name', 'image_path']
 
         for process_obj in process_list:
-             summary = safe_get_attributes(process_obj, summary_attributes)
-             if 'pid' not in summary or summary['pid'] is None:
-                 logger.warning(f"Process object missing PID: {vars(process_obj) if hasattr(process_obj, '__dict__') else process_obj}")
-                 continue
-             process_summaries.append(summary)
+            summary = safe_get_attributes(process_obj, summary_attributes)
+            if summary.get('pid') is None:
+                logger.warning(f"Process object missing PID in loaded list: {process_obj}")
+                continue
+            for attr in summary_attributes:
+                 if attr not in summary: summary[attr] = None
+            process_summaries.append(summary)
 
-        await ctx.info(f"Found {len(process_summaries)} process summaries in {LOADED_FILENAME}.")
+        await ctx.info(f"Generated {len(process_summaries)} process summaries from {LOADED_FILENAME}.")
         return process_summaries
     except Exception as e:
-        await ctx.error(f"Failed to list processes from {LOADED_FILENAME}: {e}")
+        await ctx.error(f"Failed to list processes from loaded data: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error listing processes: {e}")
 
-
 @tool_decorator
-async def get_pml_process_details(pid: int, ctx: Context) -> Dict[str, Any]:
+async def get_process_details(pid: int, ctx: Context) -> Dict[str, Any]:
     """
-    Retrieves detailed information for a specific process from the loaded PML data using its PID.
-    Searches the list of unique process objects extracted during file load.
-    Use 'list_pml_processes' first to see available PIDs.
-    Args:
-        pid: The Process ID of the process to retrieve details for.
-    Returns:
-        A dictionary containing detailed properties (e.g., pid, parent_pid, process_name, image_path, command_line, modules_summary) of the specified process. Returns an error if the PID is not found.
+    Retrieves detailed information for a specific process (by PID) from the pre-parsed
+    process list loaded from the XML file.
+
+    Args: pid: The Process ID.
+    Returns: Dictionary containing detailed properties. Error if PID not found in loaded list.
     """
-    await ctx.info(f"Request received for details of PID: {pid}")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error(f"Get process details failed: The pre-loaded file '{LOADED_FILENAME}' is not a PML file or no file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    await ctx.info(f"Request received for details of PID: {pid} from loaded process list.")
+    if LOADED_PROCESSES is None or not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error(f"Get process details failed: Process list not loaded or file type incorrect.")
+        raise TypeError("Operation requires an XML file's process list to be pre-loaded.")
 
     try:
-        process_list = LOADED_DATA.get('processes', [])
-        process_obj = None
-        for p_obj in process_list:
-            if safe_get_attributes(p_obj, ['pid']).get('pid') == pid:
-                process_obj = p_obj
+        process_obj: Optional[ProcessInfo] = None
+        # Efficient lookup now that LOADED_PROCESSES is keyed by process_index
+        # We need to iterate to find by PID
+        for proc in LOADED_PROCESSES.values():
+            if proc.pid == pid:
+                process_obj = proc
                 break
 
-        logger.debug(f"Looking for PID {pid} in process list. Found: {process_obj is not None}")
+        logger.debug(f"Looking for PID {pid} in loaded process list ({len(LOADED_PROCESSES)} items). Found: {process_obj is not None}")
 
         if not process_obj:
-            await ctx.error(f"Process with PID {pid} not found in the process list of {LOADED_FILENAME}.")
-            raise ValueError(f"Process with PID {pid} not found.")
+            await ctx.error(f"Process with PID {pid} not found in the loaded process list from {LOADED_FILENAME}.")
+            raise ValueError(f"Process with PID {pid} not found in pre-loaded list.")
 
-        process_attributes = [
-            'pid', 'parent_pid', 'process_name', 'image_path', 'command_line',
-            'user_sid', 'session_id', 'authentication_id',
-            'is_64bit', 'create_time', 'exit_time', 'modules'
-        ]
-        details = safe_get_attributes(process_obj, process_attributes)
-        if 'pid' not in details or details['pid'] is None:
-             details['pid'] = pid
+        details = dataclasses.asdict(process_obj)
+        details['pid'] = process_obj.pid
+        details['parent_pid'] = process_obj.parent_pid
+        details['user_sid'] = process_obj.user_sid
+        details['is_64bit_process'] = process_obj.is_64bit
+        for key in ['pid', 'parent_pid', 'process_name', 'image_path', 'command_line']:
+            if key not in details: details[key] = None
+        if 'parent_process_index' in details: del details['parent_process_index']
+        details['modules_summary'] = None # No modules in XML
 
-        modules_list = details.get('modules')
-        if isinstance(modules_list, list):
-             details['modules_summary'] = [safe_get_attributes(mod, ['path', 'address', 'size']) for mod in modules_list[:5]]
-             if 'modules' in details: del details['modules']
-
-        await ctx.info(f"Successfully retrieved details for PID {pid}.")
-        logger.debug(f"Process details retrieved for PID {pid}: {details}")
+        await ctx.info(f"Successfully retrieved details for PID {pid} from loaded list.")
         return details
 
-    except ValueError as e:
-        logger.debug(f"ValueError retrieving process details for PID {pid}.")
-        raise e
+    except ValueError as e: raise e # Re-raise not found error
     except Exception as e:
-        await ctx.error(f"Failed to get details for PID {pid} in {LOADED_FILENAME}: {e}")
+        await ctx.error(f"Failed to get details for PID {pid} from loaded list: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error retrieving process details: {e}")
 
 @tool_decorator
-async def get_pml_metadata(ctx: Context) -> Dict[str, Any]:
-    """
-    Retrieves metadata information potentially stored in the header of the loaded PML file.
-    Note: Header extraction may fail depending on the PML file and parser library version.
-    Fails if the pre-loaded file is not a PML file.
-    Returns:
-        A dictionary containing available metadata (e.g., os_version, computer_name) or a message indicating unavailability. Also includes actual loaded event/process counts.
-    """
-    await ctx.info("Request received for PML metadata.")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error(f"Get metadata failed: The pre-loaded file '{LOADED_FILENAME}' is not a PML file or no file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+async def get_metadata(ctx: Context) -> Dict[str, Any]:
+    """ Retrieves metadata for the loaded XML file (primarily process count). """
+    await ctx.info(f"Request received for metadata from XML file.")
+    if LOADED_PROCESSES is None or not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error(f"Get metadata failed: Process list not loaded or file type incorrect.")
+        raise TypeError("Operation requires an XML file's process list to be pre-loaded.")
 
     try:
-        header = LOADED_DATA.get('header')
-        metadata = {}
-        if header:
-            logger.debug(f"Retrieving metadata from header object: {vars(header) if hasattr(header, '__dict__') else header}")
-            header_attributes = [
-                'os_version', 'major_version', 'minor_version', 'build_number',
-                'computer_name', 'system_root',
-                'is_64bit_os', 'number_of_processors', 'total_physical_memory',
-                'total_events', # Count from header
-            ]
-            metadata = safe_get_attributes(header, header_attributes)
-            metadata["header_found"] = True
-        else:
-            await ctx.warning(f"No header information found in the loaded PML file: {LOADED_FILENAME}")
-            metadata["header_found"] = False
-            metadata["message"] = "No header information available from PML reader."
-
-
-        metadata['event_count_loaded'] = len(LOADED_DATA.get('events', []))
-        metadata['process_count_loaded'] = len(LOADED_DATA.get('processes', []))
-
+        metadata = {
+             "loaded_filename": LOADED_FILENAME, "file_type": LOADED_FILE_TYPE,
+             "compression": LOADED_COMPRESSION, "header_found": False,
+             "message": "Header info N/A for XML. Event count requires streaming.",
+             "os_version": None, "computer_name": None,
+             "process_count_loaded": len(LOADED_PROCESSES),
+             "event_count_loaded": "N/A (Streamed)"
+        }
         await ctx.info(f"Successfully retrieved metadata from {LOADED_FILENAME}.")
-        logger.debug(f"PML metadata retrieved: {metadata}")
+        logger.debug(f"File metadata retrieved: {metadata}")
         return metadata
-
     except Exception as e:
         await ctx.error(f"Failed to get metadata from {LOADED_FILENAME}: {e}")
         logger.debug("Exception details:", exc_info=True)
-        raise RuntimeError(f"Internal error retrieving PML metadata: {e}")
+        raise RuntimeError(f"Internal error retrieving metadata: {e}")
 
-# --- Analysis Tools ---
+# --- Analysis Tools (Streaming) ---
 
 @tool_decorator
 async def count_events_by_process(ctx: Context) -> Dict[str, int]:
-    """
-    Counts the number of events associated with each process name in the loaded PML file.
-    Process name is retrieved from the event's linked process object.
-    Returns:
-        A dictionary where keys are process names and values are the event counts. Returns empty dict if no events.
-    """
-    await ctx.info("Request received to count events by process name.")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error("Operation failed: No PML file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    """ Counts events per process name by streaming the loaded XML file. """
+    await ctx.info(f"Request received to count events by process name via streaming.")
+    if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error("Operation failed: No XML file loaded.")
+        raise TypeError("Operation requires an XML file to be pre-loaded.")
 
     try:
+        abs_path = _get_stream_file_path()
         event_counts = defaultdict(int)
-        events_list = LOADED_DATA.get('events', [])
-        for event in events_list:
-            process_obj = getattr(event, 'process', None)
-            process_name = safe_get_attributes(process_obj, ['process_name']).get('process_name', 'Unknown') or 'Unknown'
-            event_counts[process_name] += 1
+        total_events = 0
 
-        await ctx.info(f"Counted events for {len(event_counts)} processes.")
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            total_events += 1
+            process_name = safe_get_attributes(event, ['process_name']).get('process_name', 'Unknown') or 'Unknown'
+            event_counts[process_name] += 1
+            if total_events % 500000 == 0: await ctx.info(f" Counted {total_events} events...")
+
+
+        await ctx.info(f"Counted {total_events} total events for {len(event_counts)} processes in {LOADED_FILENAME}.")
         logger.debug(f"Event counts by process: {dict(event_counts)}")
         return dict(event_counts)
     except Exception as e:
-        await ctx.error(f"Failed to count events by process: {e}")
+        await ctx.error(f"Failed to count events by process via streaming: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error counting events by process: {e}")
 
 @tool_decorator
 async def summarize_operations_by_process(process_name_filter: str, ctx: Context) -> Dict[str, int]:
-    """
-    Counts the occurrences of each operation type for a specific process name (case-sensitive exact match).
-    Process name is retrieved from the event's linked process object.
-    Args:
-        process_name_filter: The exact process name to summarize operations for.
-    Returns:
-        A dictionary where keys are operation names and values are the counts for the specified process. Returns empty dict if process not found or has no events.
-    """
-    await ctx.info(f"Request received to summarize operations for process: {process_name_filter}")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error("Operation failed: No PML file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    """ Counts operations for a specific process name (case-sensitive) by streaming the XML file. """
+    await ctx.info(f"Request to summarize operations for process: {process_name_filter} via streaming.")
+    if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error("Operation failed: No XML file loaded.")
+        raise TypeError("Operation requires an XML file to be pre-loaded.")
     if not process_name_filter:
-        await ctx.error("Process name filter cannot be empty.")
-        raise ValueError("Process name filter is required.")
+        await ctx.error("Process name filter cannot be empty."); raise ValueError("Process name filter is required.")
 
     try:
+        abs_path = _get_stream_file_path()
         operation_counts = defaultdict(int)
-        events_list = LOADED_DATA.get('events', [])
         event_count_for_process = 0
-        for event in events_list:
-            process_obj = getattr(event, 'process', None)
-            process_name = safe_get_attributes(process_obj, ['process_name']).get('process_name', '') or ''
-            # Use exact case-sensitive match as requested
-            if process_name == process_name_filter:
+
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            process_name = safe_get_attributes(event, ['process_name']).get('process_name', '') or ''
+            if process_name == process_name_filter: # Case-sensitive match
                 event_count_for_process += 1
                 operation = safe_get_attributes(event, ['operation']).get('operation', 'Unknown') or 'Unknown'
                 operation_counts[operation] += 1
+                if event_count_for_process % 100000 == 0: await ctx.info(f" Found {event_count_for_process} events for '{process_name_filter}'...")
 
-        await ctx.info(f"Summarized {len(operation_counts)} operation types for process '{process_name_filter}' from {event_count_for_process} events.")
-        logger.debug(f"Operation counts for '{process_name_filter}': {dict(operation_counts)}")
-        if event_count_for_process == 0:
-            await ctx.warning(f"No events found for process name '{process_name_filter}'.")
+
+        await ctx.info(f"Summarized {len(operation_counts)} ops for '{process_name_filter}' ({event_count_for_process} events) in {LOADED_FILENAME}.")
+        if event_count_for_process == 0: await ctx.warning(f"No events found for process name '{process_name_filter}'.")
         return dict(operation_counts)
     except Exception as e:
-        await ctx.error(f"Failed to summarize operations for process '{process_name_filter}': {e}")
+        await ctx.error(f"Failed to summarize operations for '{process_name_filter}' via streaming: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error summarizing operations: {e}")
 
 @tool_decorator
-async def find_events_by_result(
-    result_filter: str,
-    limit: int = 50,
-    *,
-    ctx: Context
-) -> List[Dict[str, Any]]:
-    """
-    Finds event summaries matching a specific result value.
-    Compares against the event's 'result' attribute.
-    If 'result_filter' starts with '0x', it's treated as a hexadecimal integer and compared numerically against integer results.
-    Otherwise, it performs a case-insensitive string comparison against the string representation of the event's result.
-    Args:
-        result_filter: The result value (e.g., 'SUCCESS', 'ACCESS DENIED', '0', '3221225506', '0xc0000022') to filter by.
-        limit: Maximum number of event summaries to return.
-    Returns:
-        A list of dictionaries, each summarizing a matching Procmon event including its 'event_index'. Returns empty list if no matches.
-    """
-    await ctx.info(f"Request received to find events by result: '{result_filter}', Limit={limit}")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error("Operation failed: No PML file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+async def find_events_by_result(result_filter: str, limit: int = 50, *, ctx: Context) -> List[Dict[str, Any]]:
+    """ Finds event summaries matching a result value (string/hex) by streaming the XML file. """
+    await ctx.info(f"Request received to find events by result: '{result_filter}', Limit={limit} via streaming.")
+    if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error("Operation failed: No XML file loaded.")
+        raise TypeError("Operation requires an XML file to be pre-loaded.")
     if not result_filter:
-        await ctx.error("Result filter cannot be empty.")
-        raise ValueError("Result filter is required.")
+        await ctx.error("Result filter cannot be empty."); raise ValueError("Result filter is required.")
 
     try:
+        abs_path = _get_stream_file_path()
         filtered_event_summaries = []
         count = 0
-        events_list = LOADED_DATA.get('events', [])
-        logger.debug(f"Starting event search by result '{result_filter}' on {len(events_list)} events.")
 
-        # Pre-process filter_result
-        filter_result_lower_str = None
-        filter_result_int = None
-        is_hex_filter = False
+        # Pre-process filter
+        filter_result_lower_str=None; filter_result_int=None; is_hex_filter=False
         if result_filter.lower().startswith("0x"):
-            try:
-                filter_result_int = int(result_filter, 16)
-                is_hex_filter = True
-                logger.debug(f"Interpreting result_filter '{result_filter}' as hex integer: {filter_result_int} (0x{filter_result_int:X})")
-            except ValueError:
-                logger.warning(f"Could not parse result_filter '{result_filter}' as hex, treating as string.")
-                filter_result_lower_str = result_filter.lower()
-        else:
-            filter_result_lower_str = result_filter.lower()
+            try: filter_result_int=int(result_filter,16); is_hex_filter=True
+            except ValueError: filter_result_lower_str=result_filter.lower()
+        else: filter_result_lower_str=result_filter.lower()
 
-        for idx, event in enumerate(events_list):
-            if count >= limit:
-                logger.debug(f"Query limit ({limit}) reached.")
-                break
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            if count >= limit: break
 
-            event_attrs = safe_get_attributes(event, ['result', 'timestamp', 'pid', 'operation', 'path'])
-            result_val = event_attrs.get('result')
-
+            result_val = safe_get_attributes(event, ['result']).get('result')
             match = False
+            # Apply result filter logic
             if is_hex_filter:
-                event_result_int = None
-                if isinstance(result_val, int):
-                    event_result_int = result_val
-                elif isinstance(result_val, str) and result_val.isdigit():
-                     try: event_result_int = int(result_val)
-                     except ValueError: pass
-
-                if event_result_int is not None and event_result_int == filter_result_int:
-                    match = True
-                    logger.debug(f"Event {idx}: Matched hex filter. Event result (int): {event_result_int}, Filter int: {filter_result_int}")
-
+                event_result_int=None
+                if isinstance(result_val,int): event_result_int=result_val
+                elif isinstance(result_val,str):
+                    if result_val.lower().startswith("0x"):
+                        try: event_result_int=int(result_val,16)
+                        except ValueError: pass
+                    elif result_val.isdigit() or (result_val.startswith('-') and result_val[1:].isdigit()):
+                        try: event_result_int=int(result_val)
+                        except ValueError: pass
+                if event_result_int is not None and event_result_int == filter_result_int: match=True
             elif filter_result_lower_str is not None:
-                result_str = str(result_val)
-                if result_str.lower() == filter_result_lower_str:
-                    match = True
-                    logger.debug(f"Event {idx}: Matched string filter. Event result_str.lower(): '{result_str.lower()}', Filter lower: '{filter_result_lower_str}'")
+                if str(result_val).lower() == filter_result_lower_str: match=True
 
             if match:
-                 process_obj = getattr(event, 'process', None)
-                 process_name = safe_get_attributes(process_obj, ['process_name']).get('process_name', '') or ''
-                 pid = event_attrs.get('pid')
-                 if pid is None and process_obj: pid = safe_get_attributes(process_obj, ['pid']).get('pid')
+                # Create summary
+                event_attrs = safe_get_attributes(event, ['timestamp', 'pid', 'process_name', 'operation', 'path', 'sequence_number'])
+                event_summary={'sequence_number':event_attrs.get('sequence_number'), 'timestamp':str(event_attrs.get('timestamp')),'process_name':event_attrs.get('process_name','')or'','pid':event_attrs.get('pid'),'operation':event_attrs.get('operation',''),'path':event_attrs.get('path',''),'result':result_val}
+                filtered_event_summaries.append(event_summary)
+                count+=1
 
-                 event_summary = {
-                     'event_index': idx,
-                     'timestamp': str(event_attrs.get('timestamp')),
-                     'process_name': process_name,
-                     'pid': pid,
-                     'operation': event_attrs.get('operation', ''),
-                     'path': event_attrs.get('path', ''),
-                     'result': result_val,
-                 }
-                 filtered_event_summaries.append(event_summary)
-                 count += 1
-
-        await ctx.info(f"Found {len(filtered_event_summaries)} events matching result '{result_filter}'.")
+        await ctx.info(f"Found {len(filtered_event_summaries)} events matching result '{result_filter}' via streaming {LOADED_FILENAME}.")
         return filtered_event_summaries
-
     except Exception as e:
-        await ctx.error(f"Failed to find events by result '{result_filter}': {e}")
+        await ctx.error(f"Failed to find events by result '{result_filter}' via streaming: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error finding events by result: {e}")
 
 @tool_decorator
 async def get_process_tree(ctx: Context) -> Dict[int, Dict[str, Any]]:
-    """
-    Constructs and returns the process tree based on parent PIDs found in the loaded PML data.
-    Returns:
-        A dictionary representing the process tree. Keys are PIDs. Values are dictionaries containing
-        'process_name', 'image_path', and 'children' (a dictionary mapping child PIDs to their nodes).
-        Processes with no known parent in the log are listed under the root.
-    """
-    await ctx.info("Request received to get process tree.")
-    if LOADED_FILE_TYPE != 'pml' or not LOADED_DATA:
-        await ctx.error("Operation failed: No PML file is loaded.")
-        raise TypeError("Operation requires a PML file to be pre-loaded.")
+    """ Constructs the process tree from the pre-loaded process list. """
+    await ctx.info(f"Request received to get process tree from loaded list.")
+    if LOADED_PROCESSES is None or not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error("Operation failed: Process list not loaded or file type incorrect.")
+        raise TypeError("Operation requires an XML file's process list to be pre-loaded.")
 
     try:
-        process_list = LOADED_DATA.get('processes', [])
-        if not process_list:
-            await ctx.warning("No process information available to build tree.")
-            return {}
-
-        process_map = {}
+        # --- Tree building logic remains the same (uses LOADED_PROCESSES) ---
+        process_list = list(LOADED_PROCESSES.values())
+        if not process_list: await ctx.warning("No process info available for tree."); return {}
+        process_map:Dict[int,Dict[str,Any]]={}; all_pids=set()
         for p_obj in process_list:
-            pid = safe_get_attributes(p_obj, ['pid']).get('pid')
-            if pid is not None:
-                process_map[pid] = {
-                    'obj': p_obj,
-                    'children': []
-                }
+            pid=p_obj.pid # Access directly
+            if pid is not None: process_map[pid]={'obj':p_obj,'children':[]}; all_pids.add(pid)
+            else: logger.warning(f"Skipping process object without PID: {p_obj}")
+        roots=[]
+        for pid,p_data in process_map.items():
+            parent_pid=p_data['obj'].parent_pid # Access directly
+            if parent_pid is not None and parent_pid in all_pids:
+                if parent_pid!=pid:
+                    if parent_pid in process_map: process_map[parent_pid]['children'].append(pid)
+                    else: logger.warning(f"PID {pid} parent {parent_pid} not in map."); roots.append(pid)
+                else: logger.warning(f"PID {pid} is own parent."); roots.append(pid)
+            else: roots.append(pid)
+        roots=sorted(list(dict.fromkeys(roots)))
 
-        roots = []
-        all_pids = set(process_map.keys())
-        for pid, p_data in process_map.items():
-            parent_pid = safe_get_attributes(p_data['obj'], ['parent_pid']).get('parent_pid')
-            if parent_pid is not None and parent_pid in process_map:
-                process_map[parent_pid]['children'].append(pid)
-            elif parent_pid is None or parent_pid not in all_pids:
-                 if pid not in roots:
-                    roots.append(pid)
-
-
-        def build_tree_node(pid):
-            p_data = process_map.get(pid)
+        def build_tree_node(pid_to_build:int)->Optional[Dict[str,Any]]:
+            p_data=process_map.get(pid_to_build)
             if not p_data: return None
             p_obj = p_data['obj']
-            node_attrs = safe_get_attributes(p_obj, ['process_name', 'image_path'])
-            node = {
-                'pid': pid,
-                'process_name': node_attrs.get('process_name', 'Unknown'),
-                'image_path': node_attrs.get('image_path'),
-                'children': {}
-            }
-            children_pids = sorted(p_data.get('children', []))
-            for child_pid in children_pids:
-                child_node = build_tree_node(child_pid)
-                if child_node:
-                     node['children'][child_pid] = child_node
-            if not node['children']:
-                 del node['children']
+            node={'pid':pid_to_build,'process_name':p_obj.process_name or 'Unknown','image_path':p_obj.image_path}
+            child_pids=sorted(p_data.get('children',[]))
+            if child_pids:
+                node['children']={}
+                for child_pid in child_pids:
+                    child_node=build_tree_node(child_pid)
+                    if child_node: node['children'][child_pid]=child_node
             return node
 
-        process_tree_output = {}
-        for root_pid in sorted(roots):
-            root_node = build_tree_node(root_pid)
-            if root_node:
-                process_tree_output[root_pid] = root_node
-
-        await ctx.info(f"Constructed process tree with {len(roots)} root(s).")
-        logger.debug(f"Process tree: {process_tree_output}")
+        process_tree_output={}
+        for root_pid in roots:
+            root_node=build_tree_node(root_pid)
+            if root_node: process_tree_output[root_pid]=root_node
+        await ctx.info(f"Constructed process tree with {len(roots)} root(s) from loaded list.")
         return process_tree_output
-
     except Exception as e:
-        await ctx.error(f"Failed to build process tree: {e}")
+        await ctx.error(f"Failed to build process tree from loaded list: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error building process tree: {e}")
 
@@ -928,84 +1139,81 @@ async def get_process_tree(ctx: Context) -> Dict[int, Dict[str, Any]]:
 # --- Main Execution Block ---
 if __name__ == "__main__":
     if not MCP_SDK_AVAILABLE:
-        print("Error: Model Context Protocol SDK (modelcontextprotocol) is not installed. Cannot start server.")
+        print("Error: Model Context Protocol SDK (modelcontextprotocol) is not installed.")
         exit(1)
 
-    parser = argparse.ArgumentParser(description="MCP Server for analyzing a specific Procmon file.")
-    parser.add_argument("--allowed-dir", required=True, help="REQUIRED: The secure base directory containing Procmon files.")
-    parser.add_argument("--load-file", required=False, help="Optional: The specific PML or PMC filename (relative to --allowed-dir) to pre-load and analyze.")
-    parser.add_argument("--mcp-host", type=str, default="127.0.0.1",
-                        help="Host to run MCP server on (only used for sse transport), default: 127.0.0.1")
-    parser.add_argument("--mcp-port", type=int, default=8081,
-                        help="Port to run MCP server on (only used for sse transport), default: 8081")
-    parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"],
-                        help="Transport protocol for MCP, default: stdio")
+    parser = argparse.ArgumentParser(description="MCP Server for analyzing Procmon XML files (.xml, .xml.gz/bz2/xz) via streaming.")
+    parser.add_argument("--allowed-dir", required=True, help="REQUIRED: Secure base directory containing Procmon XML files.")
+    parser.add_argument("--load-file", required=True, # Make load-file required for streaming
+                        help="REQUIRED: XML file (.xml, .xml.gz/bz2/xz) relative to --allowed-dir (no subdirs) to analyze.")
+    parser.add_argument("--mcp-host", type=str, default="127.0.0.1", help="Host for MCP server (SSE transport), default: 127.0.0.1")
+    parser.add_argument("--mcp-port", type=int, default=8081, help="Port for MCP server (SSE transport), default: 8081")
+    parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"], help="MCP transport protocol, default: stdio")
     parser.add_argument("--debug", action='store_true', help="Enable debug logging.")
 
     args = parser.parse_args()
 
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.getLogger().setLevel(log_level)
+    logger.setLevel(log_level)
     logger.info(f"Logging level set to: {logging.getLevelName(log_level)}")
 
     if not os.path.isdir(args.allowed_dir):
-        logger.critical(f"Error: The specified allowed directory does not exist: {args.allowed_dir}")
+        logger.critical(f"Error: Allowed directory does not exist: {args.allowed_dir}")
         exit(1)
 
     ALLOWED_DIR_CONFIG = os.path.abspath(args.allowed_dir)
     logger.info(f"Allowed Directory set to: {ALLOWED_DIR_CONFIG}")
 
-    if args.load_file:
-        try:
-            LOADED_DATA, LOADED_FILE_TYPE = load_and_validate_file(ALLOWED_DIR_CONFIG, args.load_file)
-            LOADED_FILENAME = args.load_file
-            logger.info(f"Successfully pre-loaded {LOADED_FILE_TYPE} file: {LOADED_FILENAME}")
-            if args.debug and LOADED_DATA:
-                 if LOADED_FILE_TYPE == 'pml':
-                      logger.debug(f"PML Load Summary: Events={len(LOADED_DATA.get('events',[]))}, Processes={len(LOADED_DATA.get('processes',[]))}, Header={LOADED_DATA.get('header') is not None}")
-                 elif LOADED_FILE_TYPE == 'pmc':
-                      logger.debug(f"PMC Load Summary: Rules={len(LOADED_DATA.get('FilterRules',[]))}")
+    # Load only processes at startup
+    try:
+        logger.info(f"Attempting to validate and load process list from: {args.load_file}")
+        # load_and_validate_file now stores processes globally and returns them too
+        loaded_procs, file_type, compression = load_and_validate_file(ALLOWED_DIR_CONFIG, args.load_file)
 
-        except (ValueError, PermissionError, FileNotFoundError, TypeError) as e:
-            logger.critical(f"Error pre-loading file specified by --load-file: {e}")
-            exit(1)
-        except RuntimeError as e:
-             logger.critical(f"Error: {e}")
+        if file_type != 'xml' or loaded_procs is None: # Check if loading succeeded
+             logger.critical(f"Initial file processing failed for '{args.load_file}'. Check logs.")
              exit(1)
-        except Exception as e:
-            logger.critical(f"An unexpected error occurred during file pre-loading: {e}", exc_info=args.debug)
-            exit(1)
-    else:
-        logger.info("No specific file pre-loaded. Tools operating on loaded data will report errors.")
 
+        logger.info(f"Successfully validated file and loaded {len(loaded_procs)} processes for: {args.load_file}")
+        if args.debug:
+             logger.debug(f"XML Load Summary: Processes={len(loaded_procs)}, Compression={compression}, Events=Streamed")
+
+    except (ValueError, PermissionError, FileNotFoundError, TypeError, IndexError) as e:
+        logger.critical(f"Error during initial file processing ('{args.load_file}'): {e}")
+        exit(1)
+    except ET_impl.XMLSyntaxError as e:
+         logger.critical(f"XML Syntax Error during initial file processing ('{args.load_file}'): {e}")
+         exit(1)
+    except RuntimeError as e:
+         logger.critical(f"Runtime Error during initial file processing ('{args.load_file}'): {e}")
+         exit(1)
+    except Exception as e:
+        logger.critical(f"An unexpected error occurred during initial file processing ('{args.load_file}'): {e}", exc_info=args.debug)
+        exit(1)
+
+    # --- Start MCP Server ---
     server_started = False
     try:
         if args.transport == "sse":
             if hasattr(mcp, 'settings'):
                 logger.info("Configuring MCP for SSE transport...")
-                mcp.settings.host = args.mcp_host
-                mcp.settings.port = args.mcp_port
-                mcp.settings.log_level = logging.getLevelName(log_level)
+                mcp.settings.host = args.mcp_host; mcp.settings.port = args.mcp_port
+                mcp_log_level_name = logging.getLevelName(log_level)
+                mcp.settings.log_level = mcp_log_level_name.lower()
                 logger.info(f"  MCP Host: {mcp.settings.host}")
                 logger.info(f"  MCP Port: {mcp.settings.port}")
                 logger.info(f"  MCP Log Level: {mcp.settings.log_level}")
-            else:
-                 logger.warning("MCP object does not have 'settings' attribute. Cannot configure host/port/log_level for SSE.")
-
+            else: logger.warning("MCP object lacks 'settings'; cannot configure SSE.")
             logger.info("Starting MCP server with SSE transport...")
             mcp.run(transport="sse")
             server_started = True
-
         else: # Default to stdio
             logger.info("Starting MCP server with STDIO transport...")
-            mcp.run() # No arguments needed for stdio
+            mcp.run()
             server_started = True
-
     except Exception as e:
         logger.critical(f"Failed during server startup: {e}", exc_info=args.debug)
 
-    if not server_started:
-         logger.critical("Server did not start.")
-         exit(1)
-    else:
-         logger.info("Server finished.")
+    if not server_started: logger.critical("Server did not start."); exit(1)
+    else: logger.info("Server execution finished."); exit(0)
