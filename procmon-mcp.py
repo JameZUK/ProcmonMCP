@@ -8,6 +8,8 @@ import asyncio
 import time # For timing the loading
 from collections import defaultdict # For counting
 import dataclasses # For XML data structures
+import re # For regex filtering
+from datetime import datetime # For time-based filtering
 
 # Standard library compression formats
 import gzip
@@ -52,12 +54,20 @@ except ImportError:
         def run(self, transport: str = "stdio"): logger.info(f"MockMCP '{self.name}' run method called with transport='{transport}'."); logger.info(f"MockMCP settings - Host: {self.settings.host}, Port: {self.settings.port}"); self._run_called_with_transport = transport
     FastMCP = MockMCP
     class Context:
-        async def info(self, msg): logger.info(f"(async mock ctx): {msg}")
-        async def error(self, msg): logger.error(f"(async mock ctx): {msg}")
-        async def warning(self, msg): logger.warning(f"(async mock ctx): {msg}")
+        # Basic mock context for offline execution/testing
+        async def info(self, msg): logger.info(f"(mock ctx): {msg}")
+        async def error(self, msg): logger.error(f"(mock ctx): {msg}")
+        async def warning(self, msg): logger.warning(f"(mock ctx): {msg}")
 
 # XML parser code is integrated
 PROCMON_XML_PARSER_AVAILABLE = True
+
+# --- Constants ---
+# Define common timestamp formats found in Procmon XML (add more if needed)
+# Example: "HH:MM:SS.ms" or "YYYY-MM-DD HH:MM:SS.ms" - Procmon XML usually just has Time_of_Day
+# Adjust this format string based on actual XML content. This assumes HH:MM:SS.microseconds
+PROCMON_TIMESTAMP_FORMAT = "%H:%M:%S.%f"
+PROGRESS_REPORT_INTERVAL = 250000 # Report progress every N events during streaming
 
 # --- XML Parser Data Structures ---
 @dataclasses.dataclass
@@ -90,8 +100,8 @@ class ProcessInfo:
     parent_process_id: Optional[int] = None
     parent_process_index: Optional[int] = None
     authentication_id: Optional[str] = None
-    create_time: Optional[str] = None
-    finish_time: Optional[str] = None
+    create_time: Optional[str] = None # Keep as string, parse if needed
+    finish_time: Optional[str] = None # Keep as string, parse if needed
     is_virtualized: Optional[bool] = None
     is_64bit: Optional[bool] = None
     integrity: Optional[str] = None
@@ -169,7 +179,7 @@ class ProcmonEvent:
     duration: Optional[float] = None
     completion_time: Optional[str] = None
     relative_time: Optional[float] = None
-    sequence_number: Optional[int] = None # Crucial for finding specific events
+    sequence_number: Optional[int] = None
     process_index: Optional[int] = None
     stack: Optional[List[StackFrame]] = None
     tid: Optional[int] = None
@@ -183,8 +193,25 @@ class ProcmonEvent:
     virtualized: Optional[bool] = None
     authentication_id: Optional[str] = None
 
+    # Cache parsed timestamp
+    _parsed_timestamp: Optional[datetime] = None
+
     @property
-    def timestamp(self): return self.time_of_day
+    def timestamp(self) -> Optional[datetime]:
+        """Parses and returns the Time_of_Day as a datetime object (cached)."""
+        if self._parsed_timestamp is None and self.time_of_day:
+            try:
+                # Attempt parsing using the defined format
+                self._parsed_timestamp = datetime.strptime(self.time_of_day, PROCMON_TIMESTAMP_FORMAT)
+                # Note: This creates a datetime object with today's date. If absolute date is needed,
+                # it must be derived from file metadata or context if available.
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Could not parse timestamp '{self.time_of_day}': {e}")
+                # Set to a sentinel value or keep as None to avoid re-parsing attempt?
+                # For now, let it retry if accessed again, maybe format was wrong.
+                pass # Keep self._parsed_timestamp as None
+        return self._parsed_timestamp
+
     @property
     def user_sid(self): return self.user
     @property
@@ -215,7 +242,7 @@ class ProcmonEvent:
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo]) -> 'ProcmonEvent':
         data: Dict[str, Any] = {}
-        data['time_of_day'] = cls._safe_find_text(elem, 'Time_of_Day')
+        data['time_of_day'] = cls._safe_find_text(elem, 'Time_of_Day') # Keep original string
         data['process_name'] = cls._safe_find_text(elem, 'Process_Name')
         data['operation'] = cls._safe_find_text(elem, 'Operation')
         data['path'] = cls._safe_find_text(elem, 'Path')
@@ -280,29 +307,24 @@ def _clear_elem(elem: ET_impl.Element):
 def _parse_xml_stream(source_stream: IO[bytes], parse_events: bool = True) -> Tuple[Optional[Iterator[ProcmonEvent]], Dict[int, ProcessInfo]]:
     """
     Internal helper function to parse XML from a byte stream using iterparse (lxml preferred).
-
-    Parses the <processlist> first to build a dictionary for enrichment.
-    Optionally yields <event> elements via a generator based on `parse_events` flag.
-
-    Args:
-        source_stream: A readable binary stream providing the XML content.
-        parse_events: If True, yields events. If False, stops after parsing processes.
-
-    Returns:
-        A tuple containing:
-          - An iterator yielding ProcmonEvent objects (or None if parse_events is False).
-          - A dictionary mapping process index to ProcessInfo objects parsed from <processlist>.
-
-    Raises:
-        ET_impl.XMLSyntaxError: If the XML is malformed.
-        ValueError: If the root <procmon> tag is missing or structure is invalid.
+    Parses <processlist> first, then optionally yields <event> elements.
     """
     processes_dict: Dict[int, ProcessInfo] = {}
     parsing_stage = "seeking_procmon"
     processlist_parsed = False
     eventlist_entered = False
     tags_of_interest = ('process', 'event', 'processlist', 'eventlist', 'procmon')
-    context = ET_impl.iterparse(source_stream, events=('end',), tag=tags_of_interest)
+    # Use iterparse for streaming, focusing on 'end' events for relevant tags
+    # Wrap in try...except for better error reporting during parsing setup
+    try:
+        context = ET_impl.iterparse(source_stream, events=('end',), tag=tags_of_interest)
+    except ET_impl.XMLSyntaxError as e:
+        logger.error(f"XML Syntax Error at start of parsing: {e}")
+        raise # Re-raise critical syntax error
+    except Exception as e:
+        logger.error(f"Unexpected error initializing XML parser: {e}", exc_info=True)
+        raise RuntimeError("Failed to initialize XML parser") from e
+
 
     def event_generator() -> Iterator[ProcmonEvent]:
         nonlocal parsing_stage, eventlist_entered
@@ -314,8 +336,7 @@ def _parse_xml_stream(source_stream: IO[bytes], parse_events: bool = True) -> Tu
                     try:
                         yield ProcmonEvent.from_xml_element(elem, processes_dict)
                         event_count += 1
-                        # Reduce logging frequency for streaming
-                        if event_count % 250000 == 0: logger.info(f"Streamed {event_count} events...")
+                        # Progress reporting done in calling tool functions
                     except Exception as e: logger.warning(f"Failed to parse <event> element: {e}", exc_info=False)
                     _clear_elem(elem)
                 elif elem.tag == 'eventlist':
@@ -325,7 +346,7 @@ def _parse_xml_stream(source_stream: IO[bytes], parse_events: bool = True) -> Tu
                     logger.debug("Reached end of <procmon> during event generation.")
                     parsing_stage = "done"; break
                 elif elem.tag in tags_of_interest: _clear_elem(elem)
-            logger.info(f"Total events successfully streamed: {event_count}")
+            logger.info(f"Total events successfully yielded by generator: {event_count}")
         except ET_impl.XMLSyntaxError as e: logger.error(f"XML Parse Error during event stream: {e}"); raise
         except Exception as e: logger.error(f"Unexpected error during event stream: {e}", exc_info=True); raise
 
@@ -367,18 +388,24 @@ def _parse_xml_stream(source_stream: IO[bytes], parse_events: bool = True) -> Tu
 def stream_procmon_events(file_path: str, compression: Optional[str]) -> Iterator[Tuple[ProcmonEvent, Dict[int, ProcessInfo]]]:
     """
     Opens a Procmon XML file (plain or compressed) and yields events one by one.
-    Parses the process list first and includes it with each yielded event for context.
+    Includes the globally loaded process dictionary with each event.
 
     Args:
         file_path: Absolute path to the XML file.
         compression: Compression type ('gz', 'bz2', 'xz', or None).
 
     Yields:
-        Tuple[ProcmonEvent, Dict[int, ProcessInfo]]: The event and the full process dictionary.
+        Tuple[ProcmonEvent, Dict[int, ProcessInfo]]: The event and the *globally loaded* process dictionary.
 
     Raises:
         FileNotFoundError, ValueError, RuntimeError, ET_impl.XMLSyntaxError
     """
+    global LOADED_PROCESSES # Access the globally loaded processes
+    if LOADED_PROCESSES is None:
+        # Attempt to load processes if not already loaded? Or just fail?
+        # For simplicity, assume load_and_validate_file was called successfully before.
+        raise RuntimeError("Process list was not loaded before streaming events.")
+
     open_func: Any = open
     if compression == 'gz': open_func = gzip.open
     elif compression == 'bz2': open_func = bz2.open
@@ -388,24 +415,40 @@ def stream_procmon_events(file_path: str, compression: Optional[str]) -> Iterato
     logger.info(f"Streaming events from{comp_str} XML file: {file_path}")
 
     try:
+        # --- Potential Integration Point for aiofiles ---
+        # Replace open_func with aiofiles.open and use async iteration if parser supports it
+        # Example (conceptual):
+        # async with aiofiles.open(file_path, mode="rb") as f_stream:
+        #    async for event in async_xml_parser(f_stream, LOADED_PROCESSES):
+        #        yield event, LOADED_PROCESSES
+        # This requires an async-compatible XML iterparse implementation.
+        # Stick with synchronous I/O for now.
         with open_func(file_path, "rb") as f_stream:
-            # Use parse_events=True to get the event generator
-            event_iterator, processes_dict = _parse_xml_stream(f_stream, parse_events=True)
-            if event_iterator is None: # Should not happen if parse_events=True
-                 logger.error("Failed to get event iterator from _parse_xml_stream")
-                 return # Return empty iterator
+            # We need to re-parse the file to get the event iterator,
+            # but this time we pass the *already loaded* processes.
+            # The _parse_xml_stream function will skip process parsing if processlist_parsed is True.
+            # However, the current _parse_xml_stream always reparses processes first.
+            # Let's simplify: create a dedicated event streaming function.
 
-            # Yield each event along with the *same* processes_dict
+            # --- Dedicated Event Streamer ---
+            event_iterator, _ = _parse_xml_stream(f_stream, parse_events=True)
+            if event_iterator is None:
+                 logger.error("Failed to get event iterator from _parse_xml_stream for streaming.")
+                 return
+
+            # Yield each event along with the *globally loaded* processes_dict
             for event in event_iterator:
-                yield event, processes_dict # Yield event and the *complete* process map
+                yield event, LOADED_PROCESSES # Use the globally stored processes
 
+    except FileNotFoundError:
+        logger.error(f"File not found during streaming: {file_path}")
+        raise
+    except ET_impl.XMLSyntaxError as e:
+        logger.error(f"XML Syntax Error during streaming: {e}")
+        raise
     except Exception as e:
         logger.error(f"Error streaming events from {file_path}: {e}", exc_info=True)
-        # Re-raise specific errors if needed, otherwise wrap
-        if isinstance(e, (FileNotFoundError, ValueError, ET_impl.XMLSyntaxError)):
-            raise
-        else:
-            raise RuntimeError(f"Failed to stream events from '{file_path}'") from e
+        raise RuntimeError(f"Failed to stream events from '{file_path}'") from e
 
 
 # --- Global State ---
@@ -437,34 +480,35 @@ def get_secure_path(filename: str) -> str:
         raise RuntimeError("Internal Error: Allowed directory configuration is missing.")
     if not filename:
         raise ValueError("Filename cannot be empty.")
-    # Prevent absolute paths explicitly passed by the user
     if os.path.isabs(filename):
          raise ValueError("Invalid filename format: Absolute paths are not allowed.")
 
-    # Construct the path using the allowed directory and the relative filename
-    # os.path.join handles separators correctly
-    full_path = os.path.join(ALLOWED_DIR_CONFIG, filename)
+    try:
+        # Construct the path using the allowed directory and the relative filename
+        full_path = os.path.join(ALLOWED_DIR_CONFIG, filename)
 
-    # Normalize both the allowed directory and the constructed path
-    normalized_allowed_dir = os.path.abspath(ALLOWED_DIR_CONFIG)
-    normalized_full_path = os.path.abspath(full_path)
+        # Normalize both the allowed directory and the constructed path
+        normalized_allowed_dir = os.path.abspath(ALLOWED_DIR_CONFIG)
+        normalized_full_path = os.path.abspath(full_path)
 
-    logger.debug(f"Checking path: {normalized_full_path} against allowed: {normalized_allowed_dir}")
+        logger.debug(f"Checking path: {normalized_full_path} against allowed: {normalized_allowed_dir}")
 
-    # Use commonpath to ensure the resulting path is within the allowed directory
-    # This handles '..' and other relative path components safely.
-    common_prefix = os.path.commonpath([normalized_allowed_dir, normalized_full_path])
-    if common_prefix != normalized_allowed_dir:
-          raise PermissionError(f"Access denied: File '{filename}' resolves outside the allowed directory ('{normalized_allowed_dir}'). Resolved path: '{normalized_full_path}'")
+        # Use commonpath to ensure the resulting path is within the allowed directory
+        common_prefix = os.path.commonpath([normalized_allowed_dir, normalized_full_path])
+        if common_prefix != normalized_allowed_dir:
+              raise PermissionError(f"Access denied: File '{filename}' resolves outside the allowed directory ('{normalized_allowed_dir}'). Resolved path: '{normalized_full_path}'")
 
-    # Final checks
-    if not os.path.exists(normalized_full_path):
-        raise FileNotFoundError(f"File not found: {filename} (resolves to {normalized_full_path})")
-    if not os.path.isfile(normalized_full_path):
-        raise ValueError(f"Path exists but is not a file: {filename} (resolves to {normalized_full_path})")
+        # Final checks
+        if not os.path.exists(normalized_full_path):
+            raise FileNotFoundError(f"File not found: {filename} (resolves to {normalized_full_path})")
+        if not os.path.isfile(normalized_full_path):
+            raise ValueError(f"Path exists but is not a file: {filename} (resolves to {normalized_full_path})")
 
-    logger.debug(f"Path validated: {normalized_full_path}")
-    return normalized_full_path # Return the absolute, validated path
+        logger.debug(f"Path validated: {normalized_full_path}")
+        return normalized_full_path # Return the absolute, validated path
+    except ValueError as e: # Catch potential errors from os.path operations
+         logger.error(f"Path validation error for '{filename}': {e}")
+         raise ValueError(f"Invalid path specified: {filename}") from e
 
 
 # --- Loading Helper (Loads ONLY processes) ---
@@ -484,10 +528,8 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Di
     """
     global LOADED_FILENAME, LOADED_FILE_TYPE, LOADED_COMPRESSION, LOADED_PROCESSES
 
-    # Use the updated get_secure_path which returns absolute path
-    # We still need the relative filename for storing globally
     abs_full_path = get_secure_path(filename_relative)
-    fname_lower = filename_relative.lower() # Use relative name for extension checks
+    fname_lower = filename_relative.lower()
     file_type: str = "xml"
     compression: Optional[str] = None
 
@@ -529,9 +571,18 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Di
 
         logger.info(f"Successfully parsed process list: {len(processes_dict)} processes found.")
 
+    except FileNotFoundError as e:
+        logger.error(f"File not found during initial processing: {abs_full_path}")
+        raise # Re-raise specific error
+    except PermissionError as e:
+        logger.error(f"Permission denied during initial processing: {abs_full_path}")
+        raise
     except ET_impl.XMLSyntaxError as e:
         logger.error(f"XML Syntax Error processing file {filename_relative}: {e}", exc_info=True)
         raise RuntimeError(f"Failed to parse XML file '{filename_relative}': Invalid XML.") from e
+    except (gzip.BadGzipFile, bz2.BZ2Error, lzma.LZMAError) as e:
+         logger.error(f"Decompression error for {filename_relative}: {e}")
+         raise RuntimeError(f"Failed to decompress file '{filename_relative}'.") from e
     except Exception as e:
          logger.error(f"Error during initial processing of file {filename_relative}: {e}", exc_info=True)
          LOADED_FILENAME = None; LOADED_FILE_TYPE = None; LOADED_COMPRESSION = None; LOADED_PROCESSES = None
@@ -543,7 +594,6 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str) -> Tuple[Di
 
 
 # --- Helper to Safely Get Attributes ---
-# (Implementation remains the same as previous version, focused on XML dataclasses)
 def safe_get_attributes(obj: Any, attributes: List[str]) -> Dict[str, Any]:
     result = {}
     if obj is None: return {attr: None for attr in attributes}
@@ -556,23 +606,28 @@ def safe_get_attributes(obj: Any, attributes: List[str]) -> Dict[str, Any]:
             possible_names = [ attr_lower.capitalize(), attr_lower.title().replace("_", ""), f"{attr_lower.replace('_', ' ').title().replace(' ', '')}", ]
             if attr_lower == "pid": possible_names.append("ProcessId")
             if attr_lower == "parent_pid": possible_names.append("ParentProcessId")
-            if attr_lower == "timestamp": possible_names.append("Time_of_Day")
+            if attr_lower == "timestamp": possible_names.append("Time_of_Day") # Keep original string name
             if attr_lower == "user_sid": possible_names.append("Owner")
             if attr_lower == "is_64bit_process": possible_names.append("is_64bit")
-            if attr_lower == "stack": possible_names.append("stacktrace") # Allow getting raw stack obj if needed
+            if attr_lower == "stack": possible_names.append("stacktrace")
             possible_names = list(dict.fromkeys(possible_names))
             for name_attempt in possible_names:
                  if hasattr(obj, name_attempt):
                      try: value = getattr(obj, name_attempt); found = True; break
                      except Exception: pass
-        if isinstance(value, (bytes, bytearray)):
+        # --- Type Conversion ---
+        # Return StackFrame list directly if 'stack' is requested
+        if attr_lower == 'stack' and isinstance(value, list) and value and isinstance(value[0], StackFrame):
+             result[attr_lower] = value
+        # Return parsed datetime object if 'timestamp' is requested
+        elif attr_lower == 'timestamp' and isinstance(obj, ProcmonEvent):
+             result[attr_lower] = obj.timestamp # Use the property
+        elif isinstance(value, (bytes, bytearray)):
             try: result[attr_lower] = value.decode('utf-8', errors='replace')
             except Exception: result[attr_lower] = repr(value)
-        elif attr_lower == 'stack' and isinstance(value, list) and value and isinstance(value[0], StackFrame):
-             result[attr_lower] = value # Return list of StackFrame objects
         elif value is not None and not isinstance(value, (str, int, float, bool, list, dict)):
-             result[attr_lower] = str(value)
-        else: result[attr_lower] = value
+             result[attr_lower] = str(value) # Convert other complex types to string
+        else: result[attr_lower] = value # Assign basic types directly
     return result
 
 # --- Helper to get absolute path for streaming ---
@@ -588,35 +643,27 @@ def _get_stream_file_path() -> str:
         raise RuntimeError(f"Could not resolve secure path for streaming: {e}") from e
 
 
-# --- MCP Tools (Refactored for Streaming) ---
+# --- MCP Tools (Refactored for Streaming, Filtering, Stats) ---
 tool_decorator = mcp.tool() if MCP_SDK_AVAILABLE else lambda func: func
 
 @tool_decorator
 async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
     """
     Returns a basic summary of the pre-loaded Procmon XML file (based on process list).
+    Note: Event count is not available without streaming the entire file.
     """
     await ctx.info(f"Request received for summary of pre-loaded file.")
-    # Check if process list was loaded
-    if not LOADED_PROCESSES or not LOADED_FILENAME or not LOADED_FILE_TYPE:
+    if not LOADED_PROCESSES or not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
         await ctx.error("No Procmon XML file process list was pre-loaded via --load-file.")
         raise RuntimeError("Operation failed: No Procmon file process data is loaded.")
-    if LOADED_FILE_TYPE != 'xml': # Should be redundant now
-        await ctx.error(f"Loaded file type is '{LOADED_FILE_TYPE}', not 'xml'.")
-        raise RuntimeError(f"Operation failed: Expected XML file type.")
 
     summary = {
-        "loaded_filename": LOADED_FILENAME,
-        "file_type": LOADED_FILE_TYPE,
-        "compression": LOADED_COMPRESSION,
-        "process_count": len(LOADED_PROCESSES),
-        "event_count": "N/A (Streamed)", # Indicate events are not pre-counted
-        "os_version": "N/A (XML)",
-        "computer_name": "N/A (XML)",
-        "is_64bit_os": None
+        "loaded_filename": LOADED_FILENAME, "file_type": LOADED_FILE_TYPE,
+        "compression": LOADED_COMPRESSION, "process_count": len(LOADED_PROCESSES),
+        "event_count": "N/A (Streamed)", "os_version": "N/A (XML)",
+        "computer_name": "N/A (XML)", "is_64bit_os": None
     }
     try:
-        # Could potentially derive some info from process list if needed
         await ctx.info(f"Successfully generated summary for {LOADED_FILENAME}.")
         return summary
     except Exception as e:
@@ -626,44 +673,89 @@ async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
 
 @tool_decorator
 async def query_events(
+    # Standard Filters
     filter_process: Optional[str] = None,
     filter_operation: Optional[str] = None,
     filter_result: Optional[str] = None,
     filter_path_contains: Optional[str] = None,
     filter_process_contains: Optional[str] = None,
+    # Time Filters (ISO 8601 format: YYYY-MM-DDTHH:MM:SS or HH:MM:SS.ffffff)
+    filter_start_time: Optional[str] = None,
+    filter_end_time: Optional[str] = None,
+    # Regex Filters (Caution: Performance)
+    filter_path_regex: Optional[str] = None,
+    filter_process_regex: Optional[str] = None,
+    filter_detail_regex: Optional[str] = None,
+    # Stack Filter (Caution: Performance)
+    filter_stack_module_path: Optional[str] = None,
+    # Limit
     limit: int = 50,
     *,
     ctx: Context
 ) -> List[Dict[str, Any]]:
     """
-    Queries events by streaming the pre-loaded XML file, returning summaries.
-    Use 'get_event_details' and 'get_event_stack_trace' with the event's 'sequence_number' for more info.
+    Queries events by streaming the pre-loaded XML file, applying multiple filters (AND logic).
+    Returns event summaries. Use 'get_event_details'/'get_event_stack_trace' with 'sequence_number' for details.
+
+    Filtering Behavior:
+    - All provided filters must match for an event to be included (AND logic).
+    - String filters (process, operation, contains) are case-insensitive.
+    - Result filter handles hex ('0x...') or case-insensitive string matching.
+    - Time filters expect HH:MM:SS.ffffff format (matching Procmon XML Time_of_Day). Assumes all events are on the same day.
+    - Regex filters apply standard Python regex rules. WARNING: Can significantly impact performance.
+    - Stack module filter checks if the provided string is a substring of any module path in the event's stack trace. WARNING: Very performance intensive.
 
     Args:
-        filter_process: Optional exact process name (case-insensitive).
-        filter_operation: Optional operation name (case-insensitive).
-        filter_result: Optional result string or hex '0x...' code.
-        filter_path_contains: Optional string contained in the path (case-insensitive).
-        filter_process_contains: Optional string contained in the process name (case-insensitive).
+        filter_process: Exact process name (case-insensitive).
+        filter_operation: Exact operation name (case-insensitive).
+        filter_result: Result string or hex '0x...' code.
+        filter_path_contains: Substring in path (case-insensitive).
+        filter_process_contains: Substring in process name (case-insensitive).
+        filter_start_time: Minimum event time (HH:MM:SS.ffffff).
+        filter_end_time: Maximum event time (HH:MM:SS.ffffff).
+        filter_path_regex: Regex pattern for Path field.
+        filter_process_regex: Regex pattern for Process Name field.
+        filter_detail_regex: Regex pattern for Detail field.
+        filter_stack_module_path: Substring in any stack frame's module path (case-insensitive). VERY SLOW.
         limit: Maximum number of event summaries to return.
 
     Returns:
         List of dictionaries, each summarizing a matching event including 'sequence_number'.
     """
-    await ctx.info(f"Request received to query event summaries via streaming. Filters: Process='{filter_process}', Op='{filter_operation}', Result='{filter_result}', PathContains='{filter_path_contains}', ProcessContains='{filter_process_contains}', Limit={limit}")
+    await ctx.info(f"Request received to query events via streaming with multiple filters. Limit={limit}")
+    # Log filters if debug enabled
+    if logger.isEnabledFor(logging.DEBUG):
+         filters_applied = {k:v for k,v in locals().items() if k.startswith('filter_') and v is not None}
+         logger.debug(f"Filters Applied: {filters_applied}")
+
     if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
-        await ctx.error(f"Query failed: No XML file is loaded or file type is incorrect ({LOADED_FILE_TYPE}).")
+        await ctx.error(f"Query failed: No XML file loaded or file type incorrect ({LOADED_FILE_TYPE}).")
         raise TypeError("Operation requires an XML file to be pre-loaded.")
-    if LOADED_PROCESSES is None: # Check if processes were loaded
+    if LOADED_PROCESSES is None:
          await ctx.warning("Process list not loaded; event enrichment might be incomplete.")
-         # Allow to proceed, but enrichment in ProcmonEvent.from_xml_element will use empty dict
 
     try:
         abs_path = _get_stream_file_path()
         filtered_event_summaries = []
         count = 0
+        processed_count = 0
 
-        # Pre-process filters (same as before)
+        # --- Pre-compile Regex and Parse Times ---
+        path_regex = re.compile(filter_path_regex) if filter_path_regex else None
+        process_regex = re.compile(filter_process_regex) if filter_process_regex else None
+        detail_regex = re.compile(filter_detail_regex) if filter_detail_regex else None
+        start_time_dt: Optional[datetime.time] = None
+        end_time_dt: Optional[datetime.time] = None
+        try:
+            if filter_start_time:
+                start_time_dt = datetime.strptime(filter_start_time, PROCMON_TIMESTAMP_FORMAT).time()
+            if filter_end_time:
+                end_time_dt = datetime.strptime(filter_end_time, PROCMON_TIMESTAMP_FORMAT).time()
+        except ValueError as e:
+            await ctx.error(f"Invalid time format for start/end time filter: {e}. Expected format: {PROCMON_TIMESTAMP_FORMAT}")
+            raise ValueError("Invalid time format for filter.") from e
+
+        # Pre-process other filters
         filter_result_lower_str = None; filter_result_int = None; is_hex_filter = False
         if filter_result:
             filter_result_lower = filter_result.lower()
@@ -675,26 +767,40 @@ async def query_events(
         filter_operation_lower = filter_operation.lower() if filter_operation else None
         filter_path_contains_lower = filter_path_contains.lower() if filter_path_contains else None
         filter_process_contains_lower = filter_process_contains.lower() if filter_process_contains else None
+        filter_stack_module_path_lower = filter_stack_module_path.lower() if filter_stack_module_path else None
 
-        # Stream events
-        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION): # Ignore processes dict yielded
+        # --- Stream and Filter ---
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            processed_count += 1
+            if processed_count % PROGRESS_REPORT_INTERVAL == 0:
+                 await ctx.info(f" Query scanned {processed_count} events...")
+
             if count >= limit:
                 logger.debug(f"Query limit ({limit}) reached during streaming.")
                 break
 
-            # Apply filters directly on the streamed event object
-            # Use safe_get_attributes for consistent access
-            event_attrs = safe_get_attributes(event, ['process_name', 'operation', 'result', 'path', 'pid', 'timestamp', 'sequence_number'])
+            # --- Apply Filters (AND Logic) ---
+            match = True # Assume match initially
+
+            # Get necessary attributes (only fetch stack if needed)
+            attrs_needed = ['process_name', 'operation', 'result', 'path', 'pid', 'timestamp', 'sequence_number', 'detail']
+            if filter_stack_module_path_lower: attrs_needed.append('stack')
+            event_attrs = safe_get_attributes(event, attrs_needed)
+
+            # Standard Filters
             process_name = event_attrs.get('process_name', '') or ''
             operation = event_attrs.get('operation', '') or ''
             result_val = event_attrs.get('result', '')
             path = event_attrs.get('path', '') or ''
+            detail = event_attrs.get('detail', '') or ''
 
-            match = True
             if filter_process_lower is not None and process_name.lower() != filter_process_lower: match = False
             if match and filter_operation_lower is not None and operation.lower() != filter_operation_lower: match = False
+            if match and filter_path_contains_lower is not None and filter_path_contains_lower not in path.lower(): match = False
+            if match and filter_process_contains_lower is not None and filter_process_contains_lower not in process_name.lower(): match = False
+
+            # Result Filter
             if match and filter_result is not None:
-                # Apply result filter logic (same as before)
                 if is_hex_filter:
                     event_result_int = None
                     if isinstance(result_val, int): event_result_int = result_val
@@ -708,26 +814,51 @@ async def query_events(
                     if event_result_int is None or event_result_int != filter_result_int: match = False
                 else:
                     if str(result_val).lower() != filter_result_lower_str: match = False
-            if match and filter_path_contains_lower is not None and filter_path_contains_lower not in path.lower(): match = False
-            if match and filter_process_contains_lower is not None and filter_process_contains_lower not in process_name.lower(): match = False
 
+            # Time Filter
+            if match and (start_time_dt or end_time_dt):
+                event_dt = event_attrs.get('timestamp') # Property returns datetime or None
+                if event_dt is None:
+                    match = False # Cannot compare if timestamp is invalid
+                else:
+                    event_time = event_dt.time()
+                    if start_time_dt and event_time < start_time_dt: match = False
+                    if match and end_time_dt and event_time > end_time_dt: match = False
+
+            # Regex Filters
+            if match and path_regex and not path_regex.search(path): match = False
+            if match and process_regex and not process_regex.search(process_name): match = False
+            if match and detail_regex and not detail_regex.search(detail): match = False
+
+            # Stack Module Filter (Expensive)
+            if match and filter_stack_module_path_lower:
+                stack_frames = event_attrs.get('stack') # Get raw List[StackFrame]
+                found_in_stack = False
+                if isinstance(stack_frames, list):
+                    for frame in stack_frames:
+                        frame_path = getattr(frame, 'path', None)
+                        if frame_path and filter_stack_module_path_lower in frame_path.lower():
+                            found_in_stack = True
+                            break
+                if not found_in_stack: match = False
+
+            # --- Add to results if all filters passed ---
             if match:
-                 # Create summary dict
                  event_summary = {
-                     'sequence_number': event_attrs.get('sequence_number'), # Use sequence number instead of index
-                     'timestamp': str(event_attrs.get('timestamp')),
-                     'process_name': process_name,
-                     'pid': event_attrs.get('pid'),
-                     'operation': operation,
-                     'path': path,
-                     'result': result_val,
+                     'sequence_number': event_attrs.get('sequence_number'),
+                     'timestamp': str(event_attrs.get('timestamp')), # Use string representation of datetime
+                     'process_name': process_name, 'pid': event_attrs.get('pid'),
+                     'operation': operation, 'path': path, 'result': result_val,
                  }
                  filtered_event_summaries.append(event_summary)
                  count += 1
 
-        await ctx.info(f"Found {len(filtered_event_summaries)} matching event summaries via streaming {LOADED_FILENAME}.")
+        await ctx.info(f"Query finished. Found {len(filtered_event_summaries)} matching events after scanning {processed_count} events in {LOADED_FILENAME}.")
         return filtered_event_summaries
 
+    except re.error as e:
+        await ctx.error(f"Invalid Regex pattern provided: {e}")
+        raise ValueError(f"Invalid regex pattern: {e}") from e
     except Exception as e:
         await ctx.error(f"Failed to query XML file {LOADED_FILENAME} via streaming: {e}")
         logger.debug("Exception details:", exc_info=True)
@@ -770,7 +901,7 @@ async def get_event_details(sequence_number: int, ctx: Context) -> Dict[str, Any
                 found_event = event
                 break # Stop streaming once found
             # Log progress occasionally for long searches
-            if processed_count % 500000 == 0:
+            if processed_count % PROGRESS_REPORT_INTERVAL == 0:
                  await ctx.info(f" Scanned {processed_count} events...")
 
 
@@ -790,6 +921,9 @@ async def get_event_details(sequence_number: int, ctx: Context) -> Dict[str, Any
             'stack' # Get raw stack for stack trace tool
         ]
         details = safe_get_attributes(found_event, event_attributes)
+        # Convert datetime timestamp back to string for output consistency if needed
+        if isinstance(details.get('timestamp'), datetime):
+            details['timestamp'] = details['timestamp'].strftime(PROCMON_TIMESTAMP_FORMAT) # Or use isoformat()
         details['sequence_number'] = sequence_number # Ensure it's there
 
         # Create process summary
@@ -842,12 +976,11 @@ async def get_event_stack_trace(sequence_number: int, ctx: Context) -> List[Dict
         # Stream events to find the matching sequence number
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             processed_count += 1
-            # Ensure sequence_number is compared as int
             event_seq_num = getattr(event, 'sequence_number', None)
             if event_seq_num is not None and event_seq_num == sequence_number:
                 found_event = event
                 break
-            if processed_count % 500000 == 0: await ctx.info(f" Scanned {processed_count} events...")
+            if processed_count % PROGRESS_REPORT_INTERVAL == 0: await ctx.info(f" Scanned {processed_count} events...")
 
         end_stream_time = time.time()
         logger.info(f"Scan for sequence number {sequence_number} took {end_stream_time - start_stream_time:.2f} seconds, scanned {processed_count} events.")
@@ -864,7 +997,6 @@ async def get_event_stack_trace(sequence_number: int, ctx: Context) -> List[Dict
                  logger.warning(f"Stack trace for event {sequence_number} is not a list: {type(stack_frames_raw)}")
         else:
              await ctx.warning(f"Event with SequenceNumber {sequence_number} not found, cannot retrieve stack trace.")
-             # Return empty list if event not found
 
         await ctx.info(f"Successfully retrieved stack trace (length: {len(detailed_stack)}) for event sequence number {sequence_number}.")
         logger.debug(f"Detailed stack trace for event {sequence_number}: {detailed_stack}")
@@ -927,8 +1059,6 @@ async def get_process_details(pid: int, ctx: Context) -> Dict[str, Any]:
 
     try:
         process_obj: Optional[ProcessInfo] = None
-        # Efficient lookup now that LOADED_PROCESSES is keyed by process_index
-        # We need to iterate to find by PID
         for proc in LOADED_PROCESSES.values():
             if proc.pid == pid:
                 process_obj = proc
@@ -998,15 +1128,18 @@ async def count_events_by_process(ctx: Context) -> Dict[str, int]:
         abs_path = _get_stream_file_path()
         event_counts = defaultdict(int)
         total_events = 0
+        start_time = time.time()
 
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
             total_events += 1
             process_name = safe_get_attributes(event, ['process_name']).get('process_name', 'Unknown') or 'Unknown'
             event_counts[process_name] += 1
-            if total_events % 500000 == 0: await ctx.info(f" Counted {total_events} events...")
+            if total_events % PROGRESS_REPORT_INTERVAL == 0:
+                elapsed = time.time() - start_time
+                await ctx.info(f" Counted {total_events} events... ({elapsed:.1f}s)")
 
-
-        await ctx.info(f"Counted {total_events} total events for {len(event_counts)} processes in {LOADED_FILENAME}.")
+        elapsed = time.time() - start_time
+        await ctx.info(f"Counted {total_events} total events for {len(event_counts)} processes in {LOADED_FILENAME} ({elapsed:.2f}s).")
         logger.debug(f"Event counts by process: {dict(event_counts)}")
         return dict(event_counts)
     except Exception as e:
@@ -1028,17 +1161,23 @@ async def summarize_operations_by_process(process_name_filter: str, ctx: Context
         abs_path = _get_stream_file_path()
         operation_counts = defaultdict(int)
         event_count_for_process = 0
+        total_events_scanned = 0
+        start_time = time.time()
 
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            total_events_scanned += 1
+            if total_events_scanned % PROGRESS_REPORT_INTERVAL == 0:
+                 elapsed = time.time() - start_time
+                 await ctx.info(f" Scanned {total_events_scanned} events for '{process_name_filter}'... ({elapsed:.1f}s)")
+
             process_name = safe_get_attributes(event, ['process_name']).get('process_name', '') or ''
             if process_name == process_name_filter: # Case-sensitive match
                 event_count_for_process += 1
                 operation = safe_get_attributes(event, ['operation']).get('operation', 'Unknown') or 'Unknown'
                 operation_counts[operation] += 1
-                if event_count_for_process % 100000 == 0: await ctx.info(f" Found {event_count_for_process} events for '{process_name_filter}'...")
 
-
-        await ctx.info(f"Summarized {len(operation_counts)} ops for '{process_name_filter}' ({event_count_for_process} events) in {LOADED_FILENAME}.")
+        elapsed = time.time() - start_time
+        await ctx.info(f"Summarized {len(operation_counts)} ops for '{process_name_filter}' ({event_count_for_process} events found after scanning {total_events_scanned}) in {LOADED_FILENAME} ({elapsed:.2f}s).")
         if event_count_for_process == 0: await ctx.warning(f"No events found for process name '{process_name_filter}'.")
         return dict(operation_counts)
     except Exception as e:
@@ -1060,6 +1199,8 @@ async def find_events_by_result(result_filter: str, limit: int = 50, *, ctx: Con
         abs_path = _get_stream_file_path()
         filtered_event_summaries = []
         count = 0
+        processed_count = 0
+        start_time = time.time()
 
         # Pre-process filter
         filter_result_lower_str=None; filter_result_int=None; is_hex_filter=False
@@ -1069,7 +1210,12 @@ async def find_events_by_result(result_filter: str, limit: int = 50, *, ctx: Con
         else: filter_result_lower_str=result_filter.lower()
 
         for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
-            if count >= limit: break
+            processed_count += 1
+            if processed_count % PROGRESS_REPORT_INTERVAL == 0:
+                 elapsed = time.time() - start_time
+                 await ctx.info(f" Scanned {processed_count} events for result '{result_filter}'... ({elapsed:.1f}s)")
+
+            if count >= limit: break # Stop after finding enough
 
             result_val = safe_get_attributes(event, ['result']).get('result')
             match = False
@@ -1095,7 +1241,8 @@ async def find_events_by_result(result_filter: str, limit: int = 50, *, ctx: Con
                 filtered_event_summaries.append(event_summary)
                 count+=1
 
-        await ctx.info(f"Found {len(filtered_event_summaries)} events matching result '{result_filter}' via streaming {LOADED_FILENAME}.")
+        elapsed = time.time() - start_time
+        await ctx.info(f"Found {len(filtered_event_summaries)} events matching result '{result_filter}' after scanning {processed_count} events ({elapsed:.2f}s).")
         return filtered_event_summaries
     except Exception as e:
         await ctx.error(f"Failed to find events by result '{result_filter}' via streaming: {e}")
@@ -1153,6 +1300,85 @@ async def get_process_tree(ctx: Context) -> Dict[int, Dict[str, Any]]:
         await ctx.error(f"Failed to build process tree from loaded list: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error building process tree: {e}")
+
+@tool_decorator
+async def get_timing_statistics(
+    group_by: str = "process", # 'process' or 'operation'
+    *,
+    ctx: Context
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Calculates event duration statistics (min, max, average, count) by streaming the XML file,
+    grouped by either process name or operation type.
+
+    Args:
+        group_by: How to group statistics, either 'process' (default) or 'operation'.
+
+    Returns:
+        A dictionary where keys are process names or operation types, and values are
+        dictionaries containing 'min_duration', 'max_duration', 'avg_duration', 'count', 'total_duration'.
+    """
+    await ctx.info(f"Request received to calculate timing statistics grouped by '{group_by}'.")
+    if group_by not in ["process", "operation"]:
+        await ctx.error("Invalid group_by value. Must be 'process' or 'operation'.")
+        raise ValueError("Invalid group_by value.")
+    if not LOADED_FILENAME or LOADED_FILE_TYPE != 'xml':
+        await ctx.error("Operation failed: No XML file loaded.")
+        raise TypeError("Operation requires an XML file to be pre-loaded.")
+
+    try:
+        abs_path = _get_stream_file_path()
+        # Structure: stats[group_key] = {'min': float, 'max': float, 'sum': float, 'count': int}
+        stats = defaultdict(lambda: {'min': float('inf'), 'max': float('-inf'), 'sum': 0.0, 'count': 0})
+        total_events = 0
+        start_time = time.time()
+
+        for event, _ in stream_procmon_events(abs_path, LOADED_COMPRESSION):
+            total_events += 1
+            if total_events % PROGRESS_REPORT_INTERVAL == 0:
+                elapsed = time.time() - start_time
+                await ctx.info(f" Processed {total_events} events for timing stats... ({elapsed:.1f}s)")
+
+            duration = safe_get_attributes(event, ['duration']).get('duration')
+            if duration is None: # Skip events without valid duration
+                continue
+
+            group_key = ""
+            if group_by == "process":
+                group_key = safe_get_attributes(event, ['process_name']).get('process_name', 'Unknown') or 'Unknown'
+            elif group_by == "operation":
+                group_key = safe_get_attributes(event, ['operation']).get('operation', 'Unknown') or 'Unknown'
+
+            group_stats = stats[group_key]
+            group_stats['count'] += 1
+            group_stats['sum'] += duration
+            if duration < group_stats['min']: group_stats['min'] = duration
+            if duration > group_stats['max']: group_stats['max'] = duration
+
+        # Calculate averages and format output
+        output_stats = {}
+        for key, data in stats.items():
+            if data['count'] > 0:
+                avg = data['sum'] / data['count']
+                output_stats[key] = {
+                    'count': data['count'],
+                    'min_duration': data['min'] if data['min'] != float('inf') else None, # Handle cases with no events
+                    'max_duration': data['max'] if data['max'] != float('-inf') else None,
+                    'avg_duration': avg,
+                    'total_duration': data['sum']
+                }
+            else: # Should not happen if key exists, but handle defensively
+                 output_stats[key] = {'count': 0, 'min_duration': None, 'max_duration': None, 'avg_duration': None, 'total_duration': 0.0}
+
+
+        elapsed = time.time() - start_time
+        await ctx.info(f"Calculated timing statistics for {len(output_stats)} groups after processing {total_events} events ({elapsed:.2f}s).")
+        return output_stats
+
+    except Exception as e:
+        await ctx.error(f"Failed to calculate timing statistics: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Internal error calculating timing statistics: {e}")
 
 
 # --- Main Execution Block ---
