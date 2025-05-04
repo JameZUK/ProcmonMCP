@@ -36,6 +36,7 @@ except ImportError:
     pass # Warning will be logged later if needed
 
 # --- Basic Logging Configuration ---
+# Ensure debug level is set if requested via args later
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__) # Define logger after basicConfig
 
@@ -176,6 +177,7 @@ class ProcessInfo:
     def _safe_find_text(elem: ET_impl.Element, tag: str) -> Optional[str]:
         """Safely finds text content of a child tag, returning None if missing or empty."""
         child = elem.find(tag)
+        # Use .strip() to remove leading/trailing whitespace which might affect lookups
         return child.text.strip() if child is not None and child.text else None
 
     @staticmethod
@@ -185,12 +187,14 @@ class ProcessInfo:
         text = text.strip()
         if not text: return None # Handle empty string after strip
         try:
-            if text.startswith('0x'):
+            # Check for hex prefix case-insensitively
+            if text.lower().startswith('0x'):
                 return int(text, 16)
             else:
                 # Handle potential negative numbers if needed, though unlikely for IDs
                 return int(text)
         except (ValueError, TypeError):
+            # Log at debug level as this might happen for non-numeric fields
             logger.debug(f"Failed to convert text '{text}' to int.")
             return None
 
@@ -250,6 +254,7 @@ class ProcmonEvent:
     def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo]) -> 'ProcmonEvent':
         """Parses an <event> XML element into a ProcmonEvent object."""
         data = {}
+        # Use the static helper methods defined in ProcessInfo for consistency
         data['sequence_number'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'SequenceNumber'))
         data['process_index'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'ProcessIndex'))
         data['pid'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'ProcessId'))
@@ -269,8 +274,10 @@ class ProcmonEvent:
         # Duration might be missing or 0
         duration_text = cls._safe_find_text(elem, 'Duration')
         try:
+            # Convert duration string (which might be float) to float
             data['duration_float'] = float(duration_text) if duration_text is not None else None
         except (ValueError, TypeError):
+            # Log at debug level if conversion fails
             logger.debug(f"Failed to convert duration '{duration_text}' to float for event seq {data['sequence_number']}.")
             data['duration_float'] = None
 
@@ -286,25 +293,28 @@ class ProcmonEvent:
                 if data['parent_pid'] is None:
                     data['parent_pid'] = proc_info.parent_pid
             else:
+                 # Log if process index from event doesn't match any loaded process
                  logger.debug(f"Event seq {data['sequence_number']} has ProcessIndex {data['process_index']} but not found in process list.")
 
         # Parse Stack
         stack_elem = elem.find('Stack')
         if stack_elem is not None:
             data['stack_frames'] = []
+            # Iterate through child 'frame' elements
             for frame_elem in stack_elem.findall('frame'):
                 try:
                     data['stack_frames'].append(StackFrame.from_xml_element(frame_elem))
                 except Exception as e:
+                    # Log warning if a specific frame fails to parse
                     logger.warning(f"Failed to parse a <frame> element for event seq {data['sequence_number']}: {e}", exc_info=False)
         else:
-            data['stack_frames'] = None
+            data['stack_frames'] = None # No <Stack> element found
 
         return cls(**data)
 
     @staticmethod
     def _safe_find_text(elem: ET_impl.Element, tag: str) -> Optional[str]:
-        """Safely finds text content of a child tag, returning None if missing or empty."""
+        """Static helper to safely find text content of a child tag."""
         child = elem.find(tag)
         return child.text.strip() if child is not None and child.text else None
 
@@ -314,13 +324,14 @@ class ProcmonEvent:
         if ts_str is None:
             return None
         try:
-            # Parse the time part
+            # Parse the time part using the defined format
             parsed_time: dt_time = datetime.strptime(ts_str, PROCMON_TIMESTAMP_FORMAT).time()
-            # Combine with base date (which has UTC timezone)
+            # Combine with base date (which has UTC timezone set)
             full_dt = datetime.combine(BASE_DATE.date(), parsed_time, tzinfo=timezone.utc)
-            # Return Unix timestamp float
+            # Return Unix timestamp float (seconds since epoch)
             return full_dt.timestamp()
         except (ValueError, TypeError) as e:
+            # Log warning if timestamp string is invalid
             logger.warning(f"Could not parse timestamp string '{ts_str}': {e}")
             return None
 
@@ -434,7 +445,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Implemented Event Parsing and Optimization ---
+# --- UPDATED: Added Enhanced Debug Logging ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -444,7 +455,7 @@ def _parse_xml_stream_for_loading(
     Internal helper optimized for initial loading into memory.
     Parses <event> elements, converts them to optimized dictionaries using interners,
     and yields them. Assumes process list is already parsed and passed in `processes`.
-    Reports progress based on event count.
+    Reports progress based on event count. Includes enhanced debug logging.
 
     Yields:
         Optimized event dictionaries.
@@ -461,6 +472,7 @@ def _parse_xml_stream_for_loading(
         raise RuntimeError("Failed to initialize XML parser for events") from e
 
     event_count = 0
+    yielded_count = 0 # Separate counter for yielded events
     start_time = time.time()
     last_report_time = start_time
     try:
@@ -481,31 +493,32 @@ def _parse_xml_stream_for_loading(
 
             if parsing_stage == "parsing_events":
                 if elem.tag == 'event':
+                    event_count += 1 # Increment count when <event> tag is encountered
+                    seq_num_text = elem.findtext('SequenceNumber', default='<unknown>') # Get sequence early for logging
+                    logger.debug(f"  [Pass 2 Debug] Found <event> tag #{event_count}, Sequence ~{seq_num_text}. Attempting parse...")
                     try:
-                        # --- *** IMPLEMENTED PARSING AND OPTIMIZATION *** ---
                         # 1. Parse the raw event data using the dataclass
+                        logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for Sequence ~{seq_num_text}...")
                         raw_event = ProcmonEvent.from_xml_element(elem, processes)
+                        # Check if sequence number was parsed correctly for logging
+                        parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
+                        logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for Sequence {parsed_seq}. Optimizing...")
 
-                        # 2. Create the optimized dictionary
+                        # --- Optimization Logic ---
                         opt_event: Dict[str, Any] = {}
-
-                        # 3. Populate with non-interned or already optimized data
                         opt_event['seq'] = raw_event.sequence_number
                         opt_event['pid'] = raw_event.pid
                         opt_event['tid'] = raw_event.tid
-                        opt_event['ppid'] = raw_event.parent_pid # Store ParentPID if available
-                        opt_event['ts'] = raw_event.timestamp_float # Store pre-calculated float timestamp
-                        opt_event['dur'] = raw_event.duration_float # Store pre-calculated float duration
-                        opt_event['detail'] = raw_event.detail # Detail string is usually unique, don't intern
-
-                        # 4. Populate with interned string IDs
+                        opt_event['ppid'] = raw_event.parent_pid
+                        opt_event['ts'] = raw_event.timestamp_float
+                        opt_event['dur'] = raw_event.duration_float
+                        opt_event['detail'] = raw_event.detail
                         opt_event['pname_id'] = interners["process_name"].get_id(raw_event.process_name)
                         opt_event['op_id'] = interners["operation"].get_id(raw_event.operation)
                         opt_event['path_id'] = interners["path"].get_id(raw_event.path)
                         opt_event['res_id'] = interners["result"].get_id(raw_event.result)
                         opt_event['cat_id'] = interners["category"].get_id(raw_event.category)
 
-                        # 5. Optimize and store the stack trace
                         if raw_event.stack_frames:
                             optimized_stack = []
                             for frame in raw_event.stack_frames:
@@ -515,30 +528,41 @@ def _parse_xml_stream_for_loading(
                                         interners["stack_location"]
                                     ))
                                 except Exception as frame_e:
-                                     logger.warning(f"Failed to optimize stack frame for event seq {raw_event.sequence_number}: {frame_e}", exc_info=False)
-                            if optimized_stack: # Only store if not empty
+                                     logger.warning(f"Failed to optimize stack frame for event seq {parsed_seq}: {frame_e}", exc_info=False)
+                            if optimized_stack:
                                 opt_event['stack'] = optimized_stack
-                        # --- *** END OF IMPLEMENTATION *** ---
+                        # --- End Optimization ---
 
+                        logger.debug(f"  [Pass 2 Debug] Yielding optimized event for Sequence {parsed_seq}.")
                         yield opt_event
-                        event_count += 1
+                        yielded_count += 1 # Increment *after* successful yield
 
                         # --- Progress Reporting ---
                         current_time = time.time()
-                        # Report every INTERVAL or if 5 seconds passed since last report
+                        # Report based on event_count (elements processed)
                         if event_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > 5.0:
                             elapsed_total = current_time - start_time
                             rate = event_count / elapsed_total if elapsed_total > 0 else 0
-                            logger.info(f"  [Pass 2] Processed {event_count:,} events... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
+                            # Report both processed and yielded counts
+                            logger.info(f"  [Pass 2] Processed {event_count:,} events (yielded {yielded_count:,})... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
                             last_report_time = current_time
 
                     except Exception as e:
                         # Log error parsing this specific event but continue if possible
-                        seq_num_text = elem.findtext('SequenceNumber', default='<unknown>')
-                        logger.warning(f"Failed to parse/convert <event> element (Sequence ~{seq_num_text}): {e}", exc_info=False) # Keep log concise in loop
-                        logger.debug(f"Exception details for event ~{seq_num_text}:", exc_info=True) # Full trace in debug
+                        logger.warning(f"  [Pass 2 Warning] Failed to parse/convert <event> element (Sequence ~{seq_num_text}): {e}", exc_info=False)
+                        # Log more details in debug mode
+                        if logger.isEnabledFor(logging.DEBUG):
+                            try:
+                                # Try to log the raw XML snippet for the failed event
+                                event_xml_str = ET_impl.tostring(elem, encoding='unicode', method='xml')
+                                logger.debug(f"  [Pass 2 Debug] XML for failed event ~{seq_num_text}:\n{event_xml_str[:1000]}...") # Log first 1000 chars
+                            except Exception as log_e:
+                                logger.debug(f"  [Pass 2 Debug] Could not serialize failed event element to string: {log_e}")
+                            # Log full exception trace in debug mode
+                            logger.debug(f"  [Pass 2 Debug] Full exception details for event ~{seq_num_text}:", exc_info=True)
 
                     finally:
+                         logger.debug(f"  [Pass 2 Debug] Clearing element for event ~{seq_num_text}.")
                          _clear_elem(elem) # IMPORTANT: Clear event element memory regardless of success/failure
 
                 elif elem.tag == 'eventlist':
@@ -550,8 +574,8 @@ def _parse_xml_stream_for_loading(
                     break # Stop iteration
 
         elapsed = time.time() - start_time
-        # This log message now reflects the actual count of yielded events
-        logger.info(f"Finished Pass 2: Loaded and optimized {event_count:,} events ({elapsed:.2f}s).")
+        # Log the final count of *yielded* events, which populates LOADED_EVENTS
+        logger.info(f"Finished Pass 2: Processed {event_count:,} <event> elements, successfully yielded {yielded_count:,} optimized events ({elapsed:.2f}s).")
 
     except ET_impl.XMLSyntaxError as e:
         logger.error(f"XML Parse Error during event loading stream: {e}")
@@ -699,7 +723,7 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
             # The iterator now performs the parsing and optimization
             event_iterator = _parse_xml_stream_for_loading(f_stream, interners, processes_dict)
             # Consume the iterator and store the optimized events in a list
-            optimized_events = list(event_iterator)
+            optimized_events = list(event_iterator) # This executes the loop in _parse_xml_stream_for_loading
 
         # --- Store results globally ---
         LOADED_FILENAME = filename_relative
@@ -711,7 +735,7 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
 
         overall_end_time = time.time()
         logger.info(f"--- Loading Summary ---")
-        # This count should now be correct
+        # This count comes from len(optimized_events) which depends on successful yields
         logger.info(f" Successfully loaded and optimized {len(optimized_events):,} events from {filename_relative}.")
         logger.info(f" Found {len(processes_dict)} unique processes.")
         logger.info(f" Total loading and optimization time: {overall_end_time - overall_start_time:.2f} seconds.")
@@ -849,6 +873,11 @@ async def query_events(
         await ctx.error(f"Query failed: Event data or interners not loaded.")
         raise TypeError("Operation requires optimized event data to be loaded.")
 
+    # Handle case where there are no events to query
+    if not LOADED_EVENTS:
+         await ctx.info("Query finished: No events loaded in memory to query.")
+         return []
+
     try:
         filtered_event_summaries = []
         count = 0
@@ -958,11 +987,13 @@ async def query_events(
 
                     # Perform comparison
                     if match and start_ts is not None:
-                        compare_val = start_ts if (is_start_time_only or is_end_time_only) else start_ts
-                        if current_event_compare_val < compare_val: match = False
+                        # Determine the filter value to use based on whether it was time-only
+                        compare_filter_val = start_ts if (is_start_time_only or is_end_time_only) else start_ts
+                        if current_event_compare_val < compare_filter_val: match = False
                     if match and end_ts is not None:
-                        compare_val = end_ts if (is_start_time_only or is_end_time_only) else end_ts
-                        if current_event_compare_val > compare_val: match = False
+                        # Determine the filter value to use based on whether it was time-only
+                        compare_filter_val = end_ts if (is_start_time_only or is_end_time_only) else end_ts
+                        if current_event_compare_val > compare_filter_val: match = False
 
 
             # Contains / Regex / Stack filters require converting IDs back to strings (potentially slow)
@@ -1053,9 +1084,12 @@ async def get_event_details(event_index: int, ctx: Context) -> Dict[str, Any]:
         raise TypeError("Operation requires optimized event data to be loaded.")
 
     try:
-        # Validate index bounds
-        if not 0 <= event_index < len(LOADED_EVENTS):
-            await ctx.error(f"Invalid event index: {event_index}. Must be between 0 and {len(LOADED_EVENTS)-1}.")
+        # Validate index bounds using the actual length of LOADED_EVENTS
+        num_events = len(LOADED_EVENTS)
+        if not 0 <= event_index < num_events:
+            # Correct the error message if num_events is 0
+            upper_bound = num_events - 1 if num_events > 0 else -1
+            await ctx.error(f"Invalid event index: {event_index}. Must be between 0 and {upper_bound}.")
             raise IndexError(f"Event index {event_index} is out of bounds.")
 
         event_dict = LOADED_EVENTS[event_index] # Get the optimized event dict
@@ -1154,8 +1188,10 @@ async def get_event_stack_trace(event_index: int, ctx: Context) -> List[Dict[str
 
     try:
         # Validate index bounds
-        if not 0 <= event_index < len(LOADED_EVENTS):
-            await ctx.error(f"Invalid event index: {event_index}. Must be between 0 and {len(LOADED_EVENTS)-1}.")
+        num_events = len(LOADED_EVENTS)
+        if not 0 <= event_index < num_events:
+            upper_bound = num_events - 1 if num_events > 0 else -1
+            await ctx.error(f"Invalid event index: {event_index}. Must be between 0 and {upper_bound}.")
             raise IndexError(f"Event index {event_index} is out of bounds.")
 
         event_dict = LOADED_EVENTS[event_index]
@@ -1296,6 +1332,11 @@ async def count_events_by_process(ctx: Context) -> Dict[str, int]:
         await ctx.error("Operation failed: Optimized event data not loaded.")
         raise TypeError("Operation requires optimized event data to be loaded.")
 
+    # Handle case where there are no events
+    if not LOADED_EVENTS:
+        await ctx.info("Count events by process: No events loaded.")
+        return {}
+
     try:
         event_counts = defaultdict(int)
         start_time = time.time()
@@ -1337,6 +1378,11 @@ async def summarize_operations_by_process(process_name_filter: str, ctx: Context
     if not process_name_filter:
         await ctx.error("Process name filter cannot be empty."); raise ValueError("Process name filter is required.")
 
+    # Handle case where there are no events
+    if not LOADED_EVENTS:
+        await ctx.info(f"Summarize operations for '{process_name_filter}': No events loaded.")
+        return {}
+
     try:
         operation_counts = defaultdict(int)
         event_count_for_process = 0
@@ -1373,9 +1419,9 @@ async def summarize_operations_by_process(process_name_filter: str, ctx: Context
         # Sort results by count descending
         sorted_counts = dict(sorted(operation_counts.items(), key=lambda item: item[1], reverse=True))
         await ctx.info(f"Summarized {len(sorted_counts)} unique ops for '{process_name_filter}' ({event_count_for_process:,} events found) ({elapsed:.2f}s).")
+        # Updated warning check: Warn only if the process ID was found but resulted in zero events.
         if event_count_for_process == 0 and target_pname_id is not None:
-             # Only warn if the process name *was* found but had 0 events (shouldn't happen if count > 0)
-             await ctx.warning(f"No events found matching process name '{process_name_filter}'.")
+             await ctx.warning(f"No events found matching process name '{process_name_filter}' (ID: {target_pname_id}).")
 
         return sorted_counts
 
@@ -1408,6 +1454,11 @@ async def get_timing_statistics(
     if LOADED_EVENTS is None or not GLOBAL_INTERNERS:
         await ctx.error("Operation failed: Optimized event data not loaded.")
         raise TypeError("Operation requires optimized event data to be loaded.")
+
+    # Handle case where there are no events
+    if not LOADED_EVENTS:
+        await ctx.info(f"Get timing statistics grouped by '{group_by}': No events loaded.")
+        return {}
 
     try:
         # Use defaultdict to store intermediate sums and counts
@@ -1483,23 +1534,7 @@ async def get_timing_statistics(
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
-    if not MCP_SDK_AVAILABLE:
-        print("CRITICAL: Model Context Protocol SDK (modelcontextprotocol) is not installed.")
-        print("Please install it: pip install modelcontextprotocol")
-        # Attempt to install if possible? Or just exit.
-        # try:
-        #     import subprocess
-        #     import sys
-        #     print("Attempting to install MCP SDK...")
-        #     subprocess.check_call([sys.executable, "-m", "pip", "install", "modelcontextprotocol"])
-        #     print("Installation attempt finished. Please restart the script.")
-        # except Exception as install_e:
-        #     print(f"Failed to auto-install MCP SDK: {install_e}")
-        exit(1) # Exit regardless of install attempt for now
-
-    # Add psutil to help message if needed
-    psutil_help = " (requires 'psutil' library)" if not PSUTIL_AVAILABLE else ""
-
+    # --- Argument Parsing ---
     parser = argparse.ArgumentParser(
         description=f"MCP Server for analyzing Procmon XML files (.xml, .xml.gz/bz2/xz) using in-memory optimization.",
         epilog=f"Memory reporting requires 'psutil' library (`pip install psutil`)."
@@ -1511,49 +1546,48 @@ if __name__ == "__main__":
     parser.add_argument("--mcp-port", type=int, default=8081, help="Port for MCP server (SSE transport), default: 8081")
     parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"], help="MCP transport protocol, default: stdio")
     parser.add_argument("--debug", action='store_true', help="Enable debug logging.")
-
     args = parser.parse_args()
 
-    # Configure logging level
+    # --- Logging Configuration ---
     log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.getLogger().setLevel(log_level)
-    # Ensure our logger also respects the level
-    logger.setLevel(log_level)
-    # Also set MCP's logger level if possible (depends on MCP version)
+    logging.getLogger().setLevel(log_level) # Set root logger level
+    logger.setLevel(log_level) # Ensure our specific logger respects the level
+    # Configure MCP/Uvicorn loggers if possible
     try:
         logging.getLogger('mcp').setLevel(log_level)
-        # Also configure uvicorn logging if using SSE
         if args.transport == 'sse':
              logging.getLogger('uvicorn').setLevel(log_level)
-             logging.getLogger('uvicorn.access').setLevel(logging.WARNING if not args.debug else logging.DEBUG) # Quieter access logs unless debugging
+             logging.getLogger('uvicorn.access').setLevel(logging.WARNING if not args.debug else logging.DEBUG)
     except Exception:
-        pass # Ignore if mcp/uvicorn loggers don't exist or can't be set
-
+        logger.debug("Could not configure MCP/Uvicorn loggers.", exc_info=True)
     logger.info(f"Logging level set to: {logging.getLevelName(log_level)}")
 
-    # Validate allowed directory
+    # --- Dependency Checks ---
+    if not MCP_SDK_AVAILABLE:
+        print("CRITICAL: Model Context Protocol SDK (modelcontextprotocol) is not installed.")
+        print("Please install it: pip install modelcontextprotocol")
+        exit(1)
+
+    # --- Directory Validation ---
     if not os.path.isdir(args.allowed_dir):
         logger.critical(f"Error: Allowed directory does not exist or is not a directory: {args.allowed_dir}")
         exit(1)
-
     ALLOWED_DIR_CONFIG = os.path.abspath(args.allowed_dir)
     logger.info(f"Allowed Directory set to: {ALLOWED_DIR_CONFIG}")
 
     # --- Load File into Optimized In-Memory Structure ---
     try:
         logger.info(f"Attempting to load and optimize file: {args.load_file}")
-        # This function now loads everything into global variables and includes timing/progress
         load_and_validate_file(ALLOWED_DIR_CONFIG, args.load_file)
 
-        # Check if loading succeeded - LOADED_EVENTS should not be None, even if empty
+        # Check if loading succeeded - LOADED_EVENTS should not be None
         if LOADED_EVENTS is None or LOADED_PROCESSES is None:
-            logger.critical(f"File loading failed for '{args.load_file}'. Check logs above for errors (e.g., XML syntax, permissions, decompression). Exiting.")
+            logger.critical(f"File loading failed for '{args.load_file}'. Check logs above for errors. Exiting.")
             exit(1)
         else:
-             logger.info(f"File '{args.load_file}' loaded successfully.")
+             logger.info(f"File '{args.load_file}' loaded successfully (Events: {len(LOADED_EVENTS):,}, Processes: {len(LOADED_PROCESSES)}).")
 
-
-        # --- ADDED: Memory Usage Reporting ---
+        # --- Memory Usage Reporting ---
         if PSUTIL_AVAILABLE:
             try:
                 process = psutil.Process(os.getpid())
@@ -1561,14 +1595,13 @@ if __name__ == "__main__":
                 rss_formatted = _format_bytes(mem_info.rss)
                 vms_formatted = _format_bytes(mem_info.vms)
                 logger.info(f"--- Post-Load Memory Usage (Process RSS): {rss_formatted} ---")
-                if args.debug: # Show more detail in debug mode
+                if args.debug:
                     logger.debug(f"  Detailed Memory: RSS={rss_formatted}, VMS={vms_formatted}")
                     logger.debug(f"  Full psutil mem_info: {mem_info}")
             except Exception as mem_err:
                 logger.warning(f"Could not retrieve process memory usage: {mem_err}")
         else:
             logger.info("Memory usage reporting skipped (psutil library not installed).")
-            # No need to prompt install here, already done at start
 
         logger.info(f"Ready for MCP connections.")
 
@@ -1577,7 +1610,6 @@ if __name__ == "__main__":
         exit(1)
     except ET_impl.XMLSyntaxError as e:
          logger.critical(f"XML Syntax Error loading file ('{args.load_file}'): {e}")
-         # Optionally log more details if debug is enabled
          if args.debug: logger.exception("XML Syntax Error details:")
          exit(1)
     except RuntimeError as e:
@@ -1595,7 +1627,6 @@ if __name__ == "__main__":
                 logger.info("Configuring MCP for SSE transport...")
                 mcp.settings.host = args.mcp_host
                 mcp.settings.port = args.mcp_port
-                # Pass log level name to MCP settings
                 mcp_log_level_name = logging.getLevelName(log_level)
                 mcp.settings.log_level = mcp_log_level_name.lower()
                 logger.info(f"  MCP Host: {mcp.settings.host}")
@@ -1604,23 +1635,20 @@ if __name__ == "__main__":
             else:
                  logger.warning("MCP object lacks 'settings'; cannot configure SSE host/port/log level via arguments.")
             logger.info(f"Starting MCP server with SSE transport on http://{args.mcp_host}:{args.mcp_port}")
-            mcp.run(transport="sse") # This blocks until server stops
-            server_started = True # Assume it started if run() doesn't raise immediate exception
+            mcp.run(transport="sse") # Blocks
+            server_started = True
         else: # Default to stdio
             logger.info("Starting MCP server with STDIO transport...")
-            mcp.run(transport="stdio") # This blocks until stdin/stdout closes
+            mcp.run(transport="stdio") # Blocks
             server_started = True
     except KeyboardInterrupt:
          logger.info("Server stopped by user (KeyboardInterrupt).")
-         # Allow graceful exit
     except Exception as e:
         logger.critical(f"Failed during server startup or execution: {e}", exc_info=args.debug)
-        # Exit with error code if server fails to start/run
         exit(1)
 
-    # If we reach here, the server stopped (either gracefully or via error handled above)
+    # --- Post-Server Execution ---
     if not server_started and args.transport == "sse":
-        # This might happen if uvicorn fails very early
         logger.critical("SSE Server did not appear to start correctly.")
         exit(1)
     else:
