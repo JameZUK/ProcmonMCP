@@ -19,11 +19,13 @@ import lzma
 # --- XML Parser Choice ---
 LXML_AVAILABLE = False
 try:
-    from lxml import etree as ET_impl # Use lxml etree as the primary implementation
+    # Use lxml etree as the primary implementation if available
+    from lxml import etree as ET_impl
     LXML_AVAILABLE = True
     # Logger defined after basicConfig below
 except ImportError:
-    import xml.etree.ElementTree as ET_impl # Fallback to standard library
+    # Fallback to standard library ElementTree
+    import xml.etree.ElementTree as ET_impl
     # Logger defined after basicConfig below
 
 # --- Memory Usage Reporting Dependency ---
@@ -36,8 +38,9 @@ except ImportError:
     pass # Warning will be logged later if needed
 
 # --- Basic Logging Configuration ---
-# Ensure debug level is set if requested via args later
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+# Configure basicConfig first, we might modify handlers later based on args
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT) # Set default level
 logger = logging.getLogger(__name__) # Define logger after basicConfig
 
 # Log XML parser choice after logger is defined
@@ -118,16 +121,30 @@ class StackFrame:
     path: Optional[str] = None
     location: Optional[str] = None
 
+    @staticmethod
+    def _strip_namespace(tag):
+        """Helper to remove namespace from tag string if present."""
+        return tag.split('}', 1)[-1] if '}' in tag else tag
+
+    @classmethod
+    def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
+         """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
+         for child in elem:
+            # Check tag name ignoring namespace
+            if cls._strip_namespace(child.tag) == tag_name:
+                return child.text.strip() if child.text else None
+         return None
+
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element) -> 'StackFrame':
-        """Parses a <frame> XML element into a StackFrame object."""
-        depth_text = elem.findtext('depth')
+        """Parses a <frame> XML element into a StackFrame object, ignoring namespaces."""
+        depth_text = cls._find_text_ignore_ns(elem, 'depth')
         try: depth = int(depth_text) if depth_text and depth_text.isdigit() else None
         except (ValueError, TypeError): depth = None
         # Address is typically hex, keep as string
-        address = elem.findtext('address')
-        path = elem.findtext('path')
-        location = elem.findtext('location')
+        address = cls._find_text_ignore_ns(elem, 'address')
+        path = cls._find_text_ignore_ns(elem, 'path')
+        location = cls._find_text_ignore_ns(elem, 'location')
         return cls(depth=depth, address=address, path=path, location=location)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -174,13 +191,17 @@ class ProcessInfo:
 
     # --- Helper methods for safe parsing ---
     @staticmethod
-    def _safe_find_text(elem: ET_impl.Element, tag: str) -> Optional[str]:
-        """Safely finds text content of a child tag, returning None if missing or empty."""
-        # Iterate through direct children, ignoring namespaces
-        for child in elem:
-            if child.tag.split('}', 1)[-1] == tag:
+    def _strip_namespace(tag):
+        """Helper to remove namespace from tag string if present."""
+        return tag.split('}', 1)[-1] if '}' in tag else tag
+
+    @classmethod
+    def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
+         """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
+         for child in elem:
+            if cls._strip_namespace(child.tag) == tag_name:
                 return child.text.strip() if child.text else None
-        return None
+         return None
 
     @staticmethod
     def _safe_text_to_int(text: Optional[str]) -> Optional[int]:
@@ -211,32 +232,32 @@ class ProcessInfo:
 
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element) -> 'ProcessInfo':
-        """Parses a <process> XML element into a ProcessInfo object."""
+        """Parses a <process> XML element into a ProcessInfo object, ignoring namespaces."""
         data = {}
-        data['process_index'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ProcessIndex'))
-        data['process_id'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ProcessId'))
-        data['parent_process_id'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ParentProcessId'))
-        data['parent_process_index'] = cls._safe_text_to_int(cls._safe_find_text(elem, 'ParentProcessIndex'))
-        data['authentication_id'] = cls._safe_find_text(elem, 'AuthenticationId')
-        data['create_time'] = cls._safe_find_text(elem, 'CreateTime') # Keep as string for now
-        data['finish_time'] = cls._safe_find_text(elem, 'FinishTime') # Keep as string for now
-        data['is_virtualized'] = cls._safe_text_to_bool(cls._safe_find_text(elem, 'IsVirtualized'))
-        data['is_64bit'] = cls._safe_text_to_bool(cls._safe_find_text(elem, 'Is64bit'))
-        data['integrity'] = cls._safe_find_text(elem, 'Integrity')
-        data['owner'] = cls._safe_find_text(elem, 'Owner')
-        data['process_name'] = cls._safe_find_text(elem, 'ProcessName')
-        data['image_path'] = cls._safe_find_text(elem, 'ImagePath')
-        data['command_line'] = cls._safe_find_text(elem, 'CommandLine')
-        data['company_name'] = cls._safe_find_text(elem, 'CompanyName')
-        data['version'] = cls._safe_find_text(elem, 'Version')
-        data['description'] = cls._safe_find_text(elem, 'Description')
+        data['process_index'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessIndex'))
+        data['process_id'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessId'))
+        data['parent_process_id'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ParentProcessId'))
+        data['parent_process_index'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ParentProcessIndex'))
+        data['authentication_id'] = cls._find_text_ignore_ns(elem, 'AuthenticationId')
+        data['create_time'] = cls._find_text_ignore_ns(elem, 'CreateTime') # Keep as string for now
+        data['finish_time'] = cls._find_text_ignore_ns(elem, 'FinishTime') # Keep as string for now
+        data['is_virtualized'] = cls._safe_text_to_bool(cls._find_text_ignore_ns(elem, 'IsVirtualized'))
+        data['is_64bit'] = cls._safe_text_to_bool(cls._find_text_ignore_ns(elem, 'Is64bit'))
+        data['integrity'] = cls._find_text_ignore_ns(elem, 'Integrity')
+        data['owner'] = cls._find_text_ignore_ns(elem, 'Owner')
+        data['process_name'] = cls._find_text_ignore_ns(elem, 'ProcessName') # Corrected based on structure analysis
+        data['image_path'] = cls._find_text_ignore_ns(elem, 'ImagePath')
+        data['command_line'] = cls._find_text_ignore_ns(elem, 'CommandLine')
+        data['company_name'] = cls._find_text_ignore_ns(elem, 'CompanyName')
+        data['version'] = cls._find_text_ignore_ns(elem, 'Version')
+        data['description'] = cls._find_text_ignore_ns(elem, 'Description')
         return cls(**data)
 
 # --- ADDED: ProcmonEvent Dataclass ---
 @dataclasses.dataclass
 class ProcmonEvent:
     """Represents data parsed from a single <event> element before optimization."""
-    sequence_number: Optional[int] = None
+    sequence_number: Optional[int] = None # Might be absent in some XML exports
     process_index: Optional[int] = None # Used to link to ProcessInfo if needed
     pid: Optional[int] = None
     tid: Optional[int] = None
@@ -275,16 +296,34 @@ class ProcmonEvent:
     def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo]) -> 'ProcmonEvent':
         """Parses an <event> XML element into a ProcmonEvent object, ignoring namespaces."""
         data = {}
+
+        # *** Removed Debug Log for Child Tags ***
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     child_tags = [cls._strip_namespace(child.tag) for child in elem]
+        #     logger.debug(f"  [Event Parse Debug] Child tags of <event>: {child_tags}")
+
+        # *** Attempt to parse SequenceNumber, but don't fail if missing ***
+        seq_num_str = cls._find_text_ignore_ns(elem, 'SequenceNumber')
+        # *** Removed Debug Log for SequenceNumber Text ***
+        # logger.debug(f"  [Event Parse Debug] Found SequenceNumber text: '{seq_num_str}'")
+        data['sequence_number'] = ProcessInfo._safe_text_to_int(seq_num_str)
+        if seq_num_str is not None and data['sequence_number'] is None:
+             logger.warning(f"Could not parse SequenceNumber '{seq_num_str}' for an event.")
+        elif seq_num_str is None:
+             logger.debug("SequenceNumber tag not found or empty for this event.")
+
+
         # Use the static helper methods defined in ProcessInfo for consistency, but use the NS-ignoring find text
-        data['sequence_number'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'SequenceNumber'))
         data['process_index'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessIndex'))
-        data['pid'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessId'))
+        # *** Use correct tag name 'PID' based on analysis ***
+        data['pid'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'PID'))
         data['tid'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ThreadId'))
         # ParentPID might not be directly in the event element in XML
         data['parent_pid'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ParentPID')) # Try parsing if present
 
+        # *** Use correct tag name 'Time_of_Day' based on analysis ***
         data['timestamp_str'] = cls._find_text_ignore_ns(elem, 'Time_of_Day')
-        data['timestamp_float'] = cls._parse_timestamp_str(data['timestamp_str'])
+        data['timestamp_float'] = cls._parse_timestamp_str(data['timestamp_str']) # Uses updated parsing logic
 
         data['operation'] = cls._find_text_ignore_ns(elem, 'Operation')
         data['path'] = cls._find_text_ignore_ns(elem, 'Path')
@@ -302,14 +341,14 @@ class ProcmonEvent:
             logger.debug(f"Failed to convert duration '{duration_text}' to float for event seq {data['sequence_number']}.")
             data['duration_float'] = None
 
-        # Get ProcessName directly from event if possible
-        data['process_name'] = cls._find_text_ignore_ns(elem, 'ProcessName')
+        # *** Use correct tag name 'Process_Name' based on analysis ***
+        data['process_name'] = cls._find_text_ignore_ns(elem, 'Process_Name')
 
         # Fallback: If ProcessName missing in event, try lookup via ProcessIndex
         if data['process_name'] is None and data['process_index'] is not None:
             proc_info = processes.get(data['process_index'])
             if proc_info:
-                data['process_name'] = proc_info.process_name
+                data['process_name'] = proc_info.process_name # Assumes ProcessInfo has correct name
                 # Also try to get ParentPID from process list if missing from event
                 if data['parent_pid'] is None:
                     data['parent_pid'] = proc_info.parent_pid
@@ -318,17 +357,14 @@ class ProcmonEvent:
                  logger.debug(f"Event seq {data['sequence_number']} has ProcessIndex {data['process_index']} but not found in process list.")
 
         # Parse Stack, ignoring namespaces for Stack and frame tags
-        stack_elem = cls._find_child_ignore_ns(elem, 'Stack')
+        stack_elem = cls._find_child_ignore_ns(elem, 'stack') # Use lowercase based on analysis
         if stack_elem is not None:
             data['stack_frames'] = []
             # Iterate through child 'frame' elements
             for frame_elem in stack_elem:
                 if cls._strip_namespace(frame_elem.tag) == 'frame':
                     try:
-                        # StackFrame parsing already uses findtext which might handle namespaces depending on impl,
-                        # but let's assume it needs updating if findtext doesn't ignore NS.
-                        # For now, assuming StackFrame.from_xml_element works or needs similar NS handling internally.
-                        # If StackFrame parsing fails, it might need its own _find_text_ignore_ns.
+                        # StackFrame parsing needs to handle namespaces too now
                         data['stack_frames'].append(StackFrame.from_xml_element(frame_elem))
                     except Exception as e:
                         # Log warning if a specific frame fails to parse
@@ -342,18 +378,41 @@ class ProcmonEvent:
 
     @staticmethod
     def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
-        """Parses HH:MM:SS.ffffff string to a UTC float timestamp relative to BASE_DATE."""
+        """
+        Parses HH:MM:SS.ffffff[f...] string to a UTC float timestamp relative to BASE_DATE.
+        Handles arbitrary digits in fractional seconds by truncating to 6.
+        """
         if ts_str is None:
             return None
         try:
-            # Parse the time part using the defined format
-            parsed_time: dt_time = datetime.strptime(ts_str, PROCMON_TIMESTAMP_FORMAT).time()
+            # Split into time and fractional seconds
+            parts = ts_str.split('.', 1)
+            time_part = parts[0]
+            fractional_part = ""
+            if len(parts) > 1:
+                fractional_part = parts[1]
+
+            # Truncate fractional part to 6 digits if longer
+            if len(fractional_part) > 6:
+                # logger.debug(f"Truncating timestamp fractional part: '{fractional_part}' -> '{fractional_part[:6]}'") # Reduced verbosity
+                fractional_part = fractional_part[:6]
+            elif len(fractional_part) < 6:
+                # Pad with zeros if shorter (less common but possible)
+                fractional_part = fractional_part.ljust(6, '0')
+
+            # Reconstruct the string with exactly 6 fractional digits
+            ts_str_corrected = f"{time_part}.{fractional_part}"
+
+            # Parse the corrected time string
+            parsed_time: dt_time = datetime.strptime(ts_str_corrected, PROCMON_TIMESTAMP_FORMAT).time()
+
             # Combine with base date (which has UTC timezone set)
             full_dt = datetime.combine(BASE_DATE.date(), parsed_time, tzinfo=timezone.utc)
             # Return Unix timestamp float (seconds since epoch)
             return full_dt.timestamp()
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, IndexError) as e:
             # Log warning if timestamp string is invalid
+            # Use original ts_str in log message for clarity
             logger.warning(f"Could not parse timestamp string '{ts_str}': {e}")
             return None
 
@@ -468,7 +527,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Handle potential namespaces in event parsing ---
+# --- UPDATED: Removed verbose debug logging ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -517,26 +576,31 @@ def _parse_xml_stream_for_loading(
                 continue # Continue loop until eventlist start is found
 
             elif parsing_stage == "parsing_events":
-                # Log every tag encountered within the eventlist stage for debugging
-                logger.debug(f"  [Pass 2 Debug] Encountered tag: '{tag}' (Original: '{elem.tag}'), Event type: {event_type}")
+                # *** REMOVED verbose logging of every tag ***
+                # logger.debug(f"  [Pass 2 Debug] Encountered tag: '{tag}' (Original: '{elem.tag}'), Event type: {event_type}")
 
                 if event_type == 'end': # Process elements only when they finish
                     if tag == 'event':
                         event_count += 1 # Increment count when <event> tag *ends*
                         # Use namespace ignoring find helper for sequence number
-                        seq_num_text = ProcmonEvent._find_text_ignore_ns(elem, 'SequenceNumber') or '<unknown>'
-                        logger.debug(f"  [Pass 2 Debug] Found END of <event> tag #{event_count}, Sequence ~{seq_num_text}. Attempting parse...")
+                        seq_num_text = ProcmonEvent._find_text_ignore_ns(elem, 'SequenceNumber') or f'event #{event_count}'
+                        logger.debug(f"  [Pass 2 Debug] Found END of <event> tag #{event_count}. Attempting parse...")
                         try:
                             # 1. Parse the raw event data using the dataclass (which now ignores namespaces)
-                            logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for Sequence ~{seq_num_text}...")
+                            logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for event #{event_count}...")
                             raw_event = ProcmonEvent.from_xml_element(elem, processes)
                             # Check if sequence number was parsed correctly for logging
                             parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
-                            logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for Sequence {parsed_seq}. Optimizing...")
+                            # *** REMOVED Check for missing SequenceNumber - Assume it might be missing ***
+                            # if parsed_seq is None:
+                            #     logger.warning(f"  [Pass 2 Warning] Skipping event ~{seq_num_text} due to missing SequenceNumber after parsing.")
+                            #     continue # Skip this event if sequence couldn't be parsed
+
+                            logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for event #{event_count} (Sequence: {parsed_seq}). Optimizing...")
 
                             # --- Optimization Logic (remains the same) ---
                             opt_event: Dict[str, Any] = {}
-                            opt_event['seq'] = raw_event.sequence_number
+                            opt_event['seq'] = raw_event.sequence_number # Will be None if tag was missing/unparsable
                             opt_event['pid'] = raw_event.pid
                             opt_event['tid'] = raw_event.tid
                             opt_event['ppid'] = raw_event.parent_pid
@@ -579,6 +643,7 @@ def _parse_xml_stream_for_loading(
 
                         except Exception as e:
                             # Log error parsing this specific event but continue if possible
+                            # seq_num_text = ProcmonEvent._find_text_ignore_ns(elem, 'SequenceNumber') or f'event #{event_count}' # Already defined above
                             logger.warning(f"  [Pass 2 Warning] Failed to parse/convert <event> element (Sequence ~{seq_num_text}): {e}", exc_info=False)
                             # Log more details in debug mode
                             if logger.isEnabledFor(logging.DEBUG):
@@ -592,7 +657,7 @@ def _parse_xml_stream_for_loading(
                                 logger.debug(f"  [Pass 2 Debug] Full exception details for event ~{seq_num_text}:", exc_info=True)
 
                         finally:
-                             logger.debug(f"  [Pass 2 Debug] Clearing element for event ~{seq_num_text}.")
+                             logger.debug(f"  [Pass 2 Debug] Clearing element for event #{event_count}.")
                              _clear_elem(elem) # IMPORTANT: Clear event element memory after processing its end tag
 
                     elif tag == 'eventlist':
@@ -604,9 +669,14 @@ def _parse_xml_stream_for_loading(
                         _clear_elem(elem)
                         break # Stop iteration
                     else:
-                        # If the tag wasn't 'event', 'eventlist', or 'procmon', clear it to save memory
-                        logger.debug(f"  [Pass 2 Debug] Clearing element for unexpected tag '{tag}' on end event.")
-                        _clear_elem(elem)
+                        # *** REMOVED Premature Clearing ***
+                        # If the tag wasn't 'event', 'eventlist', or 'procmon',
+                        # it's likely a child of 'event' (like 'PID', 'Path', 'stack', 'frame', etc.)
+                        # We MUST NOT clear it here, as the parent 'event' element needs it
+                        # when its 'end' event is processed. The clearing happens
+                        # in the finally block under "if tag == 'event'".
+                        # logger.debug(f"  [Pass 2 Debug] Ignoring end event for intermediate tag '{tag}'.") # Removed this too for less noise
+                        _clear_elem(elem) # Clear other intermediate tags to save memory
 
 
         elapsed = time.time() - start_time
@@ -799,9 +869,13 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
     except FileNotFoundError as e: logger.error(f"File not found: {abs_full_path}"); raise
     except PermissionError as e: logger.error(f"Permission denied: {abs_full_path}"); raise
     except ET_impl.XMLSyntaxError as e: logger.error(f"XML Syntax Error in {filename_relative}: {e}", exc_info=True); raise RuntimeError(f"Invalid XML: {e}") from e
-    except (gzip.BadGzipFile, OSError, lzma.LZMAError, bz2.BZ2Error) as e: # More specific exception catching
-        logger.error(f"Decompression or I/O error for {filename_relative}: {e}")
-        raise RuntimeError(f"Decompression or file read failed for '{filename_relative}'.") from e
+    # *** UPDATED Exception Handling - Removed bz2.BZ2Error ***
+    except (gzip.BadGzipFile, lzma.LZMAError) as e: # Handle specific compression errors first
+        logger.error(f"Decompression error for {filename_relative}: {e}")
+        raise RuntimeError(f"Decompression failed for '{filename_relative}'.") from e
+    except OSError as e: # Catch general I/O errors, which might include bz2 issues
+        logger.error(f"File read or I/O error for {filename_relative}: {e}")
+        raise RuntimeError(f"File read or I/O failed for '{filename_relative}'.") from e
     except Exception as e:
         logger.error(f"Error loading/optimizing file {filename_relative}: {e}", exc_info=True)
         # Clear potentially partially loaded state on error
@@ -1095,7 +1169,7 @@ async def query_events(
 
                 event_summary = {
                     'event_index': idx, # Use list index
-                    'sequence_number': event_dict.get('seq'),
+                    'sequence_number': event_dict.get('seq'), # Will be None if missing in source
                     'timestamp': ts_display,
                     'process_name': get_string("process_name", event_dict.get('pname_id')),
                     'pid': event_dict.get('pid'),
@@ -1149,7 +1223,7 @@ async def get_event_details(event_index: int, ctx: Context) -> Dict[str, Any]:
         # Convert optimized dict back to a more user-friendly format
         details: Dict[str, Any] = {}
         details['event_index'] = event_index
-        details['sequence_number'] = event_dict.get('seq')
+        details['sequence_number'] = event_dict.get('seq') # Will be None if missing in source
         details['pid'] = event_dict.get('pid')
         details['tid'] = event_dict.get('tid')
         details['parent_pid'] = event_dict.get('ppid') # Get ParentPID stored during optimization
@@ -1598,26 +1672,88 @@ if __name__ == "__main__":
     parser.add_argument("--mcp-port", type=int, default=8081, help="Port for MCP server (SSE transport), default: 8081")
     parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"], help="MCP transport protocol, default: stdio")
     parser.add_argument("--debug", action='store_true', help="Enable debug logging.")
+    # *** ADDED log-file argument ***
+    parser.add_argument("--log-file", type=str, default=None, help="Optional: Path to a file to write logs to instead of console.")
+
     args = parser.parse_args()
 
     # --- Logging Configuration ---
     log_level = logging.DEBUG if args.debug else logging.INFO
-    logging.getLogger().setLevel(log_level) # Set root logger level
-    logger.setLevel(log_level) # Ensure our specific logger respects the level
+    log_handlers = []
+
+    # *** UPDATED Logging Setup ***
+    if args.log_file:
+        # Ensure the directory for the log file exists
+        log_dir = os.path.dirname(args.log_file)
+        if log_dir and not os.path.exists(log_dir):
+            try:
+                os.makedirs(log_dir)
+            except OSError as e:
+                print(f"Error: Could not create directory for log file '{args.log_file}': {e}")
+                exit(1)
+        # Add file handler
+        try:
+            file_handler = logging.FileHandler(args.log_file, mode='w') # 'w' to overwrite each run
+            file_handler.setLevel(log_level)
+            file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+            log_handlers.append(file_handler)
+            print(f"Logging to file: {args.log_file}") # Still print this to console
+        except Exception as e:
+             print(f"Error: Could not open log file '{args.log_file}' for writing: {e}")
+             exit(1)
+    else:
+        # Add console handler (default behavior if no log file)
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(log_level)
+        console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        log_handlers.append(console_handler)
+
+    # Configure the root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    # Remove existing default handlers (like the one from basicConfig)
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    # Add our configured handlers
+    for handler in log_handlers:
+        root_logger.addHandler(handler)
+
+    # Ensure our specific logger also respects the level
+    logger.setLevel(log_level)
     # Configure MCP/Uvicorn loggers if possible
     try:
         logging.getLogger('mcp').setLevel(log_level)
+        # Add our handlers to MCP logger too if desired, or let it propagate
+        # for handler in log_handlers:
+        #     logging.getLogger('mcp').addHandler(handler)
+        # logging.getLogger('mcp').propagate = False # Prevent double logging if handlers added
+
         if args.transport == 'sse':
              logging.getLogger('uvicorn').setLevel(log_level)
+             logging.getLogger('uvicorn.error').setLevel(log_level) # Ensure errors are logged
              logging.getLogger('uvicorn.access').setLevel(logging.WARNING if not args.debug else logging.DEBUG)
+             # Optionally add file handler to uvicorn loggers too
+             # for handler in log_handlers:
+             #    logging.getLogger('uvicorn').addHandler(handler)
+             #    logging.getLogger('uvicorn.error').addHandler(handler)
+             #    logging.getLogger('uvicorn.access').addHandler(handler)
+             # logging.getLogger('uvicorn').propagate = False
+             # logging.getLogger('uvicorn.error').propagate = False
+             # logging.getLogger('uvicorn.access').propagate = False
+
     except Exception:
         logger.debug("Could not configure MCP/Uvicorn loggers.", exc_info=True)
     logger.info(f"Logging level set to: {logging.getLevelName(log_level)}")
+    if args.log_file:
+        logger.info(f"Logging output directed to file: {args.log_file}")
+    else:
+        logger.info("Logging output directed to console.")
 
     # --- Dependency Checks ---
     if not MCP_SDK_AVAILABLE:
-        print("CRITICAL: Model Context Protocol SDK (modelcontextprotocol) is not installed.")
-        print("Please install it: pip install modelcontextprotocol")
+        # Log critical error before exiting
+        logger.critical("CRITICAL: Model Context Protocol SDK (modelcontextprotocol) is not installed.")
+        logger.critical("Please install it: pip install modelcontextprotocol")
         exit(1)
 
     # --- Directory Validation ---
@@ -1679,6 +1815,7 @@ if __name__ == "__main__":
                 logger.info("Configuring MCP for SSE transport...")
                 mcp.settings.host = args.mcp_host
                 mcp.settings.port = args.mcp_port
+                # Pass log level name to MCP settings
                 mcp_log_level_name = logging.getLevelName(log_level)
                 mcp.settings.log_level = mcp_log_level_name.lower()
                 logger.info(f"  MCP Host: {mcp.settings.host}")
