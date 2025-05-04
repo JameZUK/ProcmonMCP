@@ -2,7 +2,7 @@
 import os
 import logging
 import argparse
-from typing import List, Dict, Any, Optional, Tuple, Iterator, IO
+from typing import List, Dict, Any, Optional, Tuple, Iterator, IO, Set
 import io
 import asyncio
 import time # For timing
@@ -10,6 +10,8 @@ from collections import defaultdict # For counting
 import dataclasses # For XML data structures
 import re # For regex filtering
 from datetime import datetime, timezone, time as dt_time # For time-based filtering & UTC timestamps
+import csv # For CSV export
+import json # For JSON export
 
 # Standard library compression formats
 import gzip
@@ -84,6 +86,10 @@ PROGRESS_REPORT_INTERVAL = 250000 # Report progress every N events during loadin
 # Define a base date (epoch) for creating full timestamps from Time_of_Day.
 # This is necessary because XML only provides time, not date. Assumes logs don't span midnight relative to this arbitrary date for accurate time-only filtering.
 BASE_DATE = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# Known operation strings for specific tools
+OP_PROCESS_CREATE = "Process Create"
+OP_PROCESS_EXIT = "Process Exit"
+NETWORK_OPERATIONS = {"TCP Connect", "TCP Send", "TCP Receive", "UDP Send", "UDP Receive"} # Case-sensitive
 
 # --- String Interning Helper ---
 class StringInterner:
@@ -296,8 +302,11 @@ class ProcmonEvent:
          return child.text.strip() if child is not None and child.text else None
 
     @classmethod
-    def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo]) -> 'ProcmonEvent':
-        """Parses an <event> XML element into a ProcmonEvent object, ignoring namespaces and capturing extra fields."""
+    def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo], load_stack: bool, load_extra: bool) -> 'ProcmonEvent':
+        """
+        Parses an <event> XML element into a ProcmonEvent object, ignoring namespaces
+        and optionally capturing extra fields and stack traces based on flags.
+        """
         data = {}
         extra_data_dict = {}
         # Define known tags we handle explicitly (lowercase for case-insensitive comparison)
@@ -348,17 +357,20 @@ class ProcmonEvent:
             elif tag_name_clean == 'process_name': # Use Process_Name based on prior analysis
                 data['process_name'] = tag_text
             elif tag_name_clean == 'stack':
-                # Parse Stack frames
-                data['stack_frames'] = []
-                for frame_elem in child: # Iterate children of <stack>
-                    if cls._strip_namespace(frame_elem.tag) == 'frame':
-                        try:
-                            data['stack_frames'].append(StackFrame.from_xml_element(frame_elem))
-                        except Exception as e:
-                            logger.warning(f"Failed to parse a <frame> element for event seq {data.get('sequence_number', '<unknown>')}: {e}", exc_info=False)
-                if not data['stack_frames']: # Set to None if list is empty
-                    data['stack_frames'] = None
-            else:
+                # Parse Stack only if requested
+                if load_stack:
+                    data['stack_frames'] = []
+                    for frame_elem in child: # Iterate children of <stack>
+                        if cls._strip_namespace(frame_elem.tag) == 'frame':
+                            try:
+                                data['stack_frames'].append(StackFrame.from_xml_element(frame_elem))
+                            except Exception as e:
+                                logger.warning(f"Failed to parse a <frame> element for event seq {data.get('sequence_number', '<unknown>')}: {e}", exc_info=False)
+                    if not data['stack_frames']: # Set to None if list is empty
+                        data['stack_frames'] = None
+                else:
+                    data['stack_frames'] = None # Explicitly set to None if not loading
+            elif load_extra: # Check if we should load extra data
                 # Store unknown tags and their text content
                 if tag_text is not None: # Only store if there's text
                     # Use the original tag name (with namespace if present) as the key
@@ -377,8 +389,8 @@ class ProcmonEvent:
             else:
                  logger.debug(f"Event seq {data.get('sequence_number', '<unknown>')} has ProcessIndex {data['process_index']} but not found in process list.")
 
-        # Add the collected extra data if any
-        if extra_data_dict:
+        # Add the collected extra data if any and if requested
+        if load_extra and extra_data_dict:
             data['extra_data'] = extra_data_dict
 
         return cls(**data)
@@ -534,11 +546,13 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Removed verbose debug logging & premature clearing ---
+# --- UPDATED: Respect selective loading flags ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
-    processes: Dict[int, ProcessInfo] # Pass in the pre-loaded processes for potential lookups
+    processes: Dict[int, ProcessInfo], # Pass in the pre-loaded processes for potential lookups
+    load_stack: bool, # Flag for selective loading
+    load_extra: bool # Flag for selective loading
 ) -> Iterator[Dict[str, Any]]:
     """
     Internal helper optimized for initial loading into memory.
@@ -546,6 +560,7 @@ def _parse_xml_stream_for_loading(
     and yields them. Assumes process list is already parsed and passed in `processes`.
     Reports progress based on event count. Includes enhanced debug logging.
     Uses start/end events for iterparse and handles potential XML namespaces.
+    Respects selective loading flags.
 
     Yields:
         Optimized event dictionaries.
@@ -594,7 +609,8 @@ def _parse_xml_stream_for_loading(
                         try:
                             # 1. Parse the raw event data using the dataclass (which now ignores namespaces)
                             logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for event #{event_count}...")
-                            raw_event = ProcmonEvent.from_xml_element(elem, processes)
+                            # Pass selective loading flags to parser
+                            raw_event = ProcmonEvent.from_xml_element(elem, processes, load_stack, load_extra)
                             # Check if sequence number was parsed correctly for logging
                             parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
                             # *** REMOVED Check for missing SequenceNumber - Assume it might be missing ***
@@ -619,11 +635,12 @@ def _parse_xml_stream_for_loading(
                             opt_event['res_id'] = interners["result"].get_id(raw_event.result)
                             opt_event['cat_id'] = interners["category"].get_id(raw_event.category)
 
-                            # *** ADDED: Store extra_data ***
-                            if raw_event.extra_data:
+                            # *** ADDED: Store extra_data if loaded ***
+                            if load_extra and raw_event.extra_data:
                                 opt_event['extra_data'] = raw_event.extra_data # Store the dict directly
 
-                            if raw_event.stack_frames:
+                            # *** Store stack trace only if loaded ***
+                            if load_stack and raw_event.stack_frames:
                                 optimized_stack = []
                                 for frame in raw_event.stack_frames:
                                     try:
@@ -712,6 +729,12 @@ LOADED_PROCESSES: Optional[Dict[int, ProcessInfo]] = None
 LOADED_EVENTS: Optional[List[Dict[str, Any]]] = None
 # Store String Interning Maps globally
 GLOBAL_INTERNERS: Dict[str, StringInterner] = {}
+# *** ADDED: Indices for faster querying ***
+PID_INDEX: Dict[int, List[int]] = defaultdict(list) # {pid_id: [event_idx, event_idx,...]}
+OP_INDEX: Dict[int, List[int]] = defaultdict(list) # {op_id: [event_idx, event_idx,...]}
+# *** ADDED: Selective loading flags (will be set by args) ***
+LOAD_STACK_TRACES: bool = True
+LOAD_EXTRA_DATA: bool = True
 
 # --- Setup MCP ---
 if MCP_SDK_AVAILABLE:
@@ -726,11 +749,16 @@ else:
      )
 
 # --- Security Helper ---
-def get_secure_path(filename: str) -> str:
-    """ Validates filename relative to ALLOWED_DIR_CONFIG and returns absolute path. """
-    if not ALLOWED_DIR_CONFIG: raise RuntimeError("Internal Error: Allowed directory configuration is missing.")
+def get_secure_path(filename: str, base_dir: Optional[str] = None, check_exists: bool = True) -> str:
+    """
+    Validates filename relative to a base directory and returns absolute path.
+    Can optionally skip the existence check (for output files).
+    """
+    if base_dir is None:
+        base_dir = ALLOWED_DIR_CONFIG
+    if not base_dir: raise RuntimeError("Internal Error: Base directory configuration is missing.")
     if not filename: raise ValueError("Filename cannot be empty.")
-    # Prevent escaping the allowed directory
+    # Prevent escaping the base directory
     if ".." in filename or os.path.isabs(filename):
         raise ValueError("Invalid filename format: Contains '..' or is an absolute path.")
 
@@ -740,28 +768,33 @@ def get_secure_path(filename: str) -> str:
         if norm_filename.startswith("..") or os.path.isabs(norm_filename):
              raise ValueError("Invalid filename format after normalization.") # Double check after normpath
 
-        full_path = os.path.join(ALLOWED_DIR_CONFIG, norm_filename)
-        normalized_allowed_dir = os.path.abspath(ALLOWED_DIR_CONFIG)
+        full_path = os.path.join(base_dir, norm_filename)
+        normalized_base_dir = os.path.abspath(base_dir)
         normalized_full_path = os.path.abspath(full_path)
-        logger.debug(f"Checking path: {normalized_full_path} against allowed: {normalized_allowed_dir}")
+        logger.debug(f"Checking path: {normalized_full_path} against base: {normalized_base_dir}")
 
         # Use os.path.realpath to resolve symlinks *before* checking common path
-        real_allowed_dir = os.path.realpath(normalized_allowed_dir)
-        real_full_path = os.path.realpath(normalized_full_path)
+        real_base_dir = os.path.realpath(normalized_base_dir)
+        # Resolve the potential target path, but allow it not to exist yet for output
+        try:
+            real_full_path = os.path.realpath(normalized_full_path)
+        except OSError: # Handle cases where the path doesn't exist for realpath
+             real_full_path = normalized_full_path
 
         # Check if the resolved path is within the resolved allowed directory
-        common_prefix = os.path.commonpath([real_allowed_dir, real_full_path])
-        if common_prefix != real_allowed_dir:
-            raise PermissionError(f"Access denied: File '{filename}' resolves outside allowed directory '{real_allowed_dir}'.")
+        common_prefix = os.path.commonpath([real_base_dir, real_full_path])
+        if common_prefix != real_base_dir:
+            raise PermissionError(f"Access denied: Path '{filename}' resolves outside allowed base directory '{real_base_dir}'.")
 
-        # Check existence *after* resolving symlinks to ensure the target exists
-        if not os.path.exists(real_full_path):
-            raise FileNotFoundError(f"File not found: {filename} (resolves to {real_full_path})")
-        if not os.path.isfile(real_full_path):
-            raise ValueError(f"Path exists but is not a file: {filename} (resolves to {real_full_path})")
+        # Check existence only if requested
+        if check_exists:
+            if not os.path.exists(real_full_path):
+                raise FileNotFoundError(f"File not found: {filename} (resolves to {real_full_path})")
+            if not os.path.isfile(real_full_path):
+                raise ValueError(f"Path exists but is not a file: {filename} (resolves to {real_full_path})")
 
-        logger.debug(f"Path validated: {real_full_path}")
-        # Return the non-realpath version for opening, as realpath might fail on Windows junctions etc. during open
+        logger.debug(f"Path validated: {normalized_full_path}")
+        # Return the normalized (but not realpath'd) version for consistency
         return normalized_full_path
     except ValueError as e: logger.error(f"Path validation error for '{filename}': {e}"); raise ValueError(f"Invalid path specified: {filename}") from e
     except FileNotFoundError as e: logger.error(f"File not found error for '{filename}': {e}"); raise FileNotFoundError(f"File not found: {filename}") from e
@@ -774,11 +807,13 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
     """
     Loads XML file: Parses processes, then streams events, converting them
     to an optimized in-memory format using string interning. Stores results globally.
+    Builds PID and Operation indices.
 
     Raises:
         FileNotFoundError, ValueError, PermissionError, RuntimeError, ET_impl.XMLSyntaxError
     """
     global LOADED_FILENAME, LOADED_FILE_TYPE, LOADED_COMPRESSION, LOADED_PROCESSES, LOADED_EVENTS, GLOBAL_INTERNERS
+    global PID_INDEX, OP_INDEX # Declare modification of global indices
 
     # Reset global state before loading
     LOADED_FILENAME = None
@@ -787,8 +822,10 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
     LOADED_PROCESSES = None
     LOADED_EVENTS = None
     GLOBAL_INTERNERS = {}
+    PID_INDEX = defaultdict(list) # Reset indices
+    OP_INDEX = defaultdict(list)  # Reset indices
 
-    abs_full_path = get_secure_path(filename_relative)
+    abs_full_path = get_secure_path(filename_relative, base_dir=allowed_dir, check_exists=True)
     fname_lower = filename_relative.lower()
     file_type: str = "xml"
     compression: Optional[str] = None
@@ -819,6 +856,12 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
         "stack_path": StringInterner(), # Interner for stack frame paths
         "stack_location": StringInterner(), # Interner for stack frame locations/symbols
     }
+    # Pre-intern known operation strings
+    interners["operation"].get_id(OP_PROCESS_CREATE)
+    interners["operation"].get_id(OP_PROCESS_EXIT)
+    for op in NETWORK_OPERATIONS:
+        interners["operation"].get_id(op)
+
 
     try:
         open_func: Any = open
@@ -836,15 +879,29 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
 
         # --- Pass 2: Parse Events and Optimize ---
         with open_func(abs_full_path, "rb") as f_stream:
-            event_iterator = _parse_xml_stream_for_loading(f_stream, interners, processes_dict)
-            # *** UPDATED: Manual consumption with logging ***
+            # Pass selective loading flags to the parser
+            event_iterator = _parse_xml_stream_for_loading(
+                f_stream, interners, processes_dict,
+                load_stack=LOAD_STACK_TRACES, load_extra=LOAD_EXTRA_DATA
+            )
+            # *** UPDATED: Manual consumption with logging AND indexing ***
             logger.info("[Loader] Starting consumption of event iterator...")
             temp_event_list = []
             consumed_count = 0
             try:
-                for opt_event in event_iterator:
+                for idx, opt_event in enumerate(event_iterator): # Use enumerate to get index
                     temp_event_list.append(opt_event)
                     consumed_count += 1
+
+                    # --- Build Indices ---
+                    pid_id = opt_event.get('pname_id')
+                    op_id = opt_event.get('op_id')
+                    if pid_id is not None:
+                        PID_INDEX[pid_id].append(idx) # Store event index (idx)
+                    if op_id is not None:
+                        OP_INDEX[op_id].append(idx) # Store event index (idx)
+                    # --- End Indexing ---
+
                     # Log progress less frequently during consumption
                     if consumed_count % 50000 == 0:
                         logger.debug(f"[Loader] Consumed {consumed_count:,} events into list.")
@@ -864,12 +921,14 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
         LOADED_PROCESSES = processes_dict
         LOADED_EVENTS = optimized_events # This list now contains the optimized event dicts
         GLOBAL_INTERNERS = interners # Store interners for later lookup
+        # Indices (PID_INDEX, OP_INDEX) are already populated globally
 
         overall_end_time = time.time()
         logger.info(f"--- Loading Summary ---")
         # This count comes from len(optimized_events) which depends on successful yields
         logger.info(f" Successfully loaded and optimized {len(optimized_events):,} events from {filename_relative}.")
         logger.info(f" Found {len(processes_dict)} unique processes.")
+        logger.info(f" Built PID index for {len(PID_INDEX)} processes and OP index for {len(OP_INDEX)} operations.")
         logger.info(f" Total loading and optimization time: {overall_end_time - overall_start_time:.2f} seconds.")
         # Log interner stats for debugging memory usage
         if logger.isEnabledFor(logging.DEBUG):
@@ -889,7 +948,7 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
     except Exception as e:
         logger.error(f"Error loading/optimizing file {filename_relative}: {e}", exc_info=True)
         # Clear potentially partially loaded state on error
-        LOADED_FILENAME = None; LOADED_FILE_TYPE = None; LOADED_COMPRESSION = None; LOADED_PROCESSES = None; LOADED_EVENTS = None; GLOBAL_INTERNERS = {}
+        LOADED_FILENAME = None; LOADED_FILE_TYPE = None; LOADED_COMPRESSION = None; LOADED_PROCESSES = None; LOADED_EVENTS = None; GLOBAL_INTERNERS = {}; PID_INDEX = defaultdict(list); OP_INDEX = defaultdict(list)
         raise RuntimeError(f"Failed to load/optimize file: {e}") from e
 
 
@@ -940,6 +999,11 @@ async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
     try:
         # Add interner stats for context
         summary["interner_stats"] = {name: interner.next_id for name, interner in GLOBAL_INTERNERS.items()}
+        # Add index stats
+        summary["index_stats"] = {
+            "pid_indexed_count": len(PID_INDEX),
+            "op_indexed_count": len(OP_INDEX),
+        }
         await ctx.info(f"Successfully generated summary for {LOADED_FILENAME}.")
         return summary
     except Exception as e:
@@ -947,6 +1011,7 @@ async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error generating summary: {e}")
 
+# --- UPDATED: Query Events with Indexing ---
 @tool_decorator
 async def query_events(
     # Standard Filters
@@ -971,6 +1036,7 @@ async def query_events(
 ) -> List[Dict[str, Any]]:
     """
     Queries events from the optimized in-memory data, applying multiple filters (AND logic).
+    Uses indices for Process Name and Operation filters if available.
     Returns event summaries including the event index. Use 'get_event_details'/'get_event_stack_trace' with index.
 
     Filtering Behavior:
@@ -983,8 +1049,8 @@ async def query_events(
     - Stack module filter checks original string paths in stack frames. WARNING: Very performance intensive.
 
     Args:
-        filter_process: Exact process name (case-sensitive for ID lookup).
-        filter_operation: Exact operation name (case-sensitive for ID lookup).
+        filter_process: Exact process name (case-sensitive for ID lookup). Uses index.
+        filter_operation: Exact operation name (case-sensitive for ID lookup). Uses index.
         filter_result: Exact result string or hex '0x...' code (case-sensitive for ID lookup).
         filter_path_contains: Substring in path (case-insensitive).
         filter_process_contains: Substring in process name (case-insensitive).
@@ -1020,28 +1086,22 @@ async def query_events(
         start_time = time.time() # For timing
 
         # --- Pre-process Filters ---
-        # Compile regex with IGNORECASE if provided
         path_regex = re.compile(filter_path_regex, re.IGNORECASE) if filter_path_regex else None
         process_regex = re.compile(filter_process_regex, re.IGNORECASE) if filter_process_regex else None
         detail_regex = re.compile(filter_detail_regex, re.IGNORECASE) if filter_detail_regex else None
-
-        # Time parsing
         start_ts: Optional[float] = None
         end_ts: Optional[float] = None
         is_start_time_only = False
         is_end_time_only = False
         try:
             if isinstance(filter_start_time, str):
-                # Try parsing as HH:MM:SS.ffffff first
                 try:
                     parsed_time_obj = datetime.strptime(filter_start_time, PROCMON_TIMESTAMP_FORMAT).time()
-                    # Convert to float seconds since midnight for comparison if event ts is also treated this way
                     start_ts = (parsed_time_obj.hour * 3600 + parsed_time_obj.minute * 60 +
                                 parsed_time_obj.second + parsed_time_obj.microsecond / 1e6)
                     is_start_time_only = True
                     logger.warning("Using time-only string filter for start_time. Comparison ignores date.")
                 except ValueError:
-                    # If that fails, try parsing as float
                     try: start_ts = float(filter_start_time)
                     except ValueError: raise ValueError(f"Invalid start_time format: '{filter_start_time}'. Use float timestamp or HH:MM:SS.ffffff.")
             elif isinstance(filter_start_time, (int, float)):
@@ -1067,111 +1127,144 @@ async def query_events(
         # Get IDs for exact match filters (case-sensitive lookup in interner)
         process_id_filter = get_id("process_name", filter_process) if filter_process else None
         operation_id_filter = get_id("operation", filter_operation) if filter_operation else None
-        result_id_filter = get_id("result", filter_result) if filter_result else None # Direct lookup handles hex '0x...' if interned that way
+        result_id_filter = get_id("result", filter_result) if filter_result else None
 
         # Lowercase for contains filters
         filter_path_contains_lower = filter_path_contains.lower() if filter_path_contains else None
         filter_process_contains_lower = filter_process_contains.lower() if filter_process_contains else None
         filter_stack_module_path_lower = filter_stack_module_path.lower() if filter_stack_module_path else None
 
-        # --- Iterate and Filter In-Memory Data ---
+        # --- *** Indexing Logic *** ---
+        candidate_indices: Optional[Set[int]] = None # Start with None (meaning all events)
+
+        # Apply PID index
+        if process_id_filter is not None:
+            pid_indices = set(PID_INDEX.get(process_id_filter, []))
+            logger.debug(f"Found {len(pid_indices)} candidate indices for PID filter.")
+            if candidate_indices is None:
+                candidate_indices = pid_indices
+            else:
+                candidate_indices.intersection_update(pid_indices)
+            if not candidate_indices: # Early exit if intersection is empty
+                await ctx.info(f"Query finished early: No events match PID filter '{filter_process}'.")
+                return []
+
+        # Apply Operation index
+        if operation_id_filter is not None:
+            op_indices = set(OP_INDEX.get(operation_id_filter, []))
+            logger.debug(f"Found {len(op_indices)} candidate indices for Operation filter.")
+            if candidate_indices is None:
+                candidate_indices = op_indices
+            else:
+                candidate_indices.intersection_update(op_indices)
+            if not candidate_indices: # Early exit if intersection is empty
+                await ctx.info(f"Query finished early: No events match Operation filter '{filter_operation}'.")
+                return []
+
+        # Determine iterator: either all events or only indexed candidates
+        if candidate_indices is not None:
+            logger.info(f"Using index. Querying {len(candidate_indices):,} candidate events.")
+            # Sort indices to process events somewhat chronologically (optional but nice)
+            indices_to_check = sorted(list(candidate_indices))
+            event_iterator = ((idx, LOADED_EVENTS[idx]) for idx in indices_to_check)
+            total_to_scan = len(indices_to_check)
+        else:
+            logger.info("No index applicable. Querying all events.")
+            event_iterator = enumerate(LOADED_EVENTS) # Default: iterate all
+            total_to_scan = len(LOADED_EVENTS)
+        # --- *** End Indexing Logic *** ---
+
+
+        # --- Iterate and Filter (potentially reduced set) ---
         processed_count = 0
         last_progress_report_time = start_time
-        total_event_count = len(LOADED_EVENTS) # Get total count once
 
-        for idx, event_dict in enumerate(LOADED_EVENTS):
+        for idx, event_dict in event_iterator: # Use the chosen iterator
             processed_count += 1
             # --- Add progress reporting within the query itself for long queries ---
             current_time = time.time()
-            if processed_count % (PROGRESS_REPORT_INTERVAL * 2) == 0 or (current_time - last_progress_report_time > 10.0): # Report less often or every 10s
+            # Adjust progress report frequency based on total_to_scan
+            report_interval = max(10000, total_to_scan // 10) # Report roughly 10 times or every 10k
+            if processed_count % report_interval == 0 or (current_time - last_progress_report_time > 10.0):
                 try:
                     elapsed = current_time - start_time
-                    await ctx.info(f" Query scanned {processed_count:,}/{total_event_count:,} events... ({elapsed:.1f}s)")
+                    await ctx.info(f" Query scanned {processed_count:,}/{total_to_scan:,} candidate events... ({elapsed:.1f}s)")
                     last_progress_report_time = current_time
                 except Exception as progress_err:
-                    # Don't fail the query for a progress update error
                     logger.warning(f"Failed to send progress update during query: {progress_err}")
 
             if count >= limit: break # Stop if limit reached
 
             match = True # Assume match until a filter fails
 
-            # --- Apply Filters using IDs and optimized data ---
-            # Exact match filters (using IDs) - check match flag first for efficiency
-            if match and process_id_filter is not None and event_dict.get('pname_id') != process_id_filter: match = False
-            if match and operation_id_filter is not None and event_dict.get('op_id') != operation_id_filter: match = False
+            # --- Apply Remaining Filters ---
+            # Skip indexed filters if already applied
+            if candidate_indices is not None:
+                if process_id_filter is not None and event_dict.get('pname_id') != process_id_filter: continue # Should not happen if index logic is correct
+                if operation_id_filter is not None and event_dict.get('op_id') != operation_id_filter: continue # Should not happen
+
+            # Apply non-indexed exact match filters
             if match and result_id_filter is not None and event_dict.get('res_id') != result_id_filter: match = False
 
-            # Time Filter (using float timestamp)
+            # Time Filter (using float timestamp) - apply to remaining candidates
             if match and (start_ts is not None or end_ts is not None):
-                event_ts_float = event_dict.get('ts') # This is the float Unix timestamp (relative to BASE_DATE)
+                event_ts_float = event_dict.get('ts')
                 if event_ts_float is None:
-                    match = False # Cannot compare if event has no timestamp
+                    match = False
                 else:
-                    # Determine value to compare against filters
                     current_event_compare_val = event_ts_float
                     if is_start_time_only or is_end_time_only:
-                        # If *any* filter is time-only, compare only the time part of the event timestamp
                         try:
                            event_dt_obj = datetime.fromtimestamp(event_ts_float, timezone.utc)
                            current_event_compare_val = (event_dt_obj.hour * 3600 + event_dt_obj.minute * 60 +
                                                         event_dt_obj.second + event_dt_obj.microsecond / 1e6)
                         except Exception:
-                            match = False # Cannot extract time part
+                            match = False
                             logger.warning(f"Could not extract time part from event timestamp {event_ts_float}")
 
-
-                    # Perform comparison
                     if match and start_ts is not None:
-                        # Determine the filter value to use based on whether it was time-only
                         compare_filter_val = start_ts if (is_start_time_only or is_end_time_only) else start_ts
                         if current_event_compare_val < compare_filter_val: match = False
                     if match and end_ts is not None:
-                        # Determine the filter value to use based on whether it was time-only
                         compare_filter_val = end_ts if (is_start_time_only or is_end_time_only) else end_ts
                         if current_event_compare_val > compare_filter_val: match = False
 
 
-            # Contains / Regex / Stack filters require converting IDs back to strings (potentially slow)
-            # Check match flag first
+            # Contains / Regex / Stack filters require converting IDs back to strings
             if match and (filter_path_contains_lower or filter_process_contains_lower or path_regex or process_regex or detail_regex or filter_stack_module_path_lower):
-                # Get original strings ONLY if needed by an active filter
                 path_str = ""
                 pname_str = ""
-                detail_str = event_dict.get('detail') or "" # Detail not interned, get directly
+                detail_str = event_dict.get('detail') or ""
 
-                # Get strings from interner only if the corresponding filter is active
                 if filter_path_contains_lower or path_regex:
                     path_str = get_string("path", event_dict.get('path_id')) or ""
                 if filter_process_contains_lower or process_regex:
                     pname_str = get_string("process_name", event_dict.get('pname_id')) or ""
 
-                # Contains filters (case-insensitive)
                 if match and filter_path_contains_lower and filter_path_contains_lower not in path_str.lower(): match = False
                 if match and filter_process_contains_lower and filter_process_contains_lower not in pname_str.lower(): match = False
-
-                # Regex Filters (case-insensitive due to compile flag)
                 if match and path_regex and not path_regex.search(path_str): match = False
                 if match and process_regex and not process_regex.search(pname_str): match = False
                 if match and detail_regex and not detail_regex.search(detail_str): match = False
 
-                # Stack Module Filter (Expensive - requires iterating stack and string lookups)
                 if match and filter_stack_module_path_lower:
-                    stack_list_optimized = event_dict.get('stack') # List of [depth, addr, path_id, loc_id]
-                    found_in_stack = False
-                    if stack_list_optimized:
-                        for frame_list in stack_list_optimized:
-                            # Optimized frame: [depth, addr, path_id, loc_id]
-                            if len(frame_list) > 2 and frame_list[2] is not None: # Check path_id exists
-                                frame_path_str = get_string("stack_path", frame_list[2])
-                                if frame_path_str and filter_stack_module_path_lower in frame_path_str.lower():
-                                    found_in_stack = True
-                                    break # Found a match, no need to check rest of stack
-                    if not found_in_stack: match = False # If loop finished without finding, no match
+                    if not LOAD_STACK_TRACES: # Check if stacks were loaded
+                        await ctx.warning("Stack trace filtering requested, but stack traces were not loaded (--no-stack-traces). Filter skipped.")
+                        match = True # Don't filter out if stacks aren't available
+                    else:
+                        stack_list_optimized = event_dict.get('stack')
+                        found_in_stack = False
+                        if stack_list_optimized:
+                            for frame_list in stack_list_optimized:
+                                if len(frame_list) > 2 and frame_list[2] is not None:
+                                    frame_path_str = get_string("stack_path", frame_list[2])
+                                    if frame_path_str and filter_stack_module_path_lower in frame_path_str.lower():
+                                        found_in_stack = True
+                                        break
+                        if not found_in_stack: match = False
 
             # --- Add to results if all filters passed ---
             if match:
-                # Create summary, converting IDs back to strings for display
                 try:
                     ts_display = datetime.fromtimestamp(event_dict['ts'], timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT) if event_dict.get('ts') else None
                 except Exception:
@@ -1207,6 +1300,7 @@ async def get_event_details(event_index: int, ctx: Context) -> Dict[str, Any]:
     """
     Retrieves detailed properties for a specific event from the optimized in-memory data,
     referenced by its list index. Use 'query_events' first to find the index.
+    Includes 'extra_data' field if unknown fields were captured during loading.
 
     Args:
         event_index: The zero-based index of the event in the loaded event list.
@@ -1312,19 +1406,24 @@ async def get_event_details(event_index: int, ctx: Context) -> Dict[str, Any]:
 async def get_event_stack_trace(event_index: int, ctx: Context) -> List[Dict[str, Any]]:
     """
     Retrieves the detailed call stack trace for a specific event from the optimized in-memory data,
-    referenced by its list index.
+    referenced by its list index. Returns empty list if stack not loaded or not present.
 
     Args:
         event_index: The zero-based index of the event.
 
     Returns:
         A list of dictionaries representing stack frames ('depth', 'address', 'path', 'location').
-        Returns an empty list if the event has no stack trace.
+        Returns an empty list if the event has no stack trace or if stacks were not loaded.
     """
     await ctx.info(f"Request received for stack trace of event index: {event_index}")
     if LOADED_EVENTS is None or not GLOBAL_INTERNERS:
         await ctx.error(f"Get stack trace failed: Event data or interners not loaded.")
         raise TypeError("Operation requires optimized event data to be loaded.")
+
+    # Check if stack traces were loaded
+    if not LOAD_STACK_TRACES:
+        await ctx.warning("Stack traces were not loaded (--no-stack-traces). Returning empty list.")
+        return []
 
     try:
         # Validate index bounds
@@ -1336,7 +1435,7 @@ async def get_event_stack_trace(event_index: int, ctx: Context) -> List[Dict[str
 
         event_dict = LOADED_EVENTS[event_index]
         # Retrieve the list of optimized frames: [[depth, addr, path_id, loc_id], ...]
-        stack_list_optimized = event_dict.get('stack')
+        stack_list_optimized = event_dict.get('stack') # Will be None if not present or not loaded
 
         detailed_stack = []
         if stack_list_optimized:
@@ -1537,31 +1636,35 @@ async def summarize_operations_by_process(process_name_filter: str, ctx: Context
             await ctx.warning(f"Process name '{process_name_filter}' not found in loaded data (check exact name/case). No events will match.")
             return {} # Return empty dict as no events can match
 
-        for i, event_dict in enumerate(LOADED_EVENTS):
+        # Use index if available
+        indices_to_check = PID_INDEX.get(target_pname_id)
+        if indices_to_check is None: # Process name existed but had 0 events (unlikely but possible)
+             await ctx.warning(f"No events found matching process name '{process_name_filter}' (ID: {target_pname_id}).")
+             return {}
+
+        await ctx.info(f"Summarizing operations for {len(indices_to_check):,} events matching '{process_name_filter}'...")
+
+        for i, idx in enumerate(indices_to_check):
             # Progress reporting
             current_time = time.time()
             if i > 0 and (i % (PROGRESS_REPORT_INTERVAL * 4) == 0 or (current_time - last_progress_report_time > 15.0)):
                 elapsed = current_time - start_time
                 try:
-                    await ctx.info(f" Summarizing '{process_name_filter}'... processed {i:,}/{total_events:,} events ({elapsed:.1f}s)")
+                    await ctx.info(f" Summarizing '{process_name_filter}'... processed {i:,}/{len(indices_to_check):,} matching events ({elapsed:.1f}s)")
                     last_progress_report_time = current_time
                 except Exception as progress_err:
                     logger.warning(f"Failed to send progress update during summarize: {progress_err}")
 
-            # Efficiently check if the event's process ID matches the target
-            if event_dict.get('pname_id') == target_pname_id:
-                event_count_for_process += 1
-                # Lookup operation string using the interned ID
-                operation = get_string("operation", event_dict.get('op_id')) or 'Unknown'
-                operation_counts[operation] += 1
+            event_dict = LOADED_EVENTS[idx]
+            event_count_for_process += 1 # Count events actually processed for this PID
+            # Lookup operation string using the interned ID
+            operation = get_string("operation", event_dict.get('op_id')) or 'Unknown'
+            operation_counts[operation] += 1
 
         elapsed = time.time() - start_time
         # Sort results by count descending
         sorted_counts = dict(sorted(operation_counts.items(), key=lambda item: item[1], reverse=True))
         await ctx.info(f"Summarized {len(sorted_counts)} unique ops for '{process_name_filter}' ({event_count_for_process:,} events found) ({elapsed:.2f}s).")
-        # Updated warning check: Warn only if the process ID was found but resulted in zero events.
-        if event_count_for_process == 0 and target_pname_id is not None:
-             await ctx.warning(f"No events found matching process name '{process_name_filter}' (ID: {target_pname_id}).")
 
         return sorted_counts
 
@@ -1671,6 +1774,452 @@ async def get_timing_statistics(
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error calculating timing statistics: {e}")
 
+# --- *** NEW Analysis Tools *** ---
+
+@tool_decorator
+async def get_process_lifetime(pid: int, ctx: Context) -> Dict[str, Optional[float]]:
+    """
+    Finds the 'Process Create' and 'Process Exit' event timestamps for a given PID.
+
+    Args:
+        pid: The Process ID to query.
+
+    Returns:
+        A dictionary with 'create_timestamp' and 'exit_timestamp' (Unix float timestamp or None).
+    """
+    await ctx.info(f"Request received for lifetime of PID: {pid}")
+    if LOADED_EVENTS is None or not GLOBAL_INTERNERS:
+        await ctx.error("Operation failed: Event data not loaded.")
+        raise TypeError("Operation requires event data to be loaded.")
+
+    create_ts: Optional[float] = None
+    exit_ts: Optional[float] = None
+
+    # Get interned IDs for operations
+    create_op_id = get_id("operation", OP_PROCESS_CREATE)
+    exit_op_id = get_id("operation", OP_PROCESS_EXIT)
+
+    if create_op_id is None: logger.warning(f"Operation '{OP_PROCESS_CREATE}' not found in interner.")
+    if exit_op_id is None: logger.warning(f"Operation '{OP_PROCESS_EXIT}' not found in interner.")
+
+    # Iterate through events to find the relevant ones
+    # This assumes the event list is chronologically ordered (which it should be from iterparse)
+    for event_dict in LOADED_EVENTS:
+        if event_dict.get('pid') == pid:
+            op_id = event_dict.get('op_id')
+            if op_id == create_op_id and create_ts is None: # Find first create
+                create_ts = event_dict.get('ts')
+            elif op_id == exit_op_id: # Find last exit
+                exit_ts = event_dict.get('ts')
+
+            # Optimization: if both found, can potentially stop early, but finding *last* exit requires full scan
+            # if create_ts is not None and exit_ts is not None: break
+
+    result = {"create_timestamp": create_ts, "exit_timestamp": exit_ts}
+    await ctx.info(f"Found lifetime for PID {pid}: {result}")
+    return result
+
+@tool_decorator
+async def find_file_access(path_contains: str, limit: int = 100, *, ctx: Context) -> List[Dict[str, Any]]:
+    """
+    Finds events related to file system access where the path contains the given substring.
+
+    Args:
+        path_contains: Substring to search for in the event path (case-insensitive).
+        limit: Maximum number of matching events to return.
+
+    Returns:
+        List of event summaries (index, timestamp, process, pid, operation, path, result).
+    """
+    await ctx.info(f"Request received to find file access containing: '{path_contains}' (limit={limit})")
+    if LOADED_EVENTS is None or not GLOBAL_INTERNERS:
+        await ctx.error("Operation failed: Event data not loaded.")
+        raise TypeError("Operation requires event data to be loaded.")
+    if not path_contains:
+        await ctx.error("path_contains filter cannot be empty."); raise ValueError("path_contains filter is required.")
+
+    found_events = []
+    count = 0
+    path_contains_lower = path_contains.lower()
+
+    for idx, event_dict in enumerate(LOADED_EVENTS):
+        if count >= limit: break
+
+        path_id = event_dict.get('path_id')
+        if path_id is not None:
+            path_str = get_string("path", path_id)
+            if path_str and path_contains_lower in path_str.lower():
+                try:
+                    ts_display = datetime.fromtimestamp(event_dict['ts'], timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT) if event_dict.get('ts') else None
+                except Exception: ts_display = "<Invalid Timestamp>"
+
+                summary = {
+                    'event_index': idx,
+                    'timestamp': ts_display,
+                    'process_name': get_string("process_name", event_dict.get('pname_id')),
+                    'pid': event_dict.get('pid'),
+                    'operation': get_string("operation", event_dict.get('op_id')),
+                    'path': path_str, # Already have the string
+                    'result': get_string("result", event_dict.get('res_id')),
+                }
+                found_events.append(summary)
+                count += 1
+
+    await ctx.info(f"Found {len(found_events)} file access events matching '{path_contains}' (limit {limit}).")
+    return found_events
+
+@tool_decorator
+async def find_network_connections(process_name: str, *, ctx: Context) -> List[str]:
+    """
+    Finds unique remote network endpoints (IP:port) accessed by a specific process.
+    Looks for TCP Connect, TCP Send/Receive, UDP Send/Receive operations.
+
+    Args:
+        process_name: The exact name of the process (case-sensitive).
+
+    Returns:
+        A sorted list of unique remote endpoint strings (e.g., "192.168.1.100:443").
+    """
+    await ctx.info(f"Request received to find network connections for process: '{process_name}'")
+    if LOADED_EVENTS is None or not GLOBAL_INTERNERS:
+        await ctx.error("Operation failed: Event data not loaded.")
+        raise TypeError("Operation requires event data to be loaded.")
+    if not process_name:
+        await ctx.error("process_name filter cannot be empty."); raise ValueError("process_name filter is required.")
+
+    remote_endpoints = set()
+    target_pname_id = get_id("process_name", process_name)
+    network_op_ids = {get_id("operation", op) for op in NETWORK_OPERATIONS if get_id("operation", op) is not None}
+
+    if target_pname_id is None:
+        await ctx.warning(f"Process name '{process_name}' not found in loaded data. Returning empty list.")
+        return []
+    if not network_op_ids:
+        await ctx.warning(f"Could not find standard network operations in interner. Returning empty list.")
+        return []
+
+    # Use PID index for efficiency
+    indices_to_check = PID_INDEX.get(target_pname_id, [])
+    if not indices_to_check:
+         await ctx.info(f"No events found for process '{process_name}'.")
+         return []
+
+    await ctx.info(f"Scanning {len(indices_to_check):,} events for process '{process_name}' for network activity...")
+
+    # Regex to extract remote endpoint (IP:port) from Path like "local:port -> remote:port"
+    # Handles both IPv4 and IPv6 (within brackets)
+    endpoint_regex = re.compile(r".* -> \[?([a-fA-F0-9:.]+)\]?:(\d+)")
+
+    processed_count = 0
+    start_time = time.time()
+    last_progress_report_time = start_time
+
+    for idx in indices_to_check:
+        processed_count += 1
+        event_dict = LOADED_EVENTS[idx]
+        op_id = event_dict.get('op_id')
+
+        if op_id in network_op_ids:
+            path_str = get_string("path", event_dict.get('path_id'))
+            if path_str:
+                match = endpoint_regex.match(path_str)
+                if match:
+                    ip = match.group(1)
+                    port = match.group(2)
+                    remote_endpoints.add(f"{ip}:{port}")
+
+        # Progress reporting
+        current_time = time.time()
+        if processed_count % 50000 == 0 or (current_time - last_progress_report_time > 10.0):
+             elapsed = current_time - start_time
+             try: await ctx.info(f" Network scan progress: {processed_count:,}/{len(indices_to_check):,} events checked ({elapsed:.1f}s)")
+             except Exception: pass # Ignore errors sending progress
+             last_progress_report_time = current_time
+
+
+    sorted_endpoints = sorted(list(remote_endpoints))
+    await ctx.info(f"Found {len(sorted_endpoints)} unique remote network endpoints for '{process_name}'.")
+    return sorted_endpoints
+
+# --- *** NEW Export Tool *** ---
+@tool_decorator
+async def export_query_results(
+    output_file: str,
+    output_format: str = 'csv', # 'csv' or 'json'
+    # Filters (same as query_events)
+    filter_process: Optional[str] = None,
+    filter_operation: Optional[str] = None,
+    filter_result: Optional[str] = None,
+    filter_path_contains: Optional[str] = None,
+    filter_process_contains: Optional[str] = None,
+    filter_start_time: Optional[Any] = None,
+    filter_end_time: Optional[Any] = None,
+    filter_path_regex: Optional[str] = None,
+    filter_process_regex: Optional[str] = None,
+    filter_detail_regex: Optional[str] = None,
+    filter_stack_module_path: Optional[str] = None,
+    *,
+    ctx: Context
+) -> Dict[str, Any]:
+    """
+    Queries events using the specified filters and exports the full details
+    of matching events to a file (CSV or JSON).
+
+    Args:
+        output_file: The name of the output file (relative to the allowed directory).
+        output_format: The desired output format ('csv' or 'json', default 'csv').
+        filter_*: Same filters as the 'query_events' tool. Limit is ignored.
+
+    Returns:
+        A dictionary indicating success, the output path, and the number of events exported.
+    """
+    await ctx.info(f"Request received to export events to '{output_file}' in {output_format} format.")
+    if output_format.lower() not in ['csv', 'json']:
+        raise ValueError("Invalid output_format. Must be 'csv' or 'json'.")
+
+    # Validate output path securely within the allowed directory
+    try:
+        # Allow file creation, so check_exists=False
+        # Base directory is implicitly ALLOWED_DIR_CONFIG from global scope
+        abs_output_path = get_secure_path(output_file, check_exists=False)
+        await ctx.info(f"Validated output path: {abs_output_path}")
+    except (ValueError, PermissionError) as e:
+        await ctx.error(f"Invalid or disallowed output file path: {e}")
+        raise e
+
+    # --- Reuse Query Logic (without limit) ---
+    # Call query_events internally but get indices back instead of summaries
+    # This avoids duplicating the complex filter logic.
+    # We need to modify query_events slightly or create a helper.
+    # For now, let's duplicate the filtering logic here for simplicity,
+    # acknowledging this isn't ideal for maintenance.
+    # TODO: Refactor filtering logic into a reusable (async) generator function.
+
+    if LOADED_EVENTS is None or LOADED_PROCESSES is None or not GLOBAL_INTERNERS:
+        await ctx.error(f"Export failed: Event data or interners not loaded.")
+        raise TypeError("Operation requires optimized event data to be loaded.")
+
+    if not LOADED_EVENTS:
+         await ctx.info("Export finished: No events loaded in memory to export.")
+         return {"success": True, "output_path": abs_output_path, "events_exported": 0}
+
+    try:
+        matching_indices = []
+        start_time = time.time()
+
+        # --- Filtering logic (mirrors query_events for now) ---
+        path_regex = re.compile(filter_path_regex, re.IGNORECASE) if filter_path_regex else None
+        process_regex = re.compile(filter_process_regex, re.IGNORECASE) if filter_process_regex else None
+        detail_regex = re.compile(filter_detail_regex, re.IGNORECASE) if filter_detail_regex else None
+        start_ts: Optional[float] = None
+        end_ts: Optional[float] = None
+        is_start_time_only = False
+        is_end_time_only = False
+        # (Time parsing logic - identical to query_events)
+        try:
+            if isinstance(filter_start_time, str):
+                try:
+                    parsed_time_obj = datetime.strptime(filter_start_time, PROCMON_TIMESTAMP_FORMAT).time()
+                    start_ts = (parsed_time_obj.hour * 3600 + parsed_time_obj.minute * 60 +
+                                parsed_time_obj.second + parsed_time_obj.microsecond / 1e6)
+                    is_start_time_only = True
+                except ValueError:
+                    try: start_ts = float(filter_start_time)
+                    except ValueError: raise ValueError(f"Invalid start_time format: '{filter_start_time}'.")
+            elif isinstance(filter_start_time, (int, float)):
+                start_ts = float(filter_start_time)
+            if isinstance(filter_end_time, str):
+                 try:
+                    parsed_time_obj = datetime.strptime(filter_end_time, PROCMON_TIMESTAMP_FORMAT).time()
+                    end_ts = (parsed_time_obj.hour * 3600 + parsed_time_obj.minute * 60 +
+                              parsed_time_obj.second + parsed_time_obj.microsecond / 1e6)
+                    is_end_time_only = True
+                 except ValueError:
+                    try: end_ts = float(filter_end_time)
+                    except ValueError: raise ValueError(f"Invalid end_time format: '{filter_end_time}'.")
+            elif isinstance(filter_end_time, (int, float)):
+                end_ts = float(filter_end_time)
+        except ValueError as e: await ctx.error(f"Invalid time format: {e}"); raise e
+
+        process_id_filter = get_id("process_name", filter_process) if filter_process else None
+        operation_id_filter = get_id("operation", filter_operation) if filter_operation else None
+        result_id_filter = get_id("result", filter_result) if filter_result else None
+        filter_path_contains_lower = filter_path_contains.lower() if filter_path_contains else None
+        filter_process_contains_lower = filter_process_contains.lower() if filter_process_contains else None
+        filter_stack_module_path_lower = filter_stack_module_path.lower() if filter_stack_module_path else None
+
+        candidate_indices: Optional[Set[int]] = None
+        if process_id_filter is not None: candidate_indices = set(PID_INDEX.get(process_id_filter, []))
+        if operation_id_filter is not None:
+            op_indices = set(OP_INDEX.get(operation_id_filter, []))
+            if candidate_indices is None: candidate_indices = op_indices
+            else: candidate_indices.intersection_update(op_indices)
+
+        event_iterator = enumerate(LOADED_EVENTS) if candidate_indices is None else ((idx, LOADED_EVENTS[idx]) for idx in sorted(list(candidate_indices)))
+        total_to_scan = len(LOADED_EVENTS) if candidate_indices is None else len(candidate_indices)
+        processed_count = 0
+        last_progress_report_time = start_time
+        await ctx.info(f"Filtering {total_to_scan:,} events for export...")
+
+        for idx, event_dict in event_iterator:
+            processed_count += 1
+            if processed_count % (PROGRESS_REPORT_INTERVAL * 2) == 0 or (time.time() - last_progress_report_time > 15.0):
+                try: await ctx.info(f" Export filtering progress: {processed_count:,}/{total_to_scan:,}...")
+                except Exception: pass
+                last_progress_report_time = time.time()
+
+            match = True
+            # Apply non-indexed filters (or all filters if no index used)
+            if candidate_indices is not None: # Skip already indexed filters
+                 if process_id_filter is not None and event_dict.get('pname_id') != process_id_filter: continue
+                 if operation_id_filter is not None and event_dict.get('op_id') != operation_id_filter: continue
+            else: # Apply all filters if not using index
+                 if process_id_filter is not None and event_dict.get('pname_id') != process_id_filter: match = False
+                 if match and operation_id_filter is not None and event_dict.get('op_id') != operation_id_filter: match = False
+
+            if match and result_id_filter is not None and event_dict.get('res_id') != result_id_filter: match = False
+            # (Time filtering logic - identical to query_events)
+            if match and (start_ts is not None or end_ts is not None):
+                event_ts_float = event_dict.get('ts')
+                if event_ts_float is None: match = False
+                else:
+                    current_event_compare_val = event_ts_float
+                    if is_start_time_only or is_end_time_only:
+                        try:
+                           event_dt_obj = datetime.fromtimestamp(event_ts_float, timezone.utc)
+                           current_event_compare_val = (event_dt_obj.hour * 3600 + event_dt_obj.minute * 60 +
+                                                        event_dt_obj.second + event_dt_obj.microsecond / 1e6)
+                        except Exception: match = False
+                    if match and start_ts is not None:
+                        compare_filter_val = start_ts if (is_start_time_only or is_end_time_only) else start_ts
+                        if current_event_compare_val < compare_filter_val: match = False
+                    if match and end_ts is not None:
+                        compare_filter_val = end_ts if (is_start_time_only or is_end_time_only) else end_ts
+                        if current_event_compare_val > compare_filter_val: match = False
+            # (Contains/Regex/Stack filtering logic - identical to query_events)
+            if match and (filter_path_contains_lower or filter_process_contains_lower or path_regex or process_regex or detail_regex or filter_stack_module_path_lower):
+                path_str = get_string("path", event_dict.get('path_id')) or ""
+                pname_str = get_string("process_name", event_dict.get('pname_id')) or ""
+                detail_str = event_dict.get('detail') or ""
+                if match and filter_path_contains_lower and filter_path_contains_lower not in path_str.lower(): match = False
+                if match and filter_process_contains_lower and filter_process_contains_lower not in pname_str.lower(): match = False
+                if match and path_regex and not path_regex.search(path_str): match = False
+                if match and process_regex and not process_regex.search(pname_str): match = False
+                if match and detail_regex and not detail_regex.search(detail_str): match = False
+                if match and filter_stack_module_path_lower:
+                    if not LOAD_STACK_TRACES: match = True # Don't filter if not loaded
+                    else:
+                        stack_list_optimized = event_dict.get('stack')
+                        found_in_stack = False
+                        if stack_list_optimized:
+                            for frame_list in stack_list_optimized:
+                                if len(frame_list) > 2 and frame_list[2] is not None:
+                                    frame_path_str = get_string("stack_path", frame_list[2])
+                                    if frame_path_str and filter_stack_module_path_lower in frame_path_str.lower():
+                                        found_in_stack = True; break
+                        if not found_in_stack: match = False
+            # --- End Filtering ---
+
+            if match:
+                matching_indices.append(idx)
+
+        filter_elapsed = time.time() - start_time
+        await ctx.info(f"Filtering completed in {filter_elapsed:.2f}s. Found {len(matching_indices)} events to export.")
+
+        # --- Exporting ---
+        export_start_time = time.time()
+        events_exported = 0
+        if not matching_indices:
+             await ctx.info("No matching events to export.")
+             # Create empty file? Or just report 0 exported. Let's report 0.
+             return {"success": True, "output_path": abs_output_path, "events_exported": 0}
+
+        # Get full details for matching events
+        events_to_export = []
+        for i, event_idx in enumerate(matching_indices):
+             if i % 10000 == 0 and i > 0: # Progress update during detail retrieval
+                 try: await ctx.info(f" Export: Retrieving details for event {i:,}/{len(matching_indices):,}...")
+                 except Exception: pass
+             try:
+                 # Use get_event_details logic but adapt it slightly
+                 event_dict = LOADED_EVENTS[event_idx]
+                 details = { # Manually build dict to control fields
+                     'event_index': event_idx,
+                     'sequence_number': event_dict.get('seq'),
+                     'timestamp': datetime.fromtimestamp(event_dict['ts'], timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT) if event_dict.get('ts') else None,
+                     'process_name': get_string("process_name", event_dict.get('pname_id')),
+                     'pid': event_dict.get('pid'),
+                     'tid': event_dict.get('tid'),
+                     'operation': get_string("operation", event_dict.get('op_id')),
+                     'path': get_string("path", event_dict.get('path_id')),
+                     'result': get_string("result", event_dict.get('res_id')),
+                     'detail': event_dict.get('detail'),
+                     'duration': event_dict.get('dur'),
+                     'category': get_string("category", event_dict.get('cat_id')),
+                     'parent_pid': event_dict.get('ppid'),
+                     # Add extra data if loaded and present
+                     'extra_data': event_dict.get('extra_data') if LOAD_EXTRA_DATA else None,
+                 }
+                 # Add stack trace if loaded and present
+                 if LOAD_STACK_TRACES and 'stack' in event_dict:
+                     stack_list = []
+                     for frame_data in event_dict['stack']:
+                          stack_list.append({
+                             'depth': frame_data[0], 'address': frame_data[1],
+                             'path': get_string("stack_path", frame_data[2]),
+                             'location': get_string("stack_location", frame_data[3])
+                          })
+                     details['stack_trace'] = stack_list # Use a different key to avoid conflict
+                 else:
+                     details['stack_trace'] = None
+
+                 events_to_export.append(details)
+             except Exception as detail_err:
+                 await ctx.warning(f"Error retrieving details for event index {event_idx}: {detail_err}")
+                 logger.debug(f"Detail retrieval error details:", exc_info=True)
+
+
+        # Write to file
+        if output_format.lower() == 'csv':
+            if not events_to_export: # Handle empty list for CSV header
+                 fieldnames = ['event_index', 'sequence_number', 'timestamp', 'process_name', 'pid', 'tid', 'operation', 'path', 'result', 'detail', 'duration', 'category', 'parent_pid', 'extra_data', 'stack_trace']
+            else:
+                 fieldnames = list(events_to_export[0].keys()) # Get headers from first event
+
+            try:
+                with open(abs_output_path, 'w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+                    writer.writeheader()
+                    for row_dict in events_to_export:
+                        # Convert complex types (like extra_data dict or stack list) to JSON strings for CSV
+                        if isinstance(row_dict.get('extra_data'), dict):
+                            row_dict['extra_data'] = json.dumps(row_dict['extra_data'])
+                        if isinstance(row_dict.get('stack_trace'), list):
+                            row_dict['stack_trace'] = json.dumps(row_dict['stack_trace'])
+                        writer.writerow(row_dict)
+                        events_exported += 1
+            except IOError as e:
+                await ctx.error(f"Error writing CSV file '{abs_output_path}': {e}")
+                raise RuntimeError(f"Failed to write CSV file: {e}") from e
+
+        elif output_format.lower() == 'json':
+            try:
+                with open(abs_output_path, 'w', encoding='utf-8') as jsonfile:
+                    json.dump(events_to_export, jsonfile, indent=2) # Pretty print JSON
+                    events_exported = len(events_to_export)
+            except IOError as e:
+                 await ctx.error(f"Error writing JSON file '{abs_output_path}': {e}")
+                 raise RuntimeError(f"Failed to write JSON file: {e}") from e
+
+        export_elapsed = time.time() - export_start_time
+        await ctx.info(f"Successfully exported {events_exported} events to '{output_file}' ({output_format}) in {export_elapsed:.2f}s.")
+        return {"success": True, "output_path": abs_output_path, "events_exported": events_exported}
+
+    except Exception as e:
+        await ctx.error(f"Failed to export events: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Internal error exporting events: {e}")
+
 
 # --- Main Execution Block ---
 if __name__ == "__main__":
@@ -1686,10 +2235,16 @@ if __name__ == "__main__":
     parser.add_argument("--mcp-port", type=int, default=8081, help="Port for MCP server (SSE transport), default: 8081")
     parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"], help="MCP transport protocol, default: stdio")
     parser.add_argument("--debug", action='store_true', help="Enable debug logging.")
-    # *** ADDED log-file argument ***
     parser.add_argument("--log-file", type=str, default=None, help="Optional: Path to a file to write logs to instead of console.")
+    # --- Added Selective Loading Args ---
+    parser.add_argument("--no-stack-traces", action='store_true', help="Do not parse or store stack traces to save memory.")
+    parser.add_argument("--no-extra-data", action='store_true', help="Do not store unknown fields found within <event> tags.")
 
     args = parser.parse_args()
+
+    # --- Set Global Flags from Args ---
+    LOAD_STACK_TRACES = not args.no_stack_traces
+    LOAD_EXTRA_DATA = not args.no_extra_data
 
     # --- Logging Configuration ---
     log_level = logging.DEBUG if args.debug else logging.INFO
@@ -1762,6 +2317,9 @@ if __name__ == "__main__":
         logger.info(f"Logging output directed to file: {args.log_file}")
     else:
         logger.info("Logging output directed to console.")
+
+    # Log selective loading status
+    logger.info(f"Selective loading: Stacks={LOAD_STACK_TRACES}, ExtraData={LOAD_EXTRA_DATA}")
 
     # --- Dependency Checks ---
     if not MCP_SDK_AVAILABLE:
