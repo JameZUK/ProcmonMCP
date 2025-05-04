@@ -118,6 +118,28 @@ def _find_text_ignore_ns(elem: ET_impl.Element, tag_name: str) -> Optional[str]:
     child = _find_child_ignore_ns(elem, tag_name)
     return child.text.strip() if child is not None and child.text else None
 
+# --- START FIX: Define find_text_func globally for reuse ---
+if LXML_AVAILABLE:
+    def _find_text_lxml(element, tag_name):
+        """Uses lxml XPath to find text, ignoring namespaces."""
+        try:
+            xpath_query = f"string(./*[local-name()='{tag_name}'][1])"
+            xpath_result = element.xpath(xpath_query)
+            # REMOVED: Verbose XPath debug logging
+            # if logger.isEnabledFor(logging.DEBUG): # Log only in debug
+            #      logger.debug(f"XPath Query for '{tag_name}' in {element.tag}: {xpath_query}")
+            #      logger.debug(f"XPath Result for '{tag_name}': '{xpath_result}' (Type: {type(xpath_result)})")
+            return xpath_result.strip() if xpath_result else None
+        except Exception as xpath_e:
+            logger.debug(f"lxml elem.xpath failed for '{tag_name}': {xpath_e}")
+            return None
+    find_text_func = _find_text_lxml
+else:
+    # Keep original function for standard library xml.etree
+    find_text_func = _find_text_ignore_ns
+# --- END FIX ---
+
+
 def _clear_elem(elem: ET_impl.Element):
     """Helper to clear element memory using lxml/ET specific methods."""
     elem.clear()
@@ -173,13 +195,13 @@ class StackFrame:
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element) -> 'StackFrame':
         """Parses a <frame> XML element into a StackFrame object, ignoring namespaces."""
-        # NOTE: Uses original _find_text_ignore_ns as it operates on <frame>, not <event>
-        depth_text = _find_text_ignore_ns(elem, 'depth')
+        # Use appropriate text finding function
+        depth_text = find_text_func(elem, 'depth')
         try: depth = int(depth_text) if depth_text and depth_text.isdigit() else None
         except (ValueError, TypeError): depth = None
-        address = _find_text_ignore_ns(elem, 'address')
-        path = _find_text_ignore_ns(elem, 'path')
-        location = _find_text_ignore_ns(elem, 'location')
+        address = find_text_func(elem, 'address')
+        path = find_text_func(elem, 'path')
+        location = find_text_func(elem, 'location')
         return cls(depth=depth, address=address, path=path, location=location)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -250,25 +272,25 @@ class ProcessInfo:
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element) -> 'ProcessInfo':
         """Parses a <process> XML element into a ProcessInfo object, ignoring namespaces."""
-        # NOTE: Uses original _find_text_ignore_ns as it operates on <process>, not <event>
+        # Use global find_text_func here too for consistency
         data = {}
-        data['process_index'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ProcessIndex'))
-        data['process_id'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ProcessId'))
-        data['parent_process_id'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ParentProcessId'))
-        data['parent_process_index'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ParentProcessIndex'))
-        data['authentication_id'] = _find_text_ignore_ns(elem, 'AuthenticationId')
-        data['create_time'] = _find_text_ignore_ns(elem, 'CreateTime')
-        data['finish_time'] = _find_text_ignore_ns(elem, 'FinishTime')
-        data['is_virtualized'] = cls._safe_text_to_bool(_find_text_ignore_ns(elem, 'IsVirtualized'))
-        data['is_64bit'] = cls._safe_text_to_bool(_find_text_ignore_ns(elem, 'Is64bit'))
-        data['integrity'] = _find_text_ignore_ns(elem, 'Integrity')
-        data['owner'] = _find_text_ignore_ns(elem, 'Owner')
-        data['process_name'] = _find_text_ignore_ns(elem, 'ProcessName')
-        data['image_path'] = _find_text_ignore_ns(elem, 'ImagePath')
-        data['command_line'] = _find_text_ignore_ns(elem, 'CommandLine')
-        data['company_name'] = _find_text_ignore_ns(elem, 'CompanyName')
-        data['version'] = _find_text_ignore_ns(elem, 'Version')
-        data['description'] = _find_text_ignore_ns(elem, 'Description')
+        data['process_index'] = cls._safe_text_to_int(find_text_func(elem, 'ProcessIndex'))
+        data['process_id'] = cls._safe_text_to_int(find_text_func(elem, 'ProcessId'))
+        data['parent_process_id'] = cls._safe_text_to_int(find_text_func(elem, 'ParentProcessId'))
+        data['parent_process_index'] = cls._safe_text_to_int(find_text_func(elem, 'ParentProcessIndex'))
+        data['authentication_id'] = find_text_func(elem, 'AuthenticationId')
+        data['create_time'] = find_text_func(elem, 'CreateTime')
+        data['finish_time'] = find_text_func(elem, 'FinishTime')
+        data['is_virtualized'] = cls._safe_text_to_bool(find_text_func(elem, 'IsVirtualized'))
+        data['is_64bit'] = cls._safe_text_to_bool(find_text_func(elem, 'Is64bit'))
+        data['integrity'] = find_text_func(elem, 'Integrity')
+        data['owner'] = find_text_func(elem, 'Owner')
+        data['process_name'] = find_text_func(elem, 'ProcessName')
+        data['image_path'] = find_text_func(elem, 'ImagePath')
+        data['command_line'] = find_text_func(elem, 'CommandLine')
+        data['company_name'] = find_text_func(elem, 'CompanyName')
+        data['version'] = find_text_func(elem, 'Version')
+        data['description'] = find_text_func(elem, 'Description')
         return cls(**data)
 
 # --- Helper function to parse timestamp (moved outside class) ---
@@ -312,6 +334,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     process_element_count = 0
 
     try:
+        # Use 'end' event for process list as we need the full element content
         context = ET_impl.iterparse(source_stream, events=('end',), tag=tags_of_interest)
         logger.info("Starting Pass 1: Parsing process list...")
     except Exception as e:
@@ -334,6 +357,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
                 if tag == 'process':
                     process_element_count += 1
                     try:
+                        # Use ProcessInfo.from_xml_element which now uses find_text_func
                         proc_info = ProcessInfo.from_xml_element(elem)
                         if proc_info.process_index is not None and proc_info.process_index >= 0:
                             processes_dict[proc_info.process_index] = proc_info
@@ -395,6 +419,13 @@ def _parse_xml_stream_for_loading(
     skipped_count = 0
     start_time = time.time()
     last_report_time = start_time
+    current_event_data: Optional[Dict[str, Any]] = None # Store data between start/end
+    # --- START FIX: Store list of frame XML strings ---
+    current_frame_xml_strings: Optional[List[str]] = None
+    # --- END FIX ---
+
+    # find_text_func is now defined globally
+
     try:
         for event_type, elem in context:
             tag = _strip_namespace(elem.tag)
@@ -406,189 +437,226 @@ def _parse_xml_stream_for_loading(
                 elif event_type == 'end' and tag == 'procmon':
                     logger.warning("Reached end of <procmon> before finding <eventlist>.")
                     break
-                elif event_type == 'end': _clear_elem(elem) # Clear elements before eventlist
+                elif event_type == 'end':
+                    _clear_elem(elem) # Clear elements before eventlist
                 continue
 
             elif parsing_stage == "parsing_events":
-                if event_type == 'end': # Process elements only when they finish
-                    if tag == 'event':
-                        event_count += 1
-                        opt_event: Dict[str, Any] = {}
-                        extra_data_dict: Dict[str, str] = {}
-                        stack_elem: Optional[ET_impl.Element] = None
-                        parse_successful = True # Flag to track if core fields parsed
-                        skip_reason = "" # Store reason for skipping
+                # --- START: Process <event> start ---
+                if event_type == 'start' and tag == 'event':
+                    event_count += 1
+                    # --- REMOVED: Verbose raw XML logging ---
+                    # if logger.isEnabledFor(logging.DEBUG):
+                    #     try:
+                    #         event_xml_str_debug = ET_impl.tostring(elem, encoding='unicode', method='xml')
+                    #         logger.debug(f"--- Processing Event #{event_count} (START) ---")
+                    #         logger.debug(f"Raw XML:\n{event_xml_str_debug[:1000]}...") # Log first 1000 chars
+                    #     except Exception as log_e_debug:
+                    #         logger.debug(f"Could not serialize event #{event_count} for debug logging: {log_e_debug}")
 
-                        try:
-                            # --- Direct Parsing into opt_event ---
+                    current_event_data = {} # Initialize temporary storage
+                    # --- START FIX: Reset frame XML string list ---
+                    current_frame_xml_strings = [] if load_stack else None
+                    # --- END FIX ---
 
-                            # --- START FIX: Use elem.find() for lxml ---
-                            # Determine the find function based on XML library
-                            if LXML_AVAILABLE:
-                                def find_text_func(element, tag_name):
+                    try:
+                        # Extract core fields using the defined function
+                        pid_str = find_text_func(elem, 'PID')
+                        ts_str = find_text_func(elem, 'Time_of_Day')
+                        current_event_data['pid_str'] = pid_str # Store raw strings for logging
+                        current_event_data['ts_str'] = ts_str
+                        current_event_data['pid'] = ProcessInfo._safe_text_to_int(pid_str)
+                        current_event_data['ts'] = _parse_timestamp_str(ts_str)
+
+                        # Extract other simple fields needed for optimization/interning
+                        current_event_data['seq'] = ProcessInfo._safe_text_to_int(find_text_func(elem, 'SequenceNumber'))
+                        current_event_data['tid'] = ProcessInfo._safe_text_to_int(find_text_func(elem, 'ThreadId'))
+                        current_event_data['ppid'] = ProcessInfo._safe_text_to_int(find_text_func(elem, 'ParentPID'))
+                        current_event_data['detail'] = find_text_func(elem, 'Detail')
+                        duration_text = find_text_func(elem, 'Duration')
+                        current_event_data['dur'] = None # Default to None
+                        if duration_text:
+                            try:
+                                current_event_data['dur'] = float(duration_text)
+                            except (ValueError, TypeError) as dur_err:
+                                # --- DEBUG: Log duration conversion failure ---
+                                logger.debug(f"Could not convert duration '{duration_text}' to float for event #{event_count}: {dur_err}")
+                                current_event_data['dur'] = None
+
+
+                        current_event_data['process_name_str'] = find_text_func(elem, 'Process_Name')
+                        current_event_data['operation_str'] = find_text_func(elem, 'Operation')
+                        current_event_data['path_str'] = find_text_func(elem, 'Path')
+                        current_event_data['result_str'] = find_text_func(elem, 'Result')
+                        current_event_data['category_str'] = find_text_func(elem, 'Category')
+                        current_event_data['process_index_str'] = find_text_func(elem, 'ProcessIndex') # Needed for fallback
+
+                        # --- START FIX: Store stack XML string ---
+                        if load_stack:
+                            # Use _find_child_ignore_ns because we need the element itself, not just text
+                            stack_elem = _find_child_ignore_ns(elem, 'stack')
+                            if stack_elem is not None:
+                                try:
+                                    current_stack_xml_string = ET_impl.tostring(stack_elem, encoding='unicode')
+                                    # REMOVED: Verbose stack XML logging
+                                    # if logger.isEnabledFor(logging.DEBUG):
+                                    #     logger.debug(f"Stored stack XML string for event #{event_count}")
+                                except Exception as stack_log_e:
+                                     logger.warning(f"Could not serialize stack element for event #{event_count}: {stack_log_e}")
+                        # --- END FIX ---
+
+                        # Handle Extra Data (Extract during start if possible)
+                        if load_extra:
+                            extra_data_dict = {}
+                            known_event_tags = {
+                                'sequencenumber', 'processindex', 'pid', 'threadid', 'parentpid',
+                                'time_of_day', 'operation', 'path', 'result', 'detail', 'duration',
+                                'category', 'process_name', 'stack'
+                            }
+                            for child in elem: # Iterate children while available
+                                tag_name_orig = child.tag
+                                tag_name_clean = _strip_namespace(tag_name_orig).lower()
+                                if tag_name_clean not in known_event_tags:
+                                    tag_text = child.text.strip() if child.text else None
+                                    if tag_text is not None:
+                                        extra_data_dict[tag_name_orig] = tag_text
+                            if extra_data_dict: current_event_data['extra_data'] = extra_data_dict
+
+
+                    except Exception as start_parse_err:
+                        logger.warning(f"Error during START event parsing for event #{event_count}: {start_parse_err}", exc_info=True)
+                        current_event_data = None # Invalidate data if start parsing fails
+
+                # --- END: Process <event> start ---
+
+                # --- START FIX: Store <frame> XML string on start ---
+                elif event_type == 'start' and tag == 'frame' and load_stack and current_frame_xml_strings is not None:
+                     try:
+                         frame_xml_string = ET_impl.tostring(elem, encoding='unicode')
+                         current_frame_xml_strings.append(frame_xml_string)
+                         # Optional: Log stored frame XML in debug
+                         # if logger.isEnabledFor(logging.DEBUG):
+                         #    logger.debug(f"Stored frame XML for event #{event_count}: {frame_xml_string[:200]}...")
+                     except Exception as frame_log_e:
+                         logger.warning(f"Could not serialize frame element for event #{event_count}: {frame_log_e}")
+                # --- END FIX ---
+
+
+                # --- START: Process <event> end ---
+                elif event_type == 'end' and tag == 'event':
+                    if current_event_data: # Proceed only if start parsing was successful
+                        parse_successful = True
+                        skip_reason = ""
+                        opt_event = {}
+
+                        # Validate core fields extracted during start
+                        if current_event_data.get('pid') is None:
+                            skip_reason += f"Missing/invalid PID ('{current_event_data.get('pid_str')}'). "
+                            parse_successful = False
+                        if current_event_data.get('ts') is None:
+                            skip_reason += f"Missing/invalid Time_of_Day ('{current_event_data.get('ts_str')}'). "
+                            parse_successful = False
+
+                        if parse_successful:
+                            # Populate opt_event from stored data
+                            opt_event['pid'] = current_event_data['pid']
+                            opt_event['ts'] = current_event_data['ts']
+                            opt_event['seq'] = current_event_data['seq']
+                            opt_event['tid'] = current_event_data['tid']
+                            opt_event['ppid'] = current_event_data['ppid']
+                            opt_event['detail'] = current_event_data['detail']
+                            opt_event['dur'] = current_event_data['dur']
+
+                            # Process Name Fallback
+                            process_name_str = current_event_data['process_name_str']
+                            if process_name_str is None:
+                                process_index = ProcessInfo._safe_text_to_int(current_event_data['process_index_str'])
+                                if process_index is not None:
+                                    proc_info = processes.get(process_index)
+                                    if proc_info:
+                                        process_name_str = proc_info.process_name
+                                        # Update PPID only if it wasn't found directly in the event
+                                        if opt_event.get('ppid') is None: opt_event['ppid'] = proc_info.parent_pid
+                                    else: logger.warning(f"Event #{event_count} has ProcessIndex {process_index} but process info not found.")
+
+                            # Perform interning using stored strings
+                            opt_event['pname_id'] = interners[IK_PROCESS_NAME].get_id(process_name_str)
+                            opt_event['op_id'] = interners[IK_OPERATION].get_id(current_event_data['operation_str'])
+                            opt_event['path_id'] = interners[IK_PATH].get_id(current_event_data['path_str'])
+                            opt_event['res_id'] = interners[IK_RESULT].get_id(current_event_data['result_str'])
+                            opt_event['cat_id'] = interners[IK_CATEGORY].get_id(current_event_data['category_str'])
+
+                            # --- START FIX: Parse stack from stored frame XML strings ---
+                            if load_stack and current_frame_xml_strings:
+                                optimized_stack = []
+                                for frame_xml in current_frame_xml_strings:
                                     try:
-                                        # Use lxml's find method (should handle default namespace)
-                                        child = element.find(tag_name)
-                                        # Optional: Add wildcard ns fallback if needed:
-                                        # if child is None:
-                                        #     child = element.find(f"{{*}}{tag_name}")
-                                        return child.text.strip() if child is not None and child.text else None
-                                    except Exception as find_e:
-                                        logger.debug(f"lxml elem.find failed for '{tag_name}': {find_e}")
-                                        return None
-                            else:
-                                # Keep original function for standard library xml.etree
-                                find_text_func = lambda element, tag_name: _find_text_ignore_ns(element, tag_name)
+                                        frame_elem_parsed = ET_impl.fromstring(frame_xml)
+                                        # Use StackFrame.from_xml_element which uses appropriate find_text_func
+                                        frame_obj = StackFrame.from_xml_element(frame_elem_parsed)
+                                        optimized_stack.append(frame_obj.to_optimized_list(
+                                            interners[IK_STACK_PATH], interners[IK_STACK_LOCATION]
+                                        ))
+                                    except Exception as frame_e:
+                                        logger.warning(f"Failed to parse/optimize stored stack frame XML for event #{event_count}: {frame_e}", exc_info=False)
+                                        if logger.isEnabledFor(logging.DEBUG):
+                                            logger.debug(f"  Frame XML causing error: {frame_xml[:500]}...") # Log problematic XML
+                                if optimized_stack:
+                                    opt_event['stack'] = optimized_stack
                             # --- END FIX ---
 
-                            # Use the selected function
-                            pid_str = find_text_func(elem, 'PID')
-                            opt_event['pid'] = ProcessInfo._safe_text_to_int(pid_str)
-                            ts_str = find_text_func(elem, 'Time_of_Day')
-                            opt_event['ts'] = _parse_timestamp_str(ts_str)
+                            # Add collected extra data
+                            if 'extra_data' in current_event_data:
+                                opt_event['extra_data'] = current_event_data['extra_data']
 
-                            # --- Stricter Check for Core Fields ---
-                            if opt_event['pid'] is None:
-                                skip_reason += f"Missing/invalid PID ('{pid_str}'). "
-                                parse_successful = False
-                            if opt_event['ts'] is None:
-                                skip_reason += f"Missing/invalid Time_of_Day ('{ts_str}'). "
-                                parse_successful = False
+                            # --- Yield optimized event ---
+                            yield opt_event
+                            yielded_count += 1
 
-                            if parse_successful:
-                                # --- Parse remaining fields only if core fields are valid ---
-                                # Use find_text_func for other fields too...
-                                seq_num_str = find_text_func(elem, 'SequenceNumber')
-                                opt_event['seq'] = ProcessInfo._safe_text_to_int(seq_num_str)
-                                opt_event['tid'] = ProcessInfo._safe_text_to_int(find_text_func(elem, 'ThreadId'))
-                                opt_event['ppid'] = ProcessInfo._safe_text_to_int(find_text_func(elem, 'ParentPID'))
-                                opt_event['detail'] = find_text_func(elem, 'Detail')
-
-                                duration_text = find_text_func(elem, 'Duration')
-                                try: opt_event['dur'] = float(duration_text) if duration_text is not None else None
-                                except (ValueError, TypeError): opt_event['dur'] = None
-
-                                # Interned Strings (use find_text_func)
-                                process_name_str = find_text_func(elem, 'Process_Name')
-                                operation_str = find_text_func(elem, 'Operation')
-                                path_str = find_text_func(elem, 'Path')
-                                result_str = find_text_func(elem, 'Result')
-                                category_str = find_text_func(elem, 'Category')
-
-                                # Process Name Fallback
-                                if process_name_str is None:
-                                    # Use find_text_func for ProcessIndex here as well
-                                    process_index_str = find_text_func(elem, 'ProcessIndex')
-                                    process_index = ProcessInfo._safe_text_to_int(process_index_str)
-                                    if process_index is not None:
-                                        proc_info = processes.get(process_index)
-                                        if proc_info:
-                                            process_name_str = proc_info.process_name
-                                            if opt_event.get('ppid') is None: opt_event['ppid'] = proc_info.parent_pid
-                                        else: logger.warning(f"Event #{event_count} has ProcessIndex {process_index} but process info not found.")
-
-                                # Perform interning
-                                opt_event['pname_id'] = interners[IK_PROCESS_NAME].get_id(process_name_str)
-                                opt_event['op_id'] = interners[IK_OPERATION].get_id(operation_str)
-                                opt_event['path_id'] = interners[IK_PATH].get_id(path_str)
-                                opt_event['res_id'] = interners[IK_RESULT].get_id(result_str)
-                                opt_event['cat_id'] = interners[IK_CATEGORY].get_id(category_str)
-
-                                # Handle Stack Trace
-                                if load_stack:
-                                    # Use _find_child_ignore_ns for stack as it's a complex element, not just text
-                                    stack_elem = _find_child_ignore_ns(elem, 'stack')
-                                    if stack_elem is not None:
-                                        optimized_stack = []
-                                        # Iterate over children of stack_elem
-                                        for frame_elem in stack_elem:
-                                            if _strip_namespace(frame_elem.tag) == 'frame':
-                                                try:
-                                                    frame_obj = StackFrame.from_xml_element(frame_elem)
-                                                    optimized_stack.append(frame_obj.to_optimized_list(
-                                                        interners[IK_STACK_PATH], interners[IK_STACK_LOCATION]
-                                                    ))
-                                                except Exception as frame_e:
-                                                    logger.warning(f"Failed to parse/optimize stack frame for event #{event_count}: {frame_e}", exc_info=False)
-                                        if optimized_stack: opt_event['stack'] = optimized_stack
-
-                                # Handle Extra Data
-                                if load_extra:
-                                    known_event_tags = {
-                                        'sequencenumber', 'processindex', 'pid', 'threadid', 'parentpid',
-                                        'time_of_day', 'operation', 'path', 'result', 'detail', 'duration',
-                                        'category', 'process_name', 'stack'
-                                    }
-                                    # Iterate over children of elem (the <event>)
-                                    for child in elem:
-                                        tag_name_orig = child.tag
-                                        tag_name_clean = _strip_namespace(tag_name_orig).lower()
-                                        if tag_name_clean not in known_event_tags:
-                                            tag_text = child.text.strip() if child.text else None
-                                            if tag_text is not None:
-                                                extra_data_dict[tag_name_orig] = tag_text
-                                    if extra_data_dict: opt_event['extra_data'] = extra_data_dict
-
-                                # --- Yield optimized event ---
-                                yield opt_event
-                                yielded_count += 1
-
-                                # --- Progress Reporting ---
-                                current_time = time.time()
-                                # Report based on interval OR time elapsed
-                                if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > PROGRESS_REPORT_SECONDS:
-                                    elapsed_total = current_time - start_time
-                                    rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
-                                    # --- Percentage Calculation ---
-                                    percent_str = ""
-                                    if total_size is not None and total_size > 0:
-                                        try:
-                                            # Get current position in the raw stream
-                                            current_pos = source_stream.tell()
-                                            percent = (current_pos / total_size) * 100
-                                            # Use ~ to indicate it's based on raw stream position
-                                            percent_str = f" (~{percent:.1f}%)"
-                                        except (OSError, AttributeError, TypeError) as tell_err:
-                                            # Handle cases where tell() is not supported or fails
-                                            logger.debug(f"Could not get stream position for progress: {tell_err}")
-                                    # --- End Percentage Calculation ---
-                                    logger.info(f"  [Pass 2] Yielded {yielded_count:,} events{percent_str}... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
-                                    last_report_time = current_time
-                            else:
-                                # *** Log the skipped event's XML ***
-                                skipped_count += 1
-                                logger.warning(f"Skipping event #{event_count}: {skip_reason.strip()}")
+                            # --- Progress Reporting ---
+                            current_time = time.time()
+                            if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > PROGRESS_REPORT_SECONDS:
+                                elapsed_total = current_time - start_time
+                                rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
+                                percent_str = ""
+                                if total_size is not None and total_size > 0:
+                                    try:
+                                        current_pos = source_stream.tell()
+                                        percent = (current_pos / total_size) * 100
+                                        percent_str = f" (~{percent:.1f}%)"
+                                    except (OSError, AttributeError, TypeError) as tell_err:
+                                        logger.debug(f"Could not get stream position for progress: {tell_err}")
+                                logger.info(f"  [Pass 2] Yielded {yielded_count:,} events{percent_str}... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
+                                last_report_time = current_time
+                        else:
+                            # Log skip reason if parsing failed
+                            skipped_count += 1
+                            logger.warning(f"Skipping event #{event_count}: {skip_reason.strip()}")
+                            # Optionally log raw XML if debug not enabled (already logged at start)
+                            if not logger.isEnabledFor(logging.DEBUG):
                                 try:
-                                    # Serialize the current element (the <event> tag) to string
                                     event_xml_str = ET_impl.tostring(elem, encoding='unicode', method='xml')
-                                    logger.warning(f"  Skipped Event XML:\n{event_xml_str[:1500]}...") # Log first 1500 chars
+                                    logger.warning(f"  Skipped Event XML:\n{event_xml_str[:1500]}...")
                                 except Exception as log_e:
                                     logger.warning(f"  Could not serialize skipped event #{event_count} to string: {log_e}")
 
-                        except Exception as e:
-                            # Catch any other unexpected error during parsing of a single event
-                            skipped_count += 1
-                            logger.warning(f"  [Pass 2 Warning] Unexpected error parsing/converting <event> element #{event_count}, skipping: {e}", exc_info=False)
-                            # Log XML for unexpected errors too
-                            try:
-                                event_xml_str = ET_impl.tostring(elem, encoding='unicode', method='xml')
-                                logger.warning(f"  Skipped Event XML (Unexpected Error):\n{event_xml_str[:1500]}...")
-                            except Exception as log_e:
-                                logger.warning(f"  Could not serialize skipped event #{event_count} to string: {log_e}")
-                            if logger.isEnabledFor(logging.DEBUG):
-                                logger.debug(f"  [Pass 2 Debug] Full exception details for event #{event_count}:", exc_info=True)
-                        finally:
-                            _clear_elem(elem) # IMPORTANT: Clear event element memory
+                    # Reset temporary storage regardless of success
+                    current_event_data = None
+                    current_frame_xml_strings = None # Reset stack frame list
+                    # Clear the element now that we are done with its end event
+                    _clear_elem(elem)
+                # --- END: Process <event> end ---
 
-                    elif tag == 'eventlist':
-                        logger.info(f"Finished processing <eventlist> (end tag).")
-                        _clear_elem(elem)
-                    elif tag == 'procmon':
-                        logger.debug("Reached end of <procmon> during event loading.")
-                        _clear_elem(elem)
-                        break
-                    else:
-                        _clear_elem(elem) # Clear other intermediate tags
+                # --- START: Clear other tags at end ---
+                elif event_type == 'end':
+                     # Clear other intermediate tags if necessary
+                     # We need to be careful NOT to clear <frame> or <stack> here
+                     # as their 'start' events might be processed before the parent 'event' start
+                     if tag not in ['event', 'frame', 'stack']:
+                         # logger.debug(f"Clearing intermediate tag: {tag}")
+                         _clear_elem(elem)
+                # --- END: Clear other tags at end ---
+
 
         elapsed = time.time() - start_time
         logger.info(f"Finished Pass 2: Processed {event_count:,} <event> elements, yielded {yielded_count:,}, skipped {skipped_count:,} ({elapsed:.2f}s).")
@@ -770,10 +838,9 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
                     if op_id is not None: log_data.op_id_index[op_id].append(idx)
                     # --- End Indexing ---
 
-                    if consumed_count % 50000 == 0:
-                        # Progress is now handled inside _parse_xml_stream_for_loading
-                        pass
-                        # logger.debug(f"[Loader] Consumed {consumed_count:,} events into list.")
+                    # Removed progress reporting from here, handled in parser now
+                    # if consumed_count % 50000 == 0:
+                    #    logger.debug(f"[Loader] Consumed {consumed_count:,} events into list.")
             except Exception as consume_err:
                 logger.error(f"[Loader] Error during iterator consumption after {consumed_count} events: {consume_err}", exc_info=True)
             finally:
@@ -1462,8 +1529,19 @@ async def get_timing_statistics(group_by: str = "process", *, ctx: Context) -> D
                 last_progress_report_time = current_time
 
             duration = event_dict.get('dur')
-            if duration is None or duration <= 0: continue
+            # Ensure duration is a valid float > 0
+            if duration is None or not isinstance(duration, (float, int)) or duration <= 0:
+                 # --- DEBUG: Log if duration is invalid for stats ---
+                 if duration is not None and logger.isEnabledFor(logging.DEBUG):
+                     logger.debug(f"Event {i} has invalid duration for stats: '{duration}' (Type: {type(duration)})")
+                 # --- END DEBUG ---
+                 continue
             events_with_duration += 1
+            # --- DEBUG: Log first valid duration found ---
+            if events_with_duration == 1 and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Event {i} has first valid duration for stats: {duration}")
+            # --- END DEBUG ---
+
 
             group_key_id = event_dict.get('pname_id') if group_by == "process" else event_dict.get('op_id')
             interner_name = IK_PROCESS_NAME if group_by == "process" else IK_OPERATION
