@@ -445,7 +445,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Added Enhanced Debug Logging ---
+# --- UPDATED: Log ALL tags encountered in eventlist ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -492,6 +492,9 @@ def _parse_xml_stream_for_loading(
                 continue
 
             if parsing_stage == "parsing_events":
+                # *** ADDED DEBUG LOGGING FOR *ALL* TAGS IN THIS STAGE ***
+                logger.debug(f"  [Pass 2 Debug] Encountered tag: '{elem.tag}'")
+
                 if elem.tag == 'event':
                     event_count += 1 # Increment count when <event> tag is encountered
                     seq_num_text = elem.findtext('SequenceNumber', default='<unknown>') # Get sequence early for logging
@@ -544,7 +547,7 @@ def _parse_xml_stream_for_loading(
                             elapsed_total = current_time - start_time
                             rate = event_count / elapsed_total if elapsed_total > 0 else 0
                             # Report both processed and yielded counts
-                            logger.info(f"  [Pass 2] Processed {event_count:,} events (yielded {yielded_count:,})... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
+                            logger.info(f"  [Pass 2] Processed {event_count:,} event tags (yielded {yielded_count:,})... ({elapsed_total:.1f}s | {rate:,.0f} tags/sec)")
                             last_report_time = current_time
 
                     except Exception as e:
@@ -572,10 +575,15 @@ def _parse_xml_stream_for_loading(
                 elif elem.tag == 'procmon':
                     logger.debug("Reached end of <procmon> during event loading.")
                     break # Stop iteration
+                else:
+                    # If the tag wasn't 'event', 'eventlist', or 'procmon', clear it to save memory
+                    logger.debug(f"  [Pass 2 Debug] Clearing unexpected tag '{elem.tag}' within eventlist stage.")
+                    _clear_elem(elem)
+
 
         elapsed = time.time() - start_time
         # Log the final count of *yielded* events, which populates LOADED_EVENTS
-        logger.info(f"Finished Pass 2: Processed {event_count:,} <event> elements, successfully yielded {yielded_count:,} optimized events ({elapsed:.2f}s).")
+        logger.info(f"Finished Pass 2: Processed {event_count:,} <event> elements (or elements thought to be events), successfully yielded {yielded_count:,} optimized events ({elapsed:.2f}s).")
 
     except ET_impl.XMLSyntaxError as e:
         logger.error(f"XML Parse Error during event loading stream: {e}")
