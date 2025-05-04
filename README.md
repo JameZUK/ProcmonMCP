@@ -43,7 +43,7 @@ This project was inspired by the approach taken in the [GhidraMCP project](https
 3.  **Install Dependencies:**
     ```bash
     # lxml is highly recommended for performance
-    pip install "mcp[cli]" lxml
+    pip install "mcp[cli]" lxml psutil
     ```
     *(If you choose not to install `lxml`, the script will use the slower built-in XML parser).*
 
