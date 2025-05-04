@@ -418,8 +418,8 @@ def _parse_xml_stream_for_loading(
     start_time = time.time()
     last_report_time = start_time
     current_event_data: Optional[Dict[str, Any]] = None # Store data between start/end
-    # --- START FIX: Store list of frame XML strings ---
-    current_frame_xml_strings: Optional[List[str]] = None
+    # --- START FIX: Store list of OPTIMIZED frame data ---
+    current_stack_frames: Optional[List[List]] = None
     # --- END FIX ---
 
     # find_text_func is now defined globally
@@ -446,8 +446,8 @@ def _parse_xml_stream_for_loading(
                     # --- REMOVED: Verbose raw XML logging ---
 
                     current_event_data = {} # Initialize temporary storage
-                    # --- START FIX: Reset frame XML string list ---
-                    current_frame_xml_strings = [] if load_stack else None
+                    # --- START FIX: Reset stack frame list ---
+                    current_stack_frames = [] if load_stack else None
                     # --- END FIX ---
 
                     try:
@@ -508,14 +508,18 @@ def _parse_xml_stream_for_loading(
 
                 # --- END: Process <event> start ---
 
-                # --- START FIX: Store <frame> XML string on start ---
-                elif event_type == 'start' and tag == 'frame' and load_stack and current_frame_xml_strings is not None:
+                # --- START FIX: Parse <frame> on start and store OPTIMIZED data ---
+                elif event_type == 'start' and tag == 'frame' and load_stack and current_stack_frames is not None:
                      try:
-                         frame_xml_string = ET_impl.tostring(elem, encoding='unicode')
-                         current_frame_xml_strings.append(frame_xml_string)
-                         # REMOVED: Verbose frame XML logging
-                     except Exception as frame_log_e:
-                         logger.warning(f"Could not serialize frame element for event #{event_count}: {frame_log_e}")
+                         # Parse frame directly using the element available at 'start'
+                         # StackFrame.from_xml_element now uses appropriate find_text_func
+                         frame_obj = StackFrame.from_xml_element(elem)
+                         # Store the optimized list representation directly
+                         current_stack_frames.append(frame_obj.to_optimized_list(
+                             interners[IK_STACK_PATH], interners[IK_STACK_LOCATION]
+                         ))
+                     except Exception as frame_e:
+                         logger.warning(f"Failed to parse/optimize stack frame during START for event #{event_count}: {frame_e}", exc_info=False)
                 # --- END FIX ---
 
 
@@ -563,22 +567,9 @@ def _parse_xml_stream_for_loading(
                             opt_event['res_id'] = interners[IK_RESULT].get_id(current_event_data['result_str'])
                             opt_event['cat_id'] = interners[IK_CATEGORY].get_id(current_event_data['category_str'])
 
-                            # --- START FIX: Parse stack from stored frame XML strings ---
-                            if load_stack and current_frame_xml_strings:
-                                optimized_stack = []
-                                for frame_xml in current_frame_xml_strings:
-                                    try:
-                                        frame_elem_parsed = ET_impl.fromstring(frame_xml)
-                                        # Use StackFrame.from_xml_element which uses appropriate find_text_func
-                                        frame_obj = StackFrame.from_xml_element(frame_elem_parsed)
-                                        optimized_stack.append(frame_obj.to_optimized_list(
-                                            interners[IK_STACK_PATH], interners[IK_STACK_LOCATION]
-                                        ))
-                                    except Exception as frame_e:
-                                        logger.warning(f"Failed to parse/optimize stored stack frame XML for event #{event_count}: {frame_e}", exc_info=False)
-                                        # REMOVED: Verbose frame XML logging on error
-                                if optimized_stack:
-                                    opt_event['stack'] = optimized_stack
+                            # --- START FIX: Assign collected optimized stack frames ---
+                            if load_stack and current_stack_frames:
+                                opt_event['stack'] = current_stack_frames
                             # --- END FIX ---
 
                             # Add collected extra data
@@ -624,7 +615,7 @@ def _parse_xml_stream_for_loading(
 
                     # Reset temporary storage regardless of success
                     current_event_data = None
-                    current_frame_xml_strings = None # Reset stack frame list
+                    current_stack_frames = None # Reset stack frame list
                     # Clear the element now that we are done with its end event
                     _clear_elem(elem)
                 # --- END: Process <event> end ---
