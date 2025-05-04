@@ -445,7 +445,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: REMOVED tag= argument from iterparse ---
+# --- UPDATED: Use start/end events in iterparse ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -456,16 +456,15 @@ def _parse_xml_stream_for_loading(
     Parses <event> elements, converts them to optimized dictionaries using interners,
     and yields them. Assumes process list is already parsed and passed in `processes`.
     Reports progress based on event count. Includes enhanced debug logging.
+    Uses start/end events for iterparse.
 
     Yields:
         Optimized event dictionaries.
     """
     parsing_stage = "seeking_eventlist" # Start assuming processes are done
-    # REMOVED tags_of_interest = ('event', 'eventlist', 'procmon')
     try:
-        # Use 'rb' mode for binary reading
-        # *** REMOVED tag= argument to process ALL tags ***
-        context = ET_impl.iterparse(source_stream, events=('end',))
+        # *** Use start AND end events, without tag filter ***
+        context = ET_impl.iterparse(source_stream, events=('start', 'end'))
         logger.info("Starting Pass 2: Parsing and optimizing events...")
     except Exception as e:
         logger.error(f"Unexpected error initializing XML parser for event loading: {e}", exc_info=True)
@@ -477,114 +476,115 @@ def _parse_xml_stream_for_loading(
     last_report_time = start_time
     try:
         for event_type, elem in context:
-            # Skip elements until we are inside the eventlist
+            # --- State Machine based on Start/End Events ---
             if parsing_stage == "seeking_eventlist":
-                if elem.tag == 'eventlist':
-                    logger.debug("Entered <eventlist> for event loading.")
+                if event_type == 'start' and elem.tag == 'eventlist':
+                    logger.debug("Entered <eventlist> (start event).")
                     parsing_stage = "parsing_events"
-                    _clear_elem(elem) # Clear the eventlist tag itself
-                    continue # Move to next element
-                elif elem.tag == 'procmon': # Reached end before finding eventlist
+                    # Don't clear yet, wait for end tag
+                elif event_type == 'end' and elem.tag == 'procmon': # Reached end before finding eventlist
                     logger.warning("Reached end of <procmon> before finding <eventlist>.")
                     break
-                # Ignore other tags before eventlist starts
-                _clear_elem(elem)
-                continue
+                # Ignore other tags before eventlist starts, clear them on end event
+                elif event_type == 'end':
+                     _clear_elem(elem)
+                continue # Continue loop until eventlist start is found
 
-            if parsing_stage == "parsing_events":
+            elif parsing_stage == "parsing_events":
                 # Log every tag encountered within the eventlist stage for debugging
-                logger.debug(f"  [Pass 2 Debug] Encountered tag: '{elem.tag}'")
+                logger.debug(f"  [Pass 2 Debug] Encountered tag: '{elem.tag}', Event type: {event_type}")
 
-                if elem.tag == 'event':
-                    event_count += 1 # Increment count when <event> tag is encountered
-                    seq_num_text = elem.findtext('SequenceNumber', default='<unknown>') # Get sequence early for logging
-                    logger.debug(f"  [Pass 2 Debug] Found <event> tag #{event_count}, Sequence ~{seq_num_text}. Attempting parse...")
-                    try:
-                        # 1. Parse the raw event data using the dataclass
-                        logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for Sequence ~{seq_num_text}...")
-                        raw_event = ProcmonEvent.from_xml_element(elem, processes)
-                        # Check if sequence number was parsed correctly for logging
-                        parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
-                        logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for Sequence {parsed_seq}. Optimizing...")
+                if event_type == 'end': # Process elements only when they finish
+                    if elem.tag == 'event':
+                        event_count += 1 # Increment count when <event> tag *ends*
+                        seq_num_text = elem.findtext('SequenceNumber', default='<unknown>') # Get sequence early for logging
+                        logger.debug(f"  [Pass 2 Debug] Found END of <event> tag #{event_count}, Sequence ~{seq_num_text}. Attempting parse...")
+                        try:
+                            # 1. Parse the raw event data using the dataclass
+                            logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for Sequence ~{seq_num_text}...")
+                            raw_event = ProcmonEvent.from_xml_element(elem, processes)
+                            # Check if sequence number was parsed correctly for logging
+                            parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
+                            logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for Sequence {parsed_seq}. Optimizing...")
 
-                        # --- Optimization Logic ---
-                        opt_event: Dict[str, Any] = {}
-                        opt_event['seq'] = raw_event.sequence_number
-                        opt_event['pid'] = raw_event.pid
-                        opt_event['tid'] = raw_event.tid
-                        opt_event['ppid'] = raw_event.parent_pid
-                        opt_event['ts'] = raw_event.timestamp_float
-                        opt_event['dur'] = raw_event.duration_float
-                        opt_event['detail'] = raw_event.detail
-                        opt_event['pname_id'] = interners["process_name"].get_id(raw_event.process_name)
-                        opt_event['op_id'] = interners["operation"].get_id(raw_event.operation)
-                        opt_event['path_id'] = interners["path"].get_id(raw_event.path)
-                        opt_event['res_id'] = interners["result"].get_id(raw_event.result)
-                        opt_event['cat_id'] = interners["category"].get_id(raw_event.category)
+                            # --- Optimization Logic ---
+                            opt_event: Dict[str, Any] = {}
+                            opt_event['seq'] = raw_event.sequence_number
+                            opt_event['pid'] = raw_event.pid
+                            opt_event['tid'] = raw_event.tid
+                            opt_event['ppid'] = raw_event.parent_pid
+                            opt_event['ts'] = raw_event.timestamp_float
+                            opt_event['dur'] = raw_event.duration_float
+                            opt_event['detail'] = raw_event.detail
+                            opt_event['pname_id'] = interners["process_name"].get_id(raw_event.process_name)
+                            opt_event['op_id'] = interners["operation"].get_id(raw_event.operation)
+                            opt_event['path_id'] = interners["path"].get_id(raw_event.path)
+                            opt_event['res_id'] = interners["result"].get_id(raw_event.result)
+                            opt_event['cat_id'] = interners["category"].get_id(raw_event.category)
 
-                        if raw_event.stack_frames:
-                            optimized_stack = []
-                            for frame in raw_event.stack_frames:
+                            if raw_event.stack_frames:
+                                optimized_stack = []
+                                for frame in raw_event.stack_frames:
+                                    try:
+                                        optimized_stack.append(frame.to_optimized_list(
+                                            interners["stack_path"],
+                                            interners["stack_location"]
+                                        ))
+                                    except Exception as frame_e:
+                                         logger.warning(f"Failed to optimize stack frame for event seq {parsed_seq}: {frame_e}", exc_info=False)
+                                if optimized_stack:
+                                    opt_event['stack'] = optimized_stack
+                            # --- End Optimization ---
+
+                            logger.debug(f"  [Pass 2 Debug] Yielding optimized event for Sequence {parsed_seq}.")
+                            yield opt_event
+                            yielded_count += 1 # Increment *after* successful yield
+
+                            # --- Progress Reporting ---
+                            current_time = time.time()
+                            # Report based on yielded_count
+                            if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > 5.0:
+                                elapsed_total = current_time - start_time
+                                rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
+                                # Report yielded count
+                                logger.info(f"  [Pass 2] Yielded {yielded_count:,} events... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
+                                last_report_time = current_time
+
+                        except Exception as e:
+                            # Log error parsing this specific event but continue if possible
+                            logger.warning(f"  [Pass 2 Warning] Failed to parse/convert <event> element (Sequence ~{seq_num_text}): {e}", exc_info=False)
+                            # Log more details in debug mode
+                            if logger.isEnabledFor(logging.DEBUG):
                                 try:
-                                    optimized_stack.append(frame.to_optimized_list(
-                                        interners["stack_path"],
-                                        interners["stack_location"]
-                                    ))
-                                except Exception as frame_e:
-                                     logger.warning(f"Failed to optimize stack frame for event seq {parsed_seq}: {frame_e}", exc_info=False)
-                            if optimized_stack:
-                                opt_event['stack'] = optimized_stack
-                        # --- End Optimization ---
+                                    # Try to log the raw XML snippet for the failed event
+                                    event_xml_str = ET_impl.tostring(elem, encoding='unicode', method='xml')
+                                    logger.debug(f"  [Pass 2 Debug] XML for failed event ~{seq_num_text}:\n{event_xml_str[:1000]}...") # Log first 1000 chars
+                                except Exception as log_e:
+                                    logger.debug(f"  [Pass 2 Debug] Could not serialize failed event element to string: {log_e}")
+                                # Log full exception trace in debug mode
+                                logger.debug(f"  [Pass 2 Debug] Full exception details for event ~{seq_num_text}:", exc_info=True)
 
-                        logger.debug(f"  [Pass 2 Debug] Yielding optimized event for Sequence {parsed_seq}.")
-                        yield opt_event
-                        yielded_count += 1 # Increment *after* successful yield
+                        finally:
+                             logger.debug(f"  [Pass 2 Debug] Clearing element for event ~{seq_num_text}.")
+                             _clear_elem(elem) # IMPORTANT: Clear event element memory after processing its end tag
 
-                        # --- Progress Reporting ---
-                        current_time = time.time()
-                        # Report based on event_count (elements processed)
-                        # Use yielded_count for rate calculation if preferred
-                        if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > 5.0:
-                            elapsed_total = current_time - start_time
-                            rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
-                            # Report both processed and yielded counts
-                            logger.info(f"  [Pass 2] Processed {event_count:,} event tags (yielded {yielded_count:,})... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
-                            last_report_time = current_time
-
-                    except Exception as e:
-                        # Log error parsing this specific event but continue if possible
-                        logger.warning(f"  [Pass 2 Warning] Failed to parse/convert <event> element (Sequence ~{seq_num_text}): {e}", exc_info=False)
-                        # Log more details in debug mode
-                        if logger.isEnabledFor(logging.DEBUG):
-                            try:
-                                # Try to log the raw XML snippet for the failed event
-                                event_xml_str = ET_impl.tostring(elem, encoding='unicode', method='xml')
-                                logger.debug(f"  [Pass 2 Debug] XML for failed event ~{seq_num_text}:\n{event_xml_str[:1000]}...") # Log first 1000 chars
-                            except Exception as log_e:
-                                logger.debug(f"  [Pass 2 Debug] Could not serialize failed event element to string: {log_e}")
-                            # Log full exception trace in debug mode
-                            logger.debug(f"  [Pass 2 Debug] Full exception details for event ~{seq_num_text}:", exc_info=True)
-
-                    finally:
-                         logger.debug(f"  [Pass 2 Debug] Clearing element for event ~{seq_num_text}.")
-                         _clear_elem(elem) # IMPORTANT: Clear event element memory regardless of success/failure
-
-                elif elem.tag == 'eventlist':
-                    logger.info(f"Finished processing <eventlist>.")
-                    _clear_elem(elem)
-                    # Continue parsing until </procmon> in case of trailing elements
-                elif elem.tag == 'procmon':
-                    logger.debug("Reached end of <procmon> during event loading.")
-                    break # Stop iteration
-                else:
-                    # If the tag wasn't 'event', 'eventlist', or 'procmon', clear it to save memory
-                    logger.debug(f"  [Pass 2 Debug] Clearing unexpected tag '{elem.tag}' within eventlist stage.")
-                    _clear_elem(elem)
+                    elif elem.tag == 'eventlist':
+                        logger.info(f"Finished processing <eventlist> (end tag).")
+                        _clear_elem(elem)
+                        # Don't break here, wait for procmon end tag
+                    elif elem.tag == 'procmon':
+                        logger.debug("Reached end of <procmon> during event loading.")
+                        _clear_elem(elem)
+                        break # Stop iteration
+                    else:
+                        # If the tag wasn't 'event', 'eventlist', or 'procmon', clear it to save memory
+                        logger.debug(f"  [Pass 2 Debug] Clearing element for unexpected tag '{elem.tag}' on end event.")
+                        _clear_elem(elem)
 
 
         elapsed = time.time() - start_time
         # Log the final count of *yielded* events, which populates LOADED_EVENTS
-        logger.info(f"Finished Pass 2: Processed {event_count:,} <event> elements (or elements thought to be events), successfully yielded {yielded_count:,} optimized events ({elapsed:.2f}s).")
+        logger.info(f"Finished Pass 2: Processed {event_count:,} <event> elements, successfully yielded {yielded_count:,} optimized events ({elapsed:.2f}s).")
 
     except ET_impl.XMLSyntaxError as e:
         logger.error(f"XML Parse Error during event loading stream: {e}")
