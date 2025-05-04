@@ -103,8 +103,6 @@ class StringInterner:
         """Gets the integer ID for a string, adding it if new. Returns None for None input."""
         if s is None:
             return None
-        # Ensure consistent handling of empty strings if needed (optional)
-        # s = s.strip() if s else s # Example: treat "" and " " the same if desired
         if s not in self.str_to_id:
             self.str_to_id[s] = self.next_id
             self.id_to_str.append(s)
@@ -375,8 +373,7 @@ class ProcmonEvent:
                 if tag_text is not None: # Only store if there's text
                     # Use the original tag name (with namespace if present) as the key
                     extra_data_dict[tag_name_orig] = tag_text
-                    logger.debug(f"  [Event Parse Debug] Found extra field: '{tag_name_orig}' = '{tag_text[:50]}...'")
-
+                    # logger.debug(f"  [Event Parse Debug] Found extra field: '{tag_name_orig}' = '{tag_text[:50]}...'") # Removed verbose log
 
         # Fallback: If ProcessName missing in event, try lookup via ProcessIndex
         if data.get('process_name') is None and data.get('process_index') is not None:
@@ -546,7 +543,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Respect selective loading flags ---
+# --- UPDATED: Reduced logging verbosity ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -558,7 +555,7 @@ def _parse_xml_stream_for_loading(
     Internal helper optimized for initial loading into memory.
     Parses <event> elements, converts them to optimized dictionaries using interners,
     and yields them. Assumes process list is already parsed and passed in `processes`.
-    Reports progress based on event count. Includes enhanced debug logging.
+    Reports progress based on event count.
     Uses start/end events for iterparse and handles potential XML namespaces.
     Respects selective loading flags.
 
@@ -605,10 +602,10 @@ def _parse_xml_stream_for_loading(
                     if tag == 'event':
                         event_count += 1 # Increment count when <event> tag *ends*
                         seq_num_text = ProcmonEvent._find_text_ignore_ns(elem, 'SequenceNumber') or f'event #{event_count}'
-                        logger.debug(f"  [Pass 2 Debug] Found END of <event> tag #{event_count}. Attempting parse...")
+                        # logger.debug(f"  [Pass 2 Debug] Found END of <event> tag #{event_count}. Attempting parse...") # Reduced verbosity
                         try:
                             # 1. Parse the raw event data using the dataclass (which now ignores namespaces)
-                            logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for event #{event_count}...")
+                            # logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for event #{event_count}...") # Reduced verbosity
                             # Pass selective loading flags to parser
                             raw_event = ProcmonEvent.from_xml_element(elem, processes, load_stack, load_extra)
                             # Check if sequence number was parsed correctly for logging
@@ -618,7 +615,7 @@ def _parse_xml_stream_for_loading(
                             #     logger.warning(f"  [Pass 2 Warning] Skipping event ~{seq_num_text} due to missing SequenceNumber after parsing.")
                             #     continue # Skip this event if sequence couldn't be parsed
 
-                            logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for event #{event_count} (Sequence: {parsed_seq}). Optimizing...")
+                            # logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for event #{event_count} (Sequence: {parsed_seq}). Optimizing...") # Reduced verbosity
 
                             # --- Optimization Logic ---
                             opt_event: Dict[str, Any] = {}
@@ -654,7 +651,7 @@ def _parse_xml_stream_for_loading(
                                     opt_event['stack'] = optimized_stack
                             # --- End Optimization ---
 
-                            logger.debug(f"  [Pass 2 Debug] Yielding optimized event for Sequence {parsed_seq}.")
+                            # logger.debug(f"  [Pass 2 Debug] Yielding optimized event for Sequence {parsed_seq}.") # Reduced verbosity
                             yield opt_event
                             yielded_count += 1 # Increment *after* successful yield
 
@@ -684,7 +681,7 @@ def _parse_xml_stream_for_loading(
                                 logger.debug(f"  [Pass 2 Debug] Full exception details for event ~{seq_num_text}:", exc_info=True)
 
                         finally:
-                             logger.debug(f"  [Pass 2 Debug] Clearing element for event #{event_count}.")
+                             # logger.debug(f"  [Pass 2 Debug] Clearing element for event #{event_count}.") # Reduced verbosity
                              _clear_elem(elem) # IMPORTANT: Clear event element memory after processing its end tag
 
                     elif tag == 'eventlist':
@@ -1184,7 +1181,7 @@ async def query_events(
             # --- Add progress reporting within the query itself for long queries ---
             current_time = time.time()
             # Adjust progress report frequency based on total_to_scan
-            report_interval = max(10000, total_to_scan // 10) # Report roughly 10 times or every 10k
+            report_interval = max(10000, total_to_scan // 10) if total_to_scan > 0 else 10000 # Avoid division by zero
             if processed_count % report_interval == 0 or (current_time - last_progress_report_time > 10.0):
                 try:
                     elapsed = current_time - start_time
@@ -1259,8 +1256,7 @@ async def query_events(
                                 if len(frame_list) > 2 and frame_list[2] is not None:
                                     frame_path_str = get_string("stack_path", frame_list[2])
                                     if frame_path_str and filter_stack_module_path_lower in frame_path_str.lower():
-                                        found_in_stack = True
-                                        break
+                                        found_in_stack = True; break
                         if not found_in_stack: match = False
 
             # --- Add to results if all filters passed ---
