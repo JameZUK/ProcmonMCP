@@ -91,6 +91,30 @@ OP_PROCESS_CREATE = "Process Create"
 OP_PROCESS_EXIT = "Process Exit"
 NETWORK_OPERATIONS = {"TCP Connect", "TCP Send", "TCP Receive", "UDP Send", "UDP Receive"} # Case-sensitive
 
+# --- *** NEW: Standalone XML Helper Functions *** ---
+def _strip_namespace(tag: str) -> str:
+    """Helper to remove namespace from tag string if present."""
+    return tag.split('}', 1)[-1] if '}' in tag else tag
+
+def _find_child_ignore_ns(elem: ET_impl.Element, tag_name: str) -> Optional[ET_impl.Element]:
+    """Finds the first direct child element with the given tag name, ignoring namespaces."""
+    # Try finding directly first (might work for simple cases or no namespaces)
+    child = elem.find(tag_name)
+    if child is not None:
+        return child
+    # Fallback: Iterate through all children and check tag manually
+    for child_elem in elem:
+        if _strip_namespace(child_elem.tag) == tag_name:
+            return child_elem
+    return None
+
+def _find_text_ignore_ns(elem: ET_impl.Element, tag_name: str) -> Optional[str]:
+     """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
+     child = _find_child_ignore_ns(elem, tag_name) # Use the helper above
+     return child.text.strip() if child is not None and child.text else None
+# --- End Helper Functions ---
+
+
 # --- String Interning Helper ---
 class StringInterner:
     """Manages mapping strings to unique integer IDs and back."""
@@ -125,37 +149,19 @@ class StackFrame:
     path: Optional[str] = None
     location: Optional[str] = None
 
-    @staticmethod
-    def _strip_namespace(tag):
-        """Helper to remove namespace from tag string if present."""
-        return tag.split('}', 1)[-1] if '}' in tag else tag
-
-    @classmethod
-    def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
-         """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
-         # Try finding directly first (might work for simple cases or no namespaces)
-         child = elem.find(tag_name)
-         if child is not None and child.text:
-             return child.text.strip()
-
-         # Fallback: Iterate through all children and check tag manually (ignoring namespace)
-         for child in elem:
-            # Compare the part after '}' if namespace is present, otherwise the whole tag
-            local_tag = cls._strip_namespace(child.tag)
-            if local_tag == tag_name:
-                return child.text.strip() if child.text else None
-         return None # Not found
+    # Removed _strip_namespace and _find_text_ignore_ns static methods
 
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element) -> 'StackFrame':
         """Parses a <frame> XML element into a StackFrame object, ignoring namespaces."""
-        depth_text = cls._find_text_ignore_ns(elem, 'depth')
+        # Use standalone helper function
+        depth_text = _find_text_ignore_ns(elem, 'depth')
         try: depth = int(depth_text) if depth_text and depth_text.isdigit() else None
         except (ValueError, TypeError): depth = None
         # Address is typically hex, keep as string
-        address = cls._find_text_ignore_ns(elem, 'address')
-        path = cls._find_text_ignore_ns(elem, 'path')
-        location = cls._find_text_ignore_ns(elem, 'location')
+        address = _find_text_ignore_ns(elem, 'address')
+        path = _find_text_ignore_ns(elem, 'path')
+        location = _find_text_ignore_ns(elem, 'location')
         return cls(depth=depth, address=address, path=path, location=location)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -201,24 +207,7 @@ class ProcessInfo:
     def user_sid(self): return self.owner
 
     # --- Helper methods for safe parsing ---
-    @staticmethod
-    def _strip_namespace(tag):
-        """Helper to remove namespace from tag string if present."""
-        return tag.split('}', 1)[-1] if '}' in tag else tag
-
-    @classmethod
-    def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
-         """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
-         # Try finding directly first (might work for simple cases or no namespaces)
-         child = elem.find(tag_name)
-         if child is not None and child.text:
-             return child.text.strip()
-         # Fallback: Iterate through all children and check tag manually (ignoring namespace)
-         for child in elem:
-            local_tag = cls._strip_namespace(child.tag)
-            if local_tag == tag_name:
-                return child.text.strip() if child.text else None
-         return None # Not found
+    # Removed _strip_namespace and _find_text_ignore_ns static methods
 
     @staticmethod
     def _safe_text_to_int(text: Optional[str]) -> Optional[int]:
@@ -251,217 +240,67 @@ class ProcessInfo:
     def from_xml_element(cls, elem: ET_impl.Element) -> 'ProcessInfo':
         """Parses a <process> XML element into a ProcessInfo object, ignoring namespaces."""
         data = {}
-        data['process_index'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessIndex'))
-        data['process_id'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessId'))
-        data['parent_process_id'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ParentProcessId'))
-        data['parent_process_index'] = cls._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ParentProcessIndex'))
-        data['authentication_id'] = cls._find_text_ignore_ns(elem, 'AuthenticationId')
-        data['create_time'] = cls._find_text_ignore_ns(elem, 'CreateTime') # Keep as string for now
-        data['finish_time'] = cls._find_text_ignore_ns(elem, 'FinishTime') # Keep as string for now
-        data['is_virtualized'] = cls._safe_text_to_bool(cls._find_text_ignore_ns(elem, 'IsVirtualized'))
-        data['is_64bit'] = cls._safe_text_to_bool(cls._find_text_ignore_ns(elem, 'Is64bit'))
-        data['integrity'] = cls._find_text_ignore_ns(elem, 'Integrity')
-        data['owner'] = cls._find_text_ignore_ns(elem, 'Owner')
-        data['process_name'] = cls._find_text_ignore_ns(elem, 'ProcessName') # Corrected based on structure analysis
-        data['image_path'] = cls._find_text_ignore_ns(elem, 'ImagePath')
-        data['command_line'] = cls._find_text_ignore_ns(elem, 'CommandLine')
-        data['company_name'] = cls._find_text_ignore_ns(elem, 'CompanyName')
-        data['version'] = cls._find_text_ignore_ns(elem, 'Version')
-        data['description'] = cls._find_text_ignore_ns(elem, 'Description')
+        # Use standalone helper functions
+        data['process_index'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ProcessIndex'))
+        data['process_id'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ProcessId'))
+        data['parent_process_id'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ParentProcessId'))
+        data['parent_process_index'] = cls._safe_text_to_int(_find_text_ignore_ns(elem, 'ParentProcessIndex'))
+        data['authentication_id'] = _find_text_ignore_ns(elem, 'AuthenticationId')
+        data['create_time'] = _find_text_ignore_ns(elem, 'CreateTime') # Keep as string for now
+        data['finish_time'] = _find_text_ignore_ns(elem, 'FinishTime') # Keep as string for now
+        data['is_virtualized'] = cls._safe_text_to_bool(_find_text_ignore_ns(elem, 'IsVirtualized'))
+        data['is_64bit'] = cls._safe_text_to_bool(_find_text_ignore_ns(elem, 'Is64bit'))
+        data['integrity'] = _find_text_ignore_ns(elem, 'Integrity')
+        data['owner'] = _find_text_ignore_ns(elem, 'Owner')
+        data['process_name'] = _find_text_ignore_ns(elem, 'ProcessName') # Corrected based on structure analysis
+        data['image_path'] = _find_text_ignore_ns(elem, 'ImagePath')
+        data['command_line'] = _find_text_ignore_ns(elem, 'CommandLine')
+        data['company_name'] = _find_text_ignore_ns(elem, 'CompanyName')
+        data['version'] = _find_text_ignore_ns(elem, 'Version')
+        data['description'] = _find_text_ignore_ns(elem, 'Description')
         return cls(**data)
 
-# --- UPDATED: ProcmonEvent Dataclass with extra_data ---
-@dataclasses.dataclass
-class ProcmonEvent:
-    """Represents data parsed from a single <event> element before optimization."""
-    # Known fields (using consistent attribute names)
-    sequence_number: Optional[int] = None # Might be absent in some XML exports
-    process_index: Optional[int] = None # Used to link to ProcessInfo if needed
-    pid: Optional[int] = None
-    tid: Optional[int] = None
-    parent_pid: Optional[int] = None # Often missing in XML event, might need lookup via ProcessInfo
-    timestamp_str: Optional[str] = None # Original "HH:MM:SS.ffffff" string
-    timestamp_float: Optional[float] = None # Calculated Unix timestamp float (UTC, based on BASE_DATE)
-    operation: Optional[str] = None
-    path: Optional[str] = None
-    result: Optional[str] = None
-    detail: Optional[str] = None
-    duration_float: Optional[float] = None # Duration in seconds (float)
-    category: Optional[str] = None
-    process_name: Optional[str] = None # Usually present, fallback to lookup via ProcessIndex if needed
-    stack_frames: Optional[List[StackFrame]] = None # Parsed stack frames
-    # Field to store unknown/extra data
-    extra_data: Optional[Dict[str, str]] = None
+# --- REMOVED ProcmonEvent Dataclass - Parsing directly into dict ---
 
-    @staticmethod
-    def _strip_namespace(tag):
-        """Helper to remove namespace from tag string if present."""
-        return tag.split('}', 1)[-1] if '}' in tag else tag
-
-    @classmethod
-    def _find_child_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[ET_impl.Element]:
-        """Finds the first direct child element with the given tag name, ignoring namespaces."""
-        # Try finding directly first
-        child = elem.find(tag_name)
-        if child is not None:
-            return child
-        # Fallback: Iterate through all children and check tag manually
-        for child_elem in elem:
-            if cls._strip_namespace(child_elem.tag) == tag_name:
-                return child_elem
+# --- Helper function to parse timestamp (moved outside class) ---
+def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
+    """
+    Parses HH:MM:SS.ffffff[f...] string to a UTC float timestamp relative to BASE_DATE.
+    Handles arbitrary digits in fractional seconds by truncating to 6.
+    """
+    if ts_str is None:
         return None
+    try:
+        # Split into time and fractional seconds
+        parts = ts_str.split('.', 1)
+        time_part = parts[0]
+        fractional_part = ""
+        if len(parts) > 1:
+            fractional_part = parts[1]
 
-    @classmethod
-    def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
-         """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
-         # Try finding directly first
-         child = elem.find(tag_name)
-         if child is not None and child.text:
-             return child.text.strip()
-         # Fallback: Iterate through all children and check tag manually
-         for child_elem in elem:
-            local_tag = cls._strip_namespace(child_elem.tag)
-            if local_tag == tag_name:
-                return child_elem.text.strip() if child_elem.text else None
-         return None # Not found
+        # Truncate fractional part to 6 digits if longer
+        if len(fractional_part) > 6:
+            # logger.debug(f"Truncating timestamp fractional part: '{fractional_part}' -> '{fractional_part[:6]}'") # Reduced verbosity
+            fractional_part = fractional_part[:6]
+        elif len(fractional_part) < 6:
+            # Pad with zeros if shorter (less common but possible)
+            fractional_part = fractional_part.ljust(6, '0')
 
-    @classmethod
-    def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo], load_stack: bool, load_extra: bool) -> 'ProcmonEvent':
-        """
-        Parses an <event> XML element into a ProcmonEvent object, ignoring namespaces
-        and optionally capturing extra fields and stack traces based on flags.
-        Uses explicit mapping from known XML tags to standardized dataclass fields.
-        """
-        data = {}
-        extra_data_dict = {}
-        # Map expected XML tags (lowercase) to dataclass attribute names
-        tag_map = {
-            'sequencenumber': 'sequence_number',
-            'processindex': 'process_index',
-            'pid': 'pid', # Corrected based on analysis
-            'threadid': 'tid',
-            'parentpid': 'parent_pid',
-            'time_of_day': 'timestamp_str', # Corrected based on analysis
-            'operation': 'operation',
-            'path': 'path',
-            'result': 'result',
-            'detail': 'detail',
-            'duration': 'duration_float', # Will be converted later
-            'category': 'category',
-            'process_name': 'process_name', # Corrected based on analysis
-            'stack': 'stack_frames' # Will be handled separately
-        }
+        # Reconstruct the string with exactly 6 fractional digits
+        ts_str_corrected = f"{time_part}.{fractional_part}"
 
-        # Iterate through all direct children of the event element
-        for child in elem:
-            tag_name_orig = child.tag
-            tag_name_clean = cls._strip_namespace(tag_name_orig).lower()
-            tag_text = child.text.strip() if child.text else None
+        # Parse the corrected time string
+        parsed_time: dt_time = datetime.strptime(ts_str_corrected, PROCMON_TIMESTAMP_FORMAT).time()
 
-            # Check if it's a known tag we want to map
-            if tag_name_clean in tag_map:
-                attr_name = tag_map[tag_name_clean]
-                # Handle specific conversions or parsing
-                if attr_name == 'sequence_number':
-                    data[attr_name] = ProcessInfo._safe_text_to_int(tag_text)
-                    if tag_text is not None and data[attr_name] is None:
-                        logger.warning(f"Could not parse SequenceNumber '{tag_text}' for an event.")
-                elif attr_name in ['process_index', 'pid', 'tid', 'parent_pid']:
-                    data[attr_name] = ProcessInfo._safe_text_to_int(tag_text)
-                elif attr_name == 'timestamp_str':
-                    data[attr_name] = tag_text
-                    data['timestamp_float'] = cls._parse_timestamp_str(tag_text)
-                elif attr_name == 'duration_float':
-                    try:
-                        data[attr_name] = float(tag_text) if tag_text is not None else None
-                    except (ValueError, TypeError):
-                        logger.debug(f"Failed to convert duration '{tag_text}' to float for event seq {data.get('sequence_number', '<unknown>')}.")
-                        data[attr_name] = None
-                elif attr_name == 'stack_frames':
-                    if load_stack:
-                        data[attr_name] = []
-                        for frame_elem in child: # Iterate children of <stack>
-                            if cls._strip_namespace(frame_elem.tag) == 'frame':
-                                try:
-                                    data[attr_name].append(StackFrame.from_xml_element(frame_elem))
-                                except Exception as e:
-                                    logger.warning(f"Failed to parse a <frame> element for event seq {data.get('sequence_number', '<unknown>')}: {e}", exc_info=False)
-                        if not data[attr_name]: data[attr_name] = None
-                    else:
-                        data[attr_name] = None
-                else: # For simple string fields (operation, path, result, detail, category, process_name)
-                    data[attr_name] = tag_text
-            elif load_extra: # Capture unknown fields if requested
-                if tag_text is not None:
-                    extra_data_dict[tag_name_orig] = tag_text
-                    logger.debug(f"  [Event Parse Debug] Found extra field: '{tag_name_orig}' = '{tag_text[:50]}...'")
-
-
-        # Fallback: If ProcessName missing in event, try lookup via ProcessIndex
-        if data.get('process_name') is None and data.get('process_index') is not None:
-            logger.debug(f"  [Event Parse Debug] Event seq {data.get('sequence_number', '<unknown>')} missing Process_Name, attempting lookup via ProcessIndex {data['process_index']}...")
-            proc_info = processes.get(data['process_index'])
-            if proc_info:
-                data['process_name'] = proc_info.process_name # Assumes ProcessInfo has correct name
-                logger.debug(f"  [Event Parse Debug] Fallback successful, found ProcessName: '{data['process_name']}'")
-                # Also try to get ParentPID from process list if missing from event
-                if data.get('parent_pid') is None:
-                    data['parent_pid'] = proc_info.parent_pid
-            else:
-                 # Log if process index from event doesn't match any loaded process
-                 logger.warning(f"  [Event Parse Warning] Event seq {data.get('sequence_number', '<unknown>')} has ProcessIndex {data['process_index']} but process info not found in pre-loaded list.")
-
-        # Add the collected extra data if any and if requested
-        if load_extra and extra_data_dict:
-            data['extra_data'] = extra_data_dict
-
-        # Create the object using only the keys defined in the dataclass
-        # Filter data dict to only include keys that are actual fields in the dataclass
-        field_names = {f.name for f in dataclasses.fields(cls)}
-        filtered_data = {k: v for k, v in data.items() if k in field_names}
-
-        # logger.debug(f"  [Event Parse Final Data] Filtered data for object creation: {filtered_data}") # Removed verbose log
-        return cls(**filtered_data)
-
-    @staticmethod
-    def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
-        """
-        Parses HH:MM:SS.ffffff[f...] string to a UTC float timestamp relative to BASE_DATE.
-        Handles arbitrary digits in fractional seconds by truncating to 6.
-        """
-        if ts_str is None:
-            return None
-        try:
-            # Split into time and fractional seconds
-            parts = ts_str.split('.', 1)
-            time_part = parts[0]
-            fractional_part = ""
-            if len(parts) > 1:
-                fractional_part = parts[1]
-
-            # Truncate fractional part to 6 digits if longer
-            if len(fractional_part) > 6:
-                # logger.debug(f"Truncating timestamp fractional part: '{fractional_part}' -> '{fractional_part[:6]}'") # Reduced verbosity
-                fractional_part = fractional_part[:6]
-            elif len(fractional_part) < 6:
-                # Pad with zeros if shorter (less common but possible)
-                fractional_part = fractional_part.ljust(6, '0')
-
-            # Reconstruct the string with exactly 6 fractional digits
-            ts_str_corrected = f"{time_part}.{fractional_part}"
-
-            # Parse the corrected time string
-            parsed_time: dt_time = datetime.strptime(ts_str_corrected, PROCMON_TIMESTAMP_FORMAT).time()
-
-            # Combine with base date (which has UTC timezone set)
-            full_dt = datetime.combine(BASE_DATE.date(), parsed_time, tzinfo=timezone.utc)
-            # Return Unix timestamp float (seconds since epoch)
-            return full_dt.timestamp()
-        except (ValueError, TypeError, IndexError) as e:
-            # Log warning if timestamp string is invalid
-            # Use original ts_str in log message for clarity
-            logger.warning(f"Could not parse timestamp string '{ts_str}': {e}")
-            return None
+        # Combine with base date (which has UTC timezone set)
+        full_dt = datetime.combine(BASE_DATE.date(), parsed_time, tzinfo=timezone.utc)
+        # Return Unix timestamp float (seconds since epoch)
+        return full_dt.timestamp()
+    except (ValueError, TypeError, IndexError) as e:
+        # Log warning if timestamp string is invalid
+        # Use original ts_str in log message for clarity
+        logger.warning(f"Could not parse timestamp string '{ts_str}': {e}")
+        return None
 
 # --- Helper to format bytes ---
 def _format_bytes(bytes_val: int) -> str:
@@ -490,9 +329,7 @@ def _clear_elem(elem: ET_impl.Element):
             except (IndexError, AttributeError): # Handle potential errors during cleanup
                 break
 
-def _strip_namespace(tag):
-    """Helper to remove namespace from tag string if present."""
-    return tag.split('}', 1)[-1] if '}' in tag else tag
+# _strip_namespace is now a standalone function
 
 def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo]:
     """
@@ -574,7 +411,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Optimization logic uses raw_event attributes directly ---
+# --- UPDATED: Direct parsing into opt_event, simplified logic ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -584,7 +421,7 @@ def _parse_xml_stream_for_loading(
 ) -> Iterator[Dict[str, Any]]:
     """
     Internal helper optimized for initial loading into memory.
-    Parses <event> elements, converts them to optimized dictionaries using interners,
+    Parses <event> elements directly into optimized dictionaries using interners,
     and yields them. Assumes process list is already parsed and passed in `processes`.
     Reports progress based on event count.
     Uses start/end events for iterparse and handles potential XML namespaces.
@@ -627,92 +464,130 @@ def _parse_xml_stream_for_loading(
 
             elif parsing_stage == "parsing_events":
                 # *** REMOVED verbose logging of every tag ***
-                # logger.debug(f"  [Pass 2 Debug] Encountered tag: '{tag}' (Original: '{elem.tag}'), Event type: {event_type}")
 
                 if event_type == 'end': # Process elements only when they finish
                     if tag == 'event':
                         event_count += 1 # Increment count when <event> tag *ends*
-                        seq_num_text = ProcmonEvent._find_text_ignore_ns(elem, 'SequenceNumber') or f'event #{event_count}'
-                        # logger.debug(f"  [Pass 2 Debug] Found END of <event> tag #{event_count}. Attempting parse...") # Reduced verbosity
+                        opt_event: Dict[str, Any] = {} # Initialize dict for this event
+                        extra_data_dict: Dict[str, str] = {}
+                        stack_elem: Optional[ET_impl.Element] = None
+
                         try:
-                            # 1. Parse the raw event data using the dataclass (which now ignores namespaces)
-                            # logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for event #{event_count}...") # Reduced verbosity
-                            # Pass selective loading flags to parser
-                            raw_event = ProcmonEvent.from_xml_element(elem, processes, load_stack, load_extra)
-                            # Check if sequence number was parsed correctly for logging
-                            parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
-                            # *** REMOVED Check for missing SequenceNumber - Assume it might be missing ***
-                            # if parsed_seq is None:
-                            #     logger.warning(f"  [Pass 2 Warning] Skipping event ~{seq_num_text} due to missing SequenceNumber after parsing.")
-                            #     continue # Skip this event if sequence couldn't be parsed
+                            # --- Direct Parsing into opt_event ---
+                            # Parse known fields directly using correct XML tags
+                            seq_num_str = _find_text_ignore_ns(elem, 'SequenceNumber')
+                            opt_event['seq'] = ProcessInfo._safe_text_to_int(seq_num_str)
+                            if seq_num_str is not None and opt_event['seq'] is None:
+                                logger.warning(f"Could not parse SequenceNumber '{seq_num_str}' for event #{event_count}.")
 
-                            # logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for event #{event_count} (Sequence: {parsed_seq}). Optimizing...") # Reduced verbosity
+                            opt_event['pid'] = ProcessInfo._safe_text_to_int(_find_text_ignore_ns(elem, 'PID'))
+                            opt_event['tid'] = ProcessInfo._safe_text_to_int(_find_text_ignore_ns(elem, 'ThreadId'))
+                            opt_event['ppid'] = ProcessInfo._safe_text_to_int(_find_text_ignore_ns(elem, 'ParentPID')) # May be None
+                            opt_event['detail'] = _find_text_ignore_ns(elem, 'Detail') # Store directly
 
-                            # --- Optimization Logic ---
-                            opt_event: Dict[str, Any] = {}
-                            # Directly use attributes from the parsed raw_event object
-                            opt_event['seq'] = raw_event.sequence_number
-                            opt_event['pid'] = raw_event.pid
-                            opt_event['tid'] = raw_event.tid
-                            opt_event['ppid'] = raw_event.parent_pid
-                            opt_event['ts'] = raw_event.timestamp_float
-                            opt_event['dur'] = raw_event.duration_float
-                            opt_event['detail'] = raw_event.detail # Detail is not typically interned
+                            # Time and Duration
+                            ts_str = _find_text_ignore_ns(elem, 'Time_of_Day')
+                            opt_event['ts'] = _parse_timestamp_str(ts_str)
+                            duration_text = _find_text_ignore_ns(elem, 'Duration')
+                            try:
+                                opt_event['dur'] = float(duration_text) if duration_text is not None else None
+                            except (ValueError, TypeError):
+                                logger.debug(f"Failed to convert duration '{duration_text}' to float for event #{event_count}.")
+                                opt_event['dur'] = None
 
-                            # *** Use the parsed values from raw_event attributes for interning ***
-                            opt_event['pname_id'] = interners["process_name"].get_id(raw_event.process_name)
-                            opt_event['op_id'] = interners["operation"].get_id(raw_event.operation)
-                            opt_event['path_id'] = interners["path"].get_id(raw_event.path)
-                            opt_event['res_id'] = interners["result"].get_id(raw_event.result)
-                            opt_event['cat_id'] = interners["category"].get_id(raw_event.category)
+                            # Interned Strings
+                            process_name_str = _find_text_ignore_ns(elem, 'Process_Name')
+                            operation_str = _find_text_ignore_ns(elem, 'Operation')
+                            path_str = _find_text_ignore_ns(elem, 'Path')
+                            result_str = _find_text_ignore_ns(elem, 'Result')
+                            category_str = _find_text_ignore_ns(elem, 'Category')
 
-                            # *** ADDED: Store extra_data if loaded ***
-                            if load_extra and raw_event.extra_data:
-                                opt_event['extra_data'] = raw_event.extra_data # Store the dict directly
+                            # Process Name Fallback
+                            if process_name_str is None:
+                                process_index = ProcessInfo._safe_text_to_int(_find_text_ignore_ns(elem, 'ProcessIndex'))
+                                if process_index is not None:
+                                    proc_info = processes.get(process_index)
+                                    if proc_info:
+                                        process_name_str = proc_info.process_name
+                                        # Fill parent PID if missing in event
+                                        if opt_event.get('ppid') is None:
+                                            opt_event['ppid'] = proc_info.parent_pid
+                                    else:
+                                        logger.warning(f"Event #{event_count} has ProcessIndex {process_index} but process info not found.")
 
-                            # *** Store stack trace only if loaded ***
-                            if load_stack and raw_event.stack_frames:
-                                optimized_stack = []
-                                for frame in raw_event.stack_frames:
-                                    try:
-                                        optimized_stack.append(frame.to_optimized_list(
-                                            interners["stack_path"],
-                                            interners["stack_location"]
-                                        ))
-                                    except Exception as frame_e:
-                                         logger.warning(f"Failed to optimize stack frame for event seq {parsed_seq}: {frame_e}", exc_info=False)
-                                if optimized_stack:
-                                    opt_event['stack'] = optimized_stack
-                            # --- End Optimization ---
+                            # *** Debug: Print values before interning ***
+                            logger.debug(f"  [Optimize Debug #{event_count}] Values before interning - ProcessName: '{process_name_str}', Operation: '{operation_str}', Path: '{path_str}', Result: '{result_str}', Category: '{category_str}'")
 
-                            # logger.debug(f"  [Pass 2 Debug] Yielding optimized event for Sequence {parsed_seq}.") # Reduced verbosity
+                            # Perform interning and store IDs
+                            opt_event['pname_id'] = interners["process_name"].get_id(process_name_str)
+                            opt_event['op_id'] = interners["operation"].get_id(operation_str)
+                            opt_event['path_id'] = interners["path"].get_id(path_str)
+                            opt_event['res_id'] = interners["result"].get_id(result_str)
+                            opt_event['cat_id'] = interners["category"].get_id(category_str)
+
+                             # *** Debug: Print resulting IDs ***
+                            logger.debug(f"  [Optimize Debug #{event_count}] Interned IDs - pname_id: {opt_event['pname_id']}, op_id: {opt_event['op_id']}, path_id: {opt_event['path_id']}, res_id: {opt_event['res_id']}, cat_id: {opt_event['cat_id']}")
+
+
+                            # Handle Stack Trace (if requested)
+                            if load_stack:
+                                stack_elem = _find_child_ignore_ns(elem, 'stack') # Use standalone helper
+                                if stack_elem is not None:
+                                    optimized_stack = []
+                                    for frame_elem in stack_elem:
+                                        if _strip_namespace(frame_elem.tag) == 'frame':
+                                            try:
+                                                frame_obj = StackFrame.from_xml_element(frame_elem)
+                                                optimized_stack.append(frame_obj.to_optimized_list(
+                                                    interners["stack_path"],
+                                                    interners["stack_location"]
+                                                ))
+                                            except Exception as frame_e:
+                                                logger.warning(f"Failed to parse/optimize stack frame for event #{event_count}: {frame_e}", exc_info=False)
+                                    if optimized_stack:
+                                        opt_event['stack'] = optimized_stack
+
+                            # Handle Extra Data (if requested)
+                            if load_extra:
+                                known_event_tags = { # Use lowercase names matching tag_map keys + stack
+                                    'sequencenumber', 'processindex', 'pid', 'threadid', 'parentpid',
+                                    'time_of_day', 'operation', 'path', 'result', 'detail', 'duration',
+                                    'category', 'process_name', 'stack'
+                                }
+                                for child in elem:
+                                    tag_name_orig = child.tag
+                                    tag_name_clean = _strip_namespace(tag_name_orig).lower()
+                                    if tag_name_clean not in known_event_tags:
+                                        tag_text = child.text.strip() if child.text else None
+                                        if tag_text is not None:
+                                            extra_data_dict[tag_name_orig] = tag_text
+                                            logger.debug(f"  [Event Parse Debug] Found extra field: '{tag_name_orig}' = '{tag_text[:50]}...'")
+                                if extra_data_dict:
+                                    opt_event['extra_data'] = extra_data_dict
+
+                            # --- Yield optimized event ---
+                            # logger.debug(f"  [Pass 2 Debug] Yielding optimized event #{event_count}.") # Reduced verbosity
                             yield opt_event
                             yielded_count += 1 # Increment *after* successful yield
 
                             # --- Progress Reporting ---
                             current_time = time.time()
-                            # Report based on yielded_count
                             if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > 5.0:
                                 elapsed_total = current_time - start_time
                                 rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
-                                # Report yielded count
                                 logger.info(f"  [Pass 2] Yielded {yielded_count:,} events... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
                                 last_report_time = current_time
 
                         except Exception as e:
                             # Log error parsing this specific event but continue if possible
-                            # seq_num_text = ProcmonEvent._find_text_ignore_ns(elem, 'SequenceNumber') or f'event #{event_count}' # Already defined above
-                            logger.warning(f"  [Pass 2 Warning] Failed to parse/convert <event> element (Sequence ~{seq_num_text}): {e}", exc_info=False)
-                            # Log more details in debug mode
+                            logger.warning(f"  [Pass 2 Warning] Failed to parse/convert <event> element #{event_count}: {e}", exc_info=False)
                             if logger.isEnabledFor(logging.DEBUG):
                                 try:
-                                    # Try to log the raw XML snippet for the failed event
                                     event_xml_str = ET_impl.tostring(elem, encoding='unicode', method='xml')
-                                    logger.debug(f"  [Pass 2 Debug] XML for failed event ~{seq_num_text}:\n{event_xml_str[:1000]}...") # Log first 1000 chars
+                                    logger.debug(f"  [Pass 2 Debug] XML for failed event #{event_count}:\n{event_xml_str[:1000]}...")
                                 except Exception as log_e:
                                     logger.debug(f"  [Pass 2 Debug] Could not serialize failed event element to string: {log_e}")
-                                # Log full exception trace in debug mode
-                                logger.debug(f"  [Pass 2 Debug] Full exception details for event ~{seq_num_text}:", exc_info=True)
+                                logger.debug(f"  [Pass 2 Debug] Full exception details for event #{event_count}:", exc_info=True)
 
                         finally:
                              # logger.debug(f"  [Pass 2 Debug] Clearing element for event #{event_count}.") # Reduced verbosity
@@ -727,14 +602,8 @@ def _parse_xml_stream_for_loading(
                         _clear_elem(elem)
                         break # Stop iteration
                     else:
-                        # *** REMOVED Premature Clearing ***
-                        # If the tag wasn't 'event', 'eventlist', or 'procmon',
-                        # it's likely a child of 'event' (like 'PID', 'Path', 'stack', 'frame', etc.)
-                        # We MUST NOT clear it here, as the parent 'event' element needs it
-                        # when its 'end' event is processed. The clearing happens
-                        # in the finally block under "if tag == 'event'".
-                        # logger.debug(f"  [Pass 2 Debug] Ignoring end event for intermediate tag '{tag}'.") # Removed this too for less noise
-                        _clear_elem(elem) # Clear other intermediate tags to save memory
+                        # Clear other intermediate tags to save memory
+                        _clear_elem(elem)
 
 
         elapsed = time.time() - start_time
