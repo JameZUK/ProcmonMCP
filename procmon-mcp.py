@@ -133,11 +133,18 @@ class StackFrame:
     @classmethod
     def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
          """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
+         # Try finding directly first (might work for simple cases or no namespaces)
+         child = elem.find(tag_name)
+         if child is not None and child.text:
+             return child.text.strip()
+
+         # Fallback: Iterate through all children and check tag manually (ignoring namespace)
          for child in elem:
-            # Check tag name ignoring namespace
-            if cls._strip_namespace(child.tag) == tag_name:
+            # Compare the part after '}' if namespace is present, otherwise the whole tag
+            local_tag = cls._strip_namespace(child.tag)
+            if local_tag == tag_name:
                 return child.text.strip() if child.text else None
-         return None
+         return None # Not found
 
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element) -> 'StackFrame':
@@ -202,10 +209,16 @@ class ProcessInfo:
     @classmethod
     def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
          """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
+         # Try finding directly first (might work for simple cases or no namespaces)
+         child = elem.find(tag_name)
+         if child is not None and child.text:
+             return child.text.strip()
+         # Fallback: Iterate through all children and check tag manually (ignoring namespace)
          for child in elem:
-            if cls._strip_namespace(child.tag) == tag_name:
+            local_tag = cls._strip_namespace(child.tag)
+            if local_tag == tag_name:
                 return child.text.strip() if child.text else None
-         return None
+         return None # Not found
 
     @staticmethod
     def _safe_text_to_int(text: Optional[str]) -> Optional[int]:
@@ -296,8 +309,16 @@ class ProcmonEvent:
     @classmethod
     def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
          """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
-         child = cls._find_child_ignore_ns(elem, tag_name)
-         return child.text.strip() if child is not None and child.text else None
+         # Try finding directly first (might work for simple cases or no namespaces)
+         child = elem.find(tag_name)
+         if child is not None and child.text:
+             return child.text.strip()
+         # Fallback: Iterate through all children and check tag manually (ignoring namespace)
+         for child in elem:
+            local_tag = cls._strip_namespace(child.tag)
+            if local_tag == tag_name:
+                return child.text.strip() if child.text else None
+         return None # Not found
 
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo], load_stack: bool, load_extra: bool) -> 'ProcmonEvent':
@@ -377,14 +398,17 @@ class ProcmonEvent:
 
         # Fallback: If ProcessName missing in event, try lookup via ProcessIndex
         if data.get('process_name') is None and data.get('process_index') is not None:
+            logger.debug(f"  [Event Parse Debug] Event seq {data.get('sequence_number', '<unknown>')} missing Process_Name, attempting lookup via ProcessIndex {data['process_index']}...")
             proc_info = processes.get(data['process_index'])
             if proc_info:
                 data['process_name'] = proc_info.process_name # Assumes ProcessInfo has correct name
+                logger.debug(f"  [Event Parse Debug] Fallback successful, found ProcessName: '{data['process_name']}'")
                 # Also try to get ParentPID from process list if missing from event
                 if data.get('parent_pid') is None:
                     data['parent_pid'] = proc_info.parent_pid
             else:
-                 logger.debug(f"Event seq {data.get('sequence_number', '<unknown>')} has ProcessIndex {data['process_index']} but not found in process list.")
+                 # Log if process index from event doesn't match any loaded process
+                 logger.warning(f"  [Event Parse Warning] Event seq {data.get('sequence_number', '<unknown>')} has ProcessIndex {data['process_index']} but process info not found in pre-loaded list.")
 
         # Add the collected extra data if any and if requested
         if load_extra and extra_data_dict:
@@ -543,7 +567,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Reduced logging verbosity ---
+# --- UPDATED: Corrected keys used for interning and indexing ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -620,12 +644,14 @@ def _parse_xml_stream_for_loading(
                             # --- Optimization Logic ---
                             opt_event: Dict[str, Any] = {}
                             opt_event['seq'] = raw_event.sequence_number # Will be None if tag was missing/unparsable
-                            opt_event['pid'] = raw_event.pid
+                            opt_event['pid'] = raw_event.pid # Use the parsed pid
                             opt_event['tid'] = raw_event.tid
                             opt_event['ppid'] = raw_event.parent_pid
                             opt_event['ts'] = raw_event.timestamp_float
                             opt_event['dur'] = raw_event.duration_float
-                            opt_event['detail'] = raw_event.detail
+                            opt_event['detail'] = raw_event.detail # Detail is not typically interned
+
+                            # *** Use the parsed values for interning ***
                             opt_event['pname_id'] = interners["process_name"].get_id(raw_event.process_name)
                             opt_event['op_id'] = interners["operation"].get_id(raw_event.operation)
                             opt_event['path_id'] = interners["path"].get_id(raw_event.path)
@@ -727,7 +753,7 @@ LOADED_EVENTS: Optional[List[Dict[str, Any]]] = None
 # Store String Interning Maps globally
 GLOBAL_INTERNERS: Dict[str, StringInterner] = {}
 # *** ADDED: Indices for faster querying ***
-PID_INDEX: Dict[int, List[int]] = defaultdict(list) # {pid_id: [event_idx, event_idx,...]}
+PID_INDEX: Dict[int, List[int]] = defaultdict(list) # {pname_id: [event_idx, event_idx,...]}
 OP_INDEX: Dict[int, List[int]] = defaultdict(list) # {op_id: [event_idx, event_idx,...]}
 # *** ADDED: Selective loading flags (will be set by args) ***
 LOAD_STACK_TRACES: bool = True
@@ -891,12 +917,13 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
                     consumed_count += 1
 
                     # --- Build Indices ---
-                    pid_id = opt_event.get('pname_id')
-                    op_id = opt_event.get('op_id')
-                    if pid_id is not None:
-                        PID_INDEX[pid_id].append(idx) # Store event index (idx)
+                    # *** Use the correct key 'pname_id' for PID index ***
+                    pname_id = opt_event.get('pname_id') # Get the process name ID
+                    op_id = opt_event.get('op_id')      # Get the operation ID
+                    if pname_id is not None:
+                        PID_INDEX[pname_id].append(idx) # Use pname_id as the key for the PID_INDEX
                     if op_id is not None:
-                        OP_INDEX[op_id].append(idx) # Store event index (idx)
+                        OP_INDEX[op_id].append(idx) # Use op_id as the key for OP_INDEX
                     # --- End Indexing ---
 
                     # Log progress less frequently during consumption
