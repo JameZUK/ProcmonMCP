@@ -274,7 +274,7 @@ class ProcessInfo:
 @dataclasses.dataclass
 class ProcmonEvent:
     """Represents data parsed from a single <event> element before optimization."""
-    # Known fields
+    # Known fields (using consistent attribute names)
     sequence_number: Optional[int] = None # Might be absent in some XML exports
     process_index: Optional[int] = None # Used to link to ProcessInfo if needed
     pid: Optional[int] = None
@@ -301,23 +301,28 @@ class ProcmonEvent:
     @classmethod
     def _find_child_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[ET_impl.Element]:
         """Finds the first direct child element with the given tag name, ignoring namespaces."""
-        for child in elem:
-            if cls._strip_namespace(child.tag) == tag_name:
-                return child
+        # Try finding directly first
+        child = elem.find(tag_name)
+        if child is not None:
+            return child
+        # Fallback: Iterate through all children and check tag manually
+        for child_elem in elem:
+            if cls._strip_namespace(child_elem.tag) == tag_name:
+                return child_elem
         return None
 
     @classmethod
     def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
          """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
-         # Try finding directly first (might work for simple cases or no namespaces)
+         # Try finding directly first
          child = elem.find(tag_name)
          if child is not None and child.text:
              return child.text.strip()
-         # Fallback: Iterate through all children and check tag manually (ignoring namespace)
-         for child in elem:
-            local_tag = cls._strip_namespace(child.tag)
+         # Fallback: Iterate through all children and check tag manually
+         for child_elem in elem:
+            local_tag = cls._strip_namespace(child_elem.tag)
             if local_tag == tag_name:
-                return child.text.strip() if child.text else None
+                return child_elem.text.strip() if child_elem.text else None
          return None # Not found
 
     @classmethod
@@ -325,76 +330,72 @@ class ProcmonEvent:
         """
         Parses an <event> XML element into a ProcmonEvent object, ignoring namespaces
         and optionally capturing extra fields and stack traces based on flags.
+        Uses explicit mapping from known XML tags to standardized dataclass fields.
         """
         data = {}
         extra_data_dict = {}
-        # Define known tags we handle explicitly (lowercase for case-insensitive comparison)
-        known_tags = {
-            'sequencenumber', 'processindex', 'pid', 'threadid', 'parentpid',
-            'time_of_day', 'operation', 'path', 'result', 'detail', 'duration',
-            'category', 'process_name', 'stack'
+        # Map expected XML tags (lowercase) to dataclass attribute names
+        tag_map = {
+            'sequencenumber': 'sequence_number',
+            'processindex': 'process_index',
+            'pid': 'pid', # Corrected based on analysis
+            'threadid': 'tid',
+            'parentpid': 'parent_pid',
+            'time_of_day': 'timestamp_str', # Corrected based on analysis
+            'operation': 'operation',
+            'path': 'path',
+            'result': 'result',
+            'detail': 'detail',
+            'duration': 'duration_float', # Will be converted later
+            'category': 'category',
+            'process_name': 'process_name', # Corrected based on analysis
+            'stack': 'stack_frames' # Will be handled separately
         }
 
         # Iterate through all direct children of the event element
         for child in elem:
             tag_name_orig = child.tag
-            tag_name_clean = cls._strip_namespace(tag_name_orig).lower() # Use lowercase for matching known tags
+            tag_name_clean = cls._strip_namespace(tag_name_orig).lower()
             tag_text = child.text.strip() if child.text else None
 
-            # Store known fields in the main data dict
-            if tag_name_clean == 'sequencenumber':
-                data['sequence_number'] = ProcessInfo._safe_text_to_int(tag_text)
-                if tag_text is not None and data['sequence_number'] is None:
-                    logger.warning(f"Could not parse SequenceNumber '{tag_text}' for an event.")
-            elif tag_name_clean == 'processindex':
-                data['process_index'] = ProcessInfo._safe_text_to_int(tag_text)
-            elif tag_name_clean == 'pid': # Use PID based on prior analysis
-                data['pid'] = ProcessInfo._safe_text_to_int(tag_text)
-            elif tag_name_clean == 'threadid':
-                data['tid'] = ProcessInfo._safe_text_to_int(tag_text)
-            elif tag_name_clean == 'parentpid':
-                data['parent_pid'] = ProcessInfo._safe_text_to_int(tag_text)
-            elif tag_name_clean == 'time_of_day': # Use Time_of_Day based on prior analysis
-                data['timestamp_str'] = tag_text
-                data['timestamp_float'] = cls._parse_timestamp_str(tag_text)
-            elif tag_name_clean == 'operation':
-                data['operation'] = tag_text
-            elif tag_name_clean == 'path':
-                data['path'] = tag_text
-            elif tag_name_clean == 'result':
-                data['result'] = tag_text
-            elif tag_name_clean == 'detail':
-                data['detail'] = tag_text
-            elif tag_name_clean == 'duration':
-                 try:
-                    data['duration_float'] = float(tag_text) if tag_text is not None else None
-                 except (ValueError, TypeError):
-                    logger.debug(f"Failed to convert duration '{tag_text}' to float for event seq {data.get('sequence_number', '<unknown>')}.")
-                    data['duration_float'] = None
-            elif tag_name_clean == 'category':
-                data['category'] = tag_text
-            elif tag_name_clean == 'process_name': # Use Process_Name based on prior analysis
-                data['process_name'] = tag_text
-            elif tag_name_clean == 'stack':
-                # Parse Stack only if requested
-                if load_stack:
-                    data['stack_frames'] = []
-                    for frame_elem in child: # Iterate children of <stack>
-                        if cls._strip_namespace(frame_elem.tag) == 'frame':
-                            try:
-                                data['stack_frames'].append(StackFrame.from_xml_element(frame_elem))
-                            except Exception as e:
-                                logger.warning(f"Failed to parse a <frame> element for event seq {data.get('sequence_number', '<unknown>')}: {e}", exc_info=False)
-                    if not data['stack_frames']: # Set to None if list is empty
-                        data['stack_frames'] = None
-                else:
-                    data['stack_frames'] = None # Explicitly set to None if not loading
-            elif load_extra: # Check if we should load extra data
-                # Store unknown tags and their text content
-                if tag_text is not None: # Only store if there's text
-                    # Use the original tag name (with namespace if present) as the key
+            # Check if it's a known tag we want to map
+            if tag_name_clean in tag_map:
+                attr_name = tag_map[tag_name_clean]
+                # Handle specific conversions or parsing
+                if attr_name == 'sequence_number':
+                    data[attr_name] = ProcessInfo._safe_text_to_int(tag_text)
+                    if tag_text is not None and data[attr_name] is None:
+                        logger.warning(f"Could not parse SequenceNumber '{tag_text}' for an event.")
+                elif attr_name in ['process_index', 'pid', 'tid', 'parent_pid']:
+                    data[attr_name] = ProcessInfo._safe_text_to_int(tag_text)
+                elif attr_name == 'timestamp_str':
+                    data[attr_name] = tag_text
+                    data['timestamp_float'] = cls._parse_timestamp_str(tag_text)
+                elif attr_name == 'duration_float':
+                    try:
+                        data[attr_name] = float(tag_text) if tag_text is not None else None
+                    except (ValueError, TypeError):
+                        logger.debug(f"Failed to convert duration '{tag_text}' to float for event seq {data.get('sequence_number', '<unknown>')}.")
+                        data[attr_name] = None
+                elif attr_name == 'stack_frames':
+                    if load_stack:
+                        data[attr_name] = []
+                        for frame_elem in child: # Iterate children of <stack>
+                            if cls._strip_namespace(frame_elem.tag) == 'frame':
+                                try:
+                                    data[attr_name].append(StackFrame.from_xml_element(frame_elem))
+                                except Exception as e:
+                                    logger.warning(f"Failed to parse a <frame> element for event seq {data.get('sequence_number', '<unknown>')}: {e}", exc_info=False)
+                        if not data[attr_name]: data[attr_name] = None
+                    else:
+                        data[attr_name] = None
+                else: # For simple string fields (operation, path, result, detail, category, process_name)
+                    data[attr_name] = tag_text
+            elif load_extra: # Capture unknown fields if requested
+                if tag_text is not None:
                     extra_data_dict[tag_name_orig] = tag_text
-                    # logger.debug(f"  [Event Parse Debug] Found extra field: '{tag_name_orig}' = '{tag_text[:50]}...'") # Removed verbose log
+                    logger.debug(f"  [Event Parse Debug] Found extra field: '{tag_name_orig}' = '{tag_text[:50]}...'")
+
 
         # Fallback: If ProcessName missing in event, try lookup via ProcessIndex
         if data.get('process_name') is None and data.get('process_index') is not None:
@@ -414,8 +415,13 @@ class ProcmonEvent:
         if load_extra and extra_data_dict:
             data['extra_data'] = extra_data_dict
 
-        # logger.debug(f"  [Event Parse Final Data] Data dict before creating object: {data}") # Removed verbose log
-        return cls(**data)
+        # Create the object using only the keys defined in the dataclass
+        # Filter data dict to only include keys that are actual fields in the dataclass
+        field_names = {f.name for f in dataclasses.fields(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in field_names}
+
+        # logger.debug(f"  [Event Parse Final Data] Filtered data for object creation: {filtered_data}") # Removed verbose log
+        return cls(**filtered_data)
 
     @staticmethod
     def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
@@ -568,7 +574,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Corrected keys used for interning and indexing ---
+# --- UPDATED: Optimization logic uses raw_event attributes directly ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -631,7 +637,7 @@ def _parse_xml_stream_for_loading(
                         try:
                             # 1. Parse the raw event data using the dataclass (which now ignores namespaces)
                             # logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for event #{event_count}...") # Reduced verbosity
-                            # Pass selective loading flags to the parser
+                            # Pass selective loading flags to parser
                             raw_event = ProcmonEvent.from_xml_element(elem, processes, load_stack, load_extra)
                             # Check if sequence number was parsed correctly for logging
                             parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
@@ -644,15 +650,16 @@ def _parse_xml_stream_for_loading(
 
                             # --- Optimization Logic ---
                             opt_event: Dict[str, Any] = {}
-                            opt_event['seq'] = raw_event.sequence_number # Will be None if tag was missing/unparsable
-                            opt_event['pid'] = raw_event.pid # Use the parsed pid
+                            # Directly use attributes from the parsed raw_event object
+                            opt_event['seq'] = raw_event.sequence_number
+                            opt_event['pid'] = raw_event.pid
                             opt_event['tid'] = raw_event.tid
                             opt_event['ppid'] = raw_event.parent_pid
                             opt_event['ts'] = raw_event.timestamp_float
                             opt_event['dur'] = raw_event.duration_float
                             opt_event['detail'] = raw_event.detail # Detail is not typically interned
 
-                            # *** Use the parsed values for interning ***
+                            # *** Use the parsed values from raw_event attributes for interning ***
                             opt_event['pname_id'] = interners["process_name"].get_id(raw_event.process_name)
                             opt_event['op_id'] = interners["operation"].get_id(raw_event.operation)
                             opt_event['path_id'] = interners["path"].get_id(raw_event.path)
