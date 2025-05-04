@@ -446,13 +446,6 @@ def _parse_xml_stream_for_loading(
                 if event_type == 'start' and tag == 'event':
                     event_count += 1
                     # --- REMOVED: Verbose raw XML logging ---
-                    # if logger.isEnabledFor(logging.DEBUG):
-                    #     try:
-                    #         event_xml_str_debug = ET_impl.tostring(elem, encoding='unicode', method='xml')
-                    #         logger.debug(f"--- Processing Event #{event_count} (START) ---")
-                    #         logger.debug(f"Raw XML:\n{event_xml_str_debug[:1000]}...") # Log first 1000 chars
-                    #     except Exception as log_e_debug:
-                    #         logger.debug(f"Could not serialize event #{event_count} for debug logging: {log_e_debug}")
 
                     current_event_data = {} # Initialize temporary storage
                     # --- START FIX: Reset frame XML string list ---
@@ -499,8 +492,6 @@ def _parse_xml_stream_for_loading(
                                 try:
                                     current_stack_xml_string = ET_impl.tostring(stack_elem, encoding='unicode')
                                     # REMOVED: Verbose stack XML logging
-                                    # if logger.isEnabledFor(logging.DEBUG):
-                                    #     logger.debug(f"Stored stack XML string for event #{event_count}")
                                 except Exception as stack_log_e:
                                      logger.warning(f"Could not serialize stack element for event #{event_count}: {stack_log_e}")
                         # --- END FIX ---
@@ -534,9 +525,7 @@ def _parse_xml_stream_for_loading(
                      try:
                          frame_xml_string = ET_impl.tostring(elem, encoding='unicode')
                          current_frame_xml_strings.append(frame_xml_string)
-                         # Optional: Log stored frame XML in debug
-                         # if logger.isEnabledFor(logging.DEBUG):
-                         #    logger.debug(f"Stored frame XML for event #{event_count}: {frame_xml_string[:200]}...")
+                         # REMOVED: Verbose frame XML logging
                      except Exception as frame_log_e:
                          logger.warning(f"Could not serialize frame element for event #{event_count}: {frame_log_e}")
                 # --- END FIX ---
@@ -599,8 +588,9 @@ def _parse_xml_stream_for_loading(
                                         ))
                                     except Exception as frame_e:
                                         logger.warning(f"Failed to parse/optimize stored stack frame XML for event #{event_count}: {frame_e}", exc_info=False)
-                                        if logger.isEnabledFor(logging.DEBUG):
-                                            logger.debug(f"  Frame XML causing error: {frame_xml[:500]}...") # Log problematic XML
+                                        # REMOVED: Verbose frame XML logging on error
+                                        # if logger.isEnabledFor(logging.DEBUG):
+                                        #     logger.debug(f"  Frame XML causing error: {frame_xml[:500]}...") # Log problematic XML
                                 if optimized_stack:
                                     opt_event['stack'] = optimized_stack
                             # --- END FIX ---
@@ -632,13 +622,15 @@ def _parse_xml_stream_for_loading(
                             # Log skip reason if parsing failed
                             skipped_count += 1
                             logger.warning(f"Skipping event #{event_count}: {skip_reason.strip()}")
-                            # Optionally log raw XML if debug not enabled (already logged at start)
-                            if not logger.isEnabledFor(logging.DEBUG):
+                            # --- START FIX: Only log skipped XML if DEBUG is enabled ---
+                            if logger.isEnabledFor(logging.DEBUG):
                                 try:
+                                    # Attempt to serialize again here for debug purposes if skipping
                                     event_xml_str = ET_impl.tostring(elem, encoding='unicode', method='xml')
-                                    logger.warning(f"  Skipped Event XML:\n{event_xml_str[:1500]}...")
+                                    logger.debug(f"  Skipped Event XML:\n{event_xml_str[:1500]}...") # Log first 1500 chars
                                 except Exception as log_e:
-                                    logger.warning(f"  Could not serialize skipped event #{event_count} to string: {log_e}")
+                                    logger.debug(f"  Could not serialize skipped event #{event_count} to string: {log_e}")
+                            # --- END FIX ---
 
                     # Reset temporary storage regardless of success
                     current_event_data = None
