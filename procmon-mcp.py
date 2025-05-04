@@ -176,9 +176,11 @@ class ProcessInfo:
     @staticmethod
     def _safe_find_text(elem: ET_impl.Element, tag: str) -> Optional[str]:
         """Safely finds text content of a child tag, returning None if missing or empty."""
-        child = elem.find(tag)
-        # Use .strip() to remove leading/trailing whitespace which might affect lookups
-        return child.text.strip() if child is not None and child.text else None
+        # Iterate through direct children, ignoring namespaces
+        for child in elem:
+            if child.tag.split('}', 1)[-1] == tag:
+                return child.text.strip() if child.text else None
+        return None
 
     @staticmethod
     def _safe_text_to_int(text: Optional[str]) -> Optional[int]:
@@ -250,29 +252,48 @@ class ProcmonEvent:
     process_name: Optional[str] = None # Usually present, fallback to lookup via ProcessIndex if needed
     stack_frames: Optional[List[StackFrame]] = None # Parsed stack frames
 
+    @staticmethod
+    def _strip_namespace(tag):
+        """Helper to remove namespace from tag string if present."""
+        return tag.split('}', 1)[-1] if '}' in tag else tag
+
+    @classmethod
+    def _find_child_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[ET_impl.Element]:
+        """Finds the first direct child element with the given tag name, ignoring namespaces."""
+        for child in elem:
+            if cls._strip_namespace(child.tag) == tag_name:
+                return child
+        return None
+
+    @classmethod
+    def _find_text_ignore_ns(cls, elem: ET_impl.Element, tag_name: str) -> Optional[str]:
+         """Finds the text of the first direct child element with the given tag name, ignoring namespaces."""
+         child = cls._find_child_ignore_ns(elem, tag_name)
+         return child.text.strip() if child is not None and child.text else None
+
     @classmethod
     def from_xml_element(cls, elem: ET_impl.Element, processes: Dict[int, ProcessInfo]) -> 'ProcmonEvent':
-        """Parses an <event> XML element into a ProcmonEvent object."""
+        """Parses an <event> XML element into a ProcmonEvent object, ignoring namespaces."""
         data = {}
-        # Use the static helper methods defined in ProcessInfo for consistency
-        data['sequence_number'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'SequenceNumber'))
-        data['process_index'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'ProcessIndex'))
-        data['pid'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'ProcessId'))
-        data['tid'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'ThreadId'))
+        # Use the static helper methods defined in ProcessInfo for consistency, but use the NS-ignoring find text
+        data['sequence_number'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'SequenceNumber'))
+        data['process_index'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessIndex'))
+        data['pid'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ProcessId'))
+        data['tid'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ThreadId'))
         # ParentPID might not be directly in the event element in XML
-        data['parent_pid'] = ProcessInfo._safe_text_to_int(cls._safe_find_text(elem, 'ParentPID')) # Try parsing if present
+        data['parent_pid'] = ProcessInfo._safe_text_to_int(cls._find_text_ignore_ns(elem, 'ParentPID')) # Try parsing if present
 
-        data['timestamp_str'] = cls._safe_find_text(elem, 'Time_of_Day')
+        data['timestamp_str'] = cls._find_text_ignore_ns(elem, 'Time_of_Day')
         data['timestamp_float'] = cls._parse_timestamp_str(data['timestamp_str'])
 
-        data['operation'] = cls._safe_find_text(elem, 'Operation')
-        data['path'] = cls._safe_find_text(elem, 'Path')
-        data['result'] = cls._safe_find_text(elem, 'Result') # Keep as string (can be SUCCESS, ACCESS DENIED, 0x...)
-        data['detail'] = cls._safe_find_text(elem, 'Detail')
-        data['category'] = cls._safe_find_text(elem, 'Category')
+        data['operation'] = cls._find_text_ignore_ns(elem, 'Operation')
+        data['path'] = cls._find_text_ignore_ns(elem, 'Path')
+        data['result'] = cls._find_text_ignore_ns(elem, 'Result') # Keep as string (can be SUCCESS, ACCESS DENIED, 0x...)
+        data['detail'] = cls._find_text_ignore_ns(elem, 'Detail')
+        data['category'] = cls._find_text_ignore_ns(elem, 'Category')
 
         # Duration might be missing or 0
-        duration_text = cls._safe_find_text(elem, 'Duration')
+        duration_text = cls._find_text_ignore_ns(elem, 'Duration')
         try:
             # Convert duration string (which might be float) to float
             data['duration_float'] = float(duration_text) if duration_text is not None else None
@@ -282,7 +303,7 @@ class ProcmonEvent:
             data['duration_float'] = None
 
         # Get ProcessName directly from event if possible
-        data['process_name'] = cls._safe_find_text(elem, 'ProcessName')
+        data['process_name'] = cls._find_text_ignore_ns(elem, 'ProcessName')
 
         # Fallback: If ProcessName missing in event, try lookup via ProcessIndex
         if data['process_name'] is None and data['process_index'] is not None:
@@ -296,27 +317,28 @@ class ProcmonEvent:
                  # Log if process index from event doesn't match any loaded process
                  logger.debug(f"Event seq {data['sequence_number']} has ProcessIndex {data['process_index']} but not found in process list.")
 
-        # Parse Stack
-        stack_elem = elem.find('Stack')
+        # Parse Stack, ignoring namespaces for Stack and frame tags
+        stack_elem = cls._find_child_ignore_ns(elem, 'Stack')
         if stack_elem is not None:
             data['stack_frames'] = []
             # Iterate through child 'frame' elements
-            for frame_elem in stack_elem.findall('frame'):
-                try:
-                    data['stack_frames'].append(StackFrame.from_xml_element(frame_elem))
-                except Exception as e:
-                    # Log warning if a specific frame fails to parse
-                    logger.warning(f"Failed to parse a <frame> element for event seq {data['sequence_number']}: {e}", exc_info=False)
+            for frame_elem in stack_elem:
+                if cls._strip_namespace(frame_elem.tag) == 'frame':
+                    try:
+                        # StackFrame parsing already uses findtext which might handle namespaces depending on impl,
+                        # but let's assume it needs updating if findtext doesn't ignore NS.
+                        # For now, assuming StackFrame.from_xml_element works or needs similar NS handling internally.
+                        # If StackFrame parsing fails, it might need its own _find_text_ignore_ns.
+                        data['stack_frames'].append(StackFrame.from_xml_element(frame_elem))
+                    except Exception as e:
+                        # Log warning if a specific frame fails to parse
+                        logger.warning(f"Failed to parse a <frame> element for event seq {data['sequence_number']}: {e}", exc_info=False)
         else:
             data['stack_frames'] = None # No <Stack> element found
 
         return cls(**data)
 
-    @staticmethod
-    def _safe_find_text(elem: ET_impl.Element, tag: str) -> Optional[str]:
-        """Static helper to safely find text content of a child tag."""
-        child = elem.find(tag)
-        return child.text.strip() if child is not None and child.text else None
+    # _safe_find_text is removed as we use _find_text_ignore_ns now
 
     @staticmethod
     def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
@@ -362,15 +384,20 @@ def _clear_elem(elem: ET_impl.Element):
             except (IndexError, AttributeError): # Handle potential errors during cleanup
                 break
 
+def _strip_namespace(tag):
+    """Helper to remove namespace from tag string if present."""
+    return tag.split('}', 1)[-1] if '}' in tag else tag
+
 def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo]:
     """
     Parses only the <processlist> from the XML stream and returns the process dictionary
     keyed by ProcessIndex. Stops parsing after the </processlist> tag.
-    Reports progress based on element count.
+    Reports progress based on element count. Ignores namespaces.
     """
     processes_dict: Dict[int, ProcessInfo] = {}
     parsing_stage = "seeking_procmon"
-    # Only need process tags for this pass
+    # We still filter by tag here for efficiency, assuming these top-level tags don't have namespaces
+    # or that the namespace handling happens within from_xml_element if needed.
     tags_of_interest = ('process', 'processlist', 'procmon')
     start_time = time.time()
     process_element_count = 0
@@ -385,67 +412,63 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
 
     try:
         for event_type, elem in context:
+            # Strip namespace for reliable comparison
+            tag = _strip_namespace(elem.tag)
+
             if parsing_stage == "seeking_procmon":
-                # If we hit procmon end tag first, something is wrong or empty file
-                if elem.tag == 'procmon':
+                if tag == 'procmon':
                     logger.warning("Found end of procmon before processlist.")
                     break
-                # Assume we are inside procmon if we get process or processlist
                 parsing_stage = "seeking_processlist"
 
             if parsing_stage == "seeking_processlist":
-                if elem.tag == 'process':
-                    # Found the first process, start parsing the list
+                if tag == 'process':
                     parsing_stage = "parsing_processlist"
-                    # Fallthrough to parse this element
-                elif elem.tag == 'processlist':
-                    # Found end of processlist while seeking it? Means it was empty.
+                    # Fallthrough
+                elif tag == 'processlist':
                     logger.info("Found empty <processlist>.")
                     _clear_elem(elem)
-                    break # Stop parsing processes
+                    break
 
             if parsing_stage == "parsing_processlist":
-                if elem.tag == 'process':
+                if tag == 'process':
                     process_element_count += 1
                     try:
+                        # ProcessInfo.from_xml_element needs to handle namespaces internally now
                         proc_info = ProcessInfo.from_xml_element(elem)
-                        # Key by ProcessIndex for potential lookup during event parsing
                         if proc_info.process_index is not None and proc_info.process_index >= 0:
                             processes_dict[proc_info.process_index] = proc_info
                         else:
                             logger.warning(f"Parsed process element missing or invalid ProcessIndex.")
                     except Exception as e:
-                        logger.warning(f"Failed to parse <process> element: {e}", exc_info=False) # Keep log concise
+                        logger.warning(f"Failed to parse <process> element: {e}", exc_info=False)
                     _clear_elem(elem)
-                    # --- Add minor progress for process list ---
-                    if process_element_count % 500 == 0: # Report every 500 processes
+                    if process_element_count % 500 == 0:
                         elapsed = time.time() - start_time
                         logger.info(f"  [Pass 1] Parsed {process_element_count:,} process elements... ({elapsed:.1f}s)")
 
-                elif elem.tag == 'processlist':
-                    # Finished parsing the process list normally
+                elif tag == 'processlist':
                     logger.debug(f"Finished parsing <processlist> tag.")
                     _clear_elem(elem)
-                    break # Stop parsing after processlist is done
+                    break
 
-            # Stop if we somehow reach the end of the document early
-            if elem.tag == 'procmon':
+            if tag == 'procmon':
                 logger.warning("Reached end of <procmon> while parsing processes.")
                 break
 
     except ET_impl.XMLSyntaxError as e:
         logger.error(f"XML Parse Error during process parsing: {e}")
-        raise # Re-raise to indicate critical failure
+        raise
     except Exception as e:
         logger.error(f"Unexpected error during process parsing: {e}", exc_info=True)
-        raise # Re-raise
+        raise
 
     elapsed = time.time() - start_time
     logger.info(f"Finished Pass 1: Found {len(processes_dict)} unique processes from {process_element_count:,} elements ({elapsed:.2f}s).")
     return processes_dict
 
 
-# --- UPDATED: Use start/end events in iterparse ---
+# --- UPDATED: Handle potential namespaces in event parsing ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -456,14 +479,14 @@ def _parse_xml_stream_for_loading(
     Parses <event> elements, converts them to optimized dictionaries using interners,
     and yields them. Assumes process list is already parsed and passed in `processes`.
     Reports progress based on event count. Includes enhanced debug logging.
-    Uses start/end events for iterparse.
+    Uses start/end events for iterparse and handles potential XML namespaces.
 
     Yields:
         Optimized event dictionaries.
     """
     parsing_stage = "seeking_eventlist" # Start assuming processes are done
     try:
-        # *** Use start AND end events, without tag filter ***
+        # Use start AND end events, without tag filter to handle namespaces/unexpected tags
         context = ET_impl.iterparse(source_stream, events=('start', 'end'))
         logger.info("Starting Pass 2: Parsing and optimizing events...")
     except Exception as e:
@@ -476,13 +499,16 @@ def _parse_xml_stream_for_loading(
     last_report_time = start_time
     try:
         for event_type, elem in context:
+            # Strip namespace for reliable comparison
+            tag = _strip_namespace(elem.tag)
+
             # --- State Machine based on Start/End Events ---
             if parsing_stage == "seeking_eventlist":
-                if event_type == 'start' and elem.tag == 'eventlist':
+                if event_type == 'start' and tag == 'eventlist':
                     logger.debug("Entered <eventlist> (start event).")
                     parsing_stage = "parsing_events"
                     # Don't clear yet, wait for end tag
-                elif event_type == 'end' and elem.tag == 'procmon': # Reached end before finding eventlist
+                elif event_type == 'end' and tag == 'procmon': # Reached end before finding eventlist
                     logger.warning("Reached end of <procmon> before finding <eventlist>.")
                     break
                 # Ignore other tags before eventlist starts, clear them on end event
@@ -492,22 +518,23 @@ def _parse_xml_stream_for_loading(
 
             elif parsing_stage == "parsing_events":
                 # Log every tag encountered within the eventlist stage for debugging
-                logger.debug(f"  [Pass 2 Debug] Encountered tag: '{elem.tag}', Event type: {event_type}")
+                logger.debug(f"  [Pass 2 Debug] Encountered tag: '{tag}' (Original: '{elem.tag}'), Event type: {event_type}")
 
                 if event_type == 'end': # Process elements only when they finish
-                    if elem.tag == 'event':
+                    if tag == 'event':
                         event_count += 1 # Increment count when <event> tag *ends*
-                        seq_num_text = elem.findtext('SequenceNumber', default='<unknown>') # Get sequence early for logging
+                        # Use namespace ignoring find helper for sequence number
+                        seq_num_text = ProcmonEvent._find_text_ignore_ns(elem, 'SequenceNumber') or '<unknown>'
                         logger.debug(f"  [Pass 2 Debug] Found END of <event> tag #{event_count}, Sequence ~{seq_num_text}. Attempting parse...")
                         try:
-                            # 1. Parse the raw event data using the dataclass
+                            # 1. Parse the raw event data using the dataclass (which now ignores namespaces)
                             logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for Sequence ~{seq_num_text}...")
                             raw_event = ProcmonEvent.from_xml_element(elem, processes)
                             # Check if sequence number was parsed correctly for logging
                             parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
                             logger.debug(f"  [Pass 2 Debug] Successfully parsed raw_event for Sequence {parsed_seq}. Optimizing...")
 
-                            # --- Optimization Logic ---
+                            # --- Optimization Logic (remains the same) ---
                             opt_event: Dict[str, Any] = {}
                             opt_event['seq'] = raw_event.sequence_number
                             opt_event['pid'] = raw_event.pid
@@ -568,17 +595,17 @@ def _parse_xml_stream_for_loading(
                              logger.debug(f"  [Pass 2 Debug] Clearing element for event ~{seq_num_text}.")
                              _clear_elem(elem) # IMPORTANT: Clear event element memory after processing its end tag
 
-                    elif elem.tag == 'eventlist':
+                    elif tag == 'eventlist':
                         logger.info(f"Finished processing <eventlist> (end tag).")
                         _clear_elem(elem)
                         # Don't break here, wait for procmon end tag
-                    elif elem.tag == 'procmon':
+                    elif tag == 'procmon':
                         logger.debug("Reached end of <procmon> during event loading.")
                         _clear_elem(elem)
                         break # Stop iteration
                     else:
                         # If the tag wasn't 'event', 'eventlist', or 'procmon', clear it to save memory
-                        logger.debug(f"  [Pass 2 Debug] Clearing element for unexpected tag '{elem.tag}' on end event.")
+                        logger.debug(f"  [Pass 2 Debug] Clearing element for unexpected tag '{tag}' on end event.")
                         _clear_elem(elem)
 
 
@@ -729,10 +756,26 @@ def load_and_validate_file(allowed_dir: str, filename_relative: str):
 
         # --- Pass 2: Parse Events and Optimize ---
         with open_func(abs_full_path, "rb") as f_stream:
-            # The iterator now performs the parsing and optimization
             event_iterator = _parse_xml_stream_for_loading(f_stream, interners, processes_dict)
-            # Consume the iterator and store the optimized events in a list
-            optimized_events = list(event_iterator) # This executes the loop in _parse_xml_stream_for_loading
+            # *** UPDATED: Manual consumption with logging ***
+            logger.info("[Loader] Starting consumption of event iterator...")
+            temp_event_list = []
+            consumed_count = 0
+            try:
+                for opt_event in event_iterator:
+                    temp_event_list.append(opt_event)
+                    consumed_count += 1
+                    # Log progress less frequently during consumption
+                    if consumed_count % 50000 == 0:
+                        logger.debug(f"[Loader] Consumed {consumed_count:,} events into list.")
+            except Exception as consume_err:
+                # Log any error during the consumption loop
+                logger.error(f"[Loader] Error during iterator consumption after {consumed_count} events: {consume_err}", exc_info=True)
+                # Decide whether to proceed with partial list or raise error - proceed for now
+            finally:
+                 # Log final counts after consumption loop finishes or breaks
+                 logger.info(f"[Loader] Finished consuming event iterator. Total events consumed in loop: {consumed_count}. Final list length: {len(temp_event_list)}")
+            optimized_events = temp_event_list # Assign the manually built list
 
         # --- Store results globally ---
         LOADED_FILENAME = filename_relative
