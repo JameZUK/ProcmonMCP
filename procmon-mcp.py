@@ -445,7 +445,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
     return processes_dict
 
 
-# --- UPDATED: Log ALL tags encountered in eventlist ---
+# --- UPDATED: REMOVED tag= argument from iterparse ---
 def _parse_xml_stream_for_loading(
     source_stream: IO[bytes],
     interners: Dict[str, StringInterner],
@@ -461,11 +461,11 @@ def _parse_xml_stream_for_loading(
         Optimized event dictionaries.
     """
     parsing_stage = "seeking_eventlist" # Start assuming processes are done
-    # Only need event-related tags now
-    tags_of_interest = ('event', 'eventlist', 'procmon')
+    # REMOVED tags_of_interest = ('event', 'eventlist', 'procmon')
     try:
         # Use 'rb' mode for binary reading
-        context = ET_impl.iterparse(source_stream, events=('end',), tag=tags_of_interest)
+        # *** REMOVED tag= argument to process ALL tags ***
+        context = ET_impl.iterparse(source_stream, events=('end',))
         logger.info("Starting Pass 2: Parsing and optimizing events...")
     except Exception as e:
         logger.error(f"Unexpected error initializing XML parser for event loading: {e}", exc_info=True)
@@ -487,12 +487,12 @@ def _parse_xml_stream_for_loading(
                 elif elem.tag == 'procmon': # Reached end before finding eventlist
                     logger.warning("Reached end of <procmon> before finding <eventlist>.")
                     break
-                # Ignore other tags like 'process' if they somehow appear here
+                # Ignore other tags before eventlist starts
                 _clear_elem(elem)
                 continue
 
             if parsing_stage == "parsing_events":
-                # *** ADDED DEBUG LOGGING FOR *ALL* TAGS IN THIS STAGE ***
+                # Log every tag encountered within the eventlist stage for debugging
                 logger.debug(f"  [Pass 2 Debug] Encountered tag: '{elem.tag}'")
 
                 if elem.tag == 'event':
@@ -543,11 +543,12 @@ def _parse_xml_stream_for_loading(
                         # --- Progress Reporting ---
                         current_time = time.time()
                         # Report based on event_count (elements processed)
-                        if event_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > 5.0:
+                        # Use yielded_count for rate calculation if preferred
+                        if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > 5.0:
                             elapsed_total = current_time - start_time
-                            rate = event_count / elapsed_total if elapsed_total > 0 else 0
+                            rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
                             # Report both processed and yielded counts
-                            logger.info(f"  [Pass 2] Processed {event_count:,} event tags (yielded {yielded_count:,})... ({elapsed_total:.1f}s | {rate:,.0f} tags/sec)")
+                            logger.info(f"  [Pass 2] Processed {event_count:,} event tags (yielded {yielded_count:,})... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
                             last_report_time = current_time
 
                     except Exception as e:
