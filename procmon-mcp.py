@@ -414,6 +414,7 @@ class ProcmonEvent:
         if load_extra and extra_data_dict:
             data['extra_data'] = extra_data_dict
 
+        # logger.debug(f"  [Event Parse Final Data] Data dict before creating object: {data}") # Removed verbose log
         return cls(**data)
 
     @staticmethod
@@ -630,7 +631,7 @@ def _parse_xml_stream_for_loading(
                         try:
                             # 1. Parse the raw event data using the dataclass (which now ignores namespaces)
                             # logger.debug(f"  [Pass 2 Debug] Calling ProcmonEvent.from_xml_element for event #{event_count}...") # Reduced verbosity
-                            # Pass selective loading flags to parser
+                            # Pass selective loading flags to the parser
                             raw_event = ProcmonEvent.from_xml_element(elem, processes, load_stack, load_extra)
                             # Check if sequence number was parsed correctly for logging
                             parsed_seq = raw_event.sequence_number if raw_event else "<parse failed>"
