@@ -126,9 +126,6 @@ if LXML_AVAILABLE:
             xpath_query = f"string(./*[local-name()='{tag_name}'][1])"
             xpath_result = element.xpath(xpath_query)
             # REMOVED: Verbose XPath debug logging
-            # if logger.isEnabledFor(logging.DEBUG): # Log only in debug
-            #      logger.debug(f"XPath Query for '{tag_name}' in {element.tag}: {xpath_query}")
-            #      logger.debug(f"XPath Result for '{tag_name}': '{xpath_result}' (Type: {type(xpath_result)})")
             return xpath_result.strip() if xpath_result else None
         except Exception as xpath_e:
             logger.debug(f"lxml elem.xpath failed for '{tag_name}': {xpath_e}")
@@ -392,7 +389,8 @@ def _parse_xml_stream_for_loading(
     processes: Dict[int, ProcessInfo], # Pass in the pre-loaded processes for potential lookups
     load_stack: bool, # Flag for selective loading
     load_extra: bool, # Flag for selective loading
-    total_size: Optional[int] = None # ADDED: Total size for percentage calculation
+    raw_file_stream: Optional[IO[bytes]] = None, # ADDED: Raw stream for progress
+    total_size: Optional[int] = None # Total size for percentage calculation
 ) -> Iterator[Dict[str, Any]]:
     """
     Internal helper optimized for initial loading into memory. Parses <event> elements
@@ -484,17 +482,7 @@ def _parse_xml_stream_for_loading(
                         current_event_data['category_str'] = find_text_func(elem, 'Category')
                         current_event_data['process_index_str'] = find_text_func(elem, 'ProcessIndex') # Needed for fallback
 
-                        # --- START FIX: Store stack XML string ---
-                        if load_stack:
-                            # Use _find_child_ignore_ns because we need the element itself, not just text
-                            stack_elem = _find_child_ignore_ns(elem, 'stack')
-                            if stack_elem is not None:
-                                try:
-                                    current_stack_xml_string = ET_impl.tostring(stack_elem, encoding='unicode')
-                                    # REMOVED: Verbose stack XML logging
-                                except Exception as stack_log_e:
-                                     logger.warning(f"Could not serialize stack element for event #{event_count}: {stack_log_e}")
-                        # --- END FIX ---
+                        # --- REMOVED: Stack XML string storage here ---
 
                         # Handle Extra Data (Extract during start if possible)
                         if load_extra:
@@ -589,8 +577,6 @@ def _parse_xml_stream_for_loading(
                                     except Exception as frame_e:
                                         logger.warning(f"Failed to parse/optimize stored stack frame XML for event #{event_count}: {frame_e}", exc_info=False)
                                         # REMOVED: Verbose frame XML logging on error
-                                        # if logger.isEnabledFor(logging.DEBUG):
-                                        #     logger.debug(f"  Frame XML causing error: {frame_xml[:500]}...") # Log problematic XML
                                 if optimized_stack:
                                     opt_event['stack'] = optimized_stack
                             # --- END FIX ---
@@ -609,13 +595,17 @@ def _parse_xml_stream_for_loading(
                                 elapsed_total = current_time - start_time
                                 rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
                                 percent_str = ""
-                                if total_size is not None and total_size > 0:
+                                # --- START FIX: Use raw_file_stream for tell() ---
+                                if raw_file_stream and total_size is not None and total_size > 0:
                                     try:
-                                        current_pos = source_stream.tell()
+                                        # Get current position in the RAW stream
+                                        current_pos = raw_file_stream.tell()
                                         percent = (current_pos / total_size) * 100
-                                        percent_str = f" (~{percent:.1f}%)"
-                                    except (OSError, AttributeError, TypeError) as tell_err:
-                                        logger.debug(f"Could not get stream position for progress: {tell_err}")
+                                        percent_str = f" ({percent:.1f}%)" # Removed tilde
+                                    except (OSError, AttributeError, TypeError, io.UnsupportedOperation) as tell_err:
+                                        # Handle cases where tell() is not supported or fails
+                                        logger.debug(f"Could not get raw stream position for progress: {tell_err}")
+                                # --- END FIX ---
                                 logger.info(f"  [Pass 2] Yielded {yielded_count:,} events{percent_str}... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
                                 last_report_time = current_time
                         else:
@@ -748,6 +738,7 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
     fname_lower = filename_abs.lower()
     compression: Optional[str] = None
     open_func: Any = open
+    file_mode = "rb" # Read bytes
 
     # Determine compression type and open function
     if fname_lower.endswith(".xml"): compression = None
@@ -791,53 +782,64 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
         comp_str = f" ({compression} compressed)" if compression else ""
         logger.info(f"Loading and optimizing{comp_str} XML file: {filename_abs}")
 
-        # --- Pass 1: Parse Processes Only ---
-        with open_func(filename_abs, "rb") as f_stream:
-            log_data.processes_by_index = _parse_xml_processes_only(f_stream)
-            if log_data.processes_by_index is None: log_data.processes_by_index = {} # Safety
+        # --- START FIX: Open raw file handle alongside compressed stream ---
+        raw_f = None
+        try:
+            raw_f = open(filename_abs, "rb") # Open raw file for tell()
 
-        # --- Build PID -> ProcessInfo Map ---
-        for proc_info in log_data.processes_by_index.values():
-            if proc_info.pid is not None:
-                if proc_info.pid in log_data.processes_by_pid:
-                    # This might happen if PIDs are reused quickly, log a warning
-                    logger.warning(f"Duplicate PID {proc_info.pid} encountered in process list. Using the last entry found (ProcessIndex: {proc_info.process_index}).")
-                log_data.processes_by_pid[proc_info.pid] = proc_info
-        logger.info(f"Built PID-to-ProcessInfo map for {len(log_data.processes_by_pid)} unique PIDs.")
+            # --- Pass 1: Parse Processes Only ---
+            # Use a separate stream for pass 1 to avoid interfering with pass 2 position
+            with open_func(filename_abs, file_mode) as f_stream_pass1:
+                log_data.processes_by_index = _parse_xml_processes_only(f_stream_pass1)
+                if log_data.processes_by_index is None: log_data.processes_by_index = {} # Safety
+
+            # --- Build PID -> ProcessInfo Map ---
+            for proc_info in log_data.processes_by_index.values():
+                if proc_info.pid is not None:
+                    if proc_info.pid in log_data.processes_by_pid:
+                        # This might happen if PIDs are reused quickly, log a warning
+                        logger.warning(f"Duplicate PID {proc_info.pid} encountered in process list. Using the last entry found (ProcessIndex: {proc_info.process_index}).")
+                    log_data.processes_by_pid[proc_info.pid] = proc_info
+            logger.info(f"Built PID-to-ProcessInfo map for {len(log_data.processes_by_pid)} unique PIDs.")
 
 
-        # --- Pass 2: Parse Events and Optimize ---
-        with open_func(filename_abs, "rb") as f_stream:
-            event_iterator = _parse_xml_stream_for_loading(
-                f_stream, log_data.interners, log_data.processes_by_index,
-                load_stack=log_data.load_stack_traces,
-                load_extra=log_data.load_extra_data,
-                total_size=total_file_size # Pass total size for progress
-            )
+            # --- Pass 2: Parse Events and Optimize ---
+            # Pass the raw file handle (raw_f) for progress reporting
+            with open_func(raw_f, file_mode) as f_stream_pass2: # Use raw_f with the compression opener
+                event_iterator = _parse_xml_stream_for_loading(
+                    f_stream_pass2, log_data.interners, log_data.processes_by_index,
+                    load_stack=log_data.load_stack_traces,
+                    load_extra=log_data.load_extra_data,
+                    raw_file_stream=raw_f, # Pass the raw file handle
+                    total_size=total_file_size # Pass total size for progress
+                )
 
-            logger.info("[Loader] Starting consumption of event iterator...")
-            temp_event_list = []
-            consumed_count = 0
-            try:
-                for idx, opt_event in enumerate(event_iterator): # Use enumerate to get index
-                    temp_event_list.append(opt_event)
-                    consumed_count += 1
+                logger.info("[Loader] Starting consumption of event iterator...")
+                temp_event_list = []
+                consumed_count = 0
+                try:
+                    for idx, opt_event in enumerate(event_iterator): # Use enumerate to get index
+                        temp_event_list.append(opt_event)
+                        consumed_count += 1
 
-                    # --- Build Indices ---
-                    pname_id = opt_event.get('pname_id')
-                    op_id = opt_event.get('op_id')
-                    if pname_id is not None: log_data.pname_id_index[pname_id].append(idx)
-                    if op_id is not None: log_data.op_id_index[op_id].append(idx)
-                    # --- End Indexing ---
+                        # --- Build Indices ---
+                        pname_id = opt_event.get('pname_id')
+                        op_id = opt_event.get('op_id')
+                        if pname_id is not None: log_data.pname_id_index[pname_id].append(idx)
+                        if op_id is not None: log_data.op_id_index[op_id].append(idx)
+                        # --- End Indexing ---
 
-                    # Removed progress reporting from here, handled in parser now
-                    # if consumed_count % 50000 == 0:
-                    #    logger.debug(f"[Loader] Consumed {consumed_count:,} events into list.")
-            except Exception as consume_err:
-                logger.error(f"[Loader] Error during iterator consumption after {consumed_count} events: {consume_err}", exc_info=True)
-            finally:
-                logger.info(f"[Loader] Finished consuming event iterator. Total events consumed in loop: {consumed_count}. Final list length: {len(temp_event_list)}")
-            log_data.events = temp_event_list
+                        # Removed progress reporting from here, handled in parser now
+                except Exception as consume_err:
+                    logger.error(f"[Loader] Error during iterator consumption after {consumed_count} events: {consume_err}", exc_info=True)
+                finally:
+                    logger.info(f"[Loader] Finished consuming event iterator. Total events consumed in loop: {consumed_count}. Final list length: {len(temp_event_list)}")
+                log_data.events = temp_event_list
+
+        finally:
+            if raw_f:
+                raw_f.close() # Ensure raw file handle is closed
+        # --- END FIX ---
 
         overall_end_time = time.time()
         logger.info(f"--- Loading Summary ---")
