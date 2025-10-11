@@ -88,6 +88,25 @@ The server requires specifying the path to the Procmon XML file to pre-load for 
     python procmon-mcp.py --input-file C:\procmon_files\trace_log.xml --transport sse --mcp-port 8082 --debug --no-stack-traces
     ```
 
+MCP Clients
+
+Theoretically, any MCP client should work with ProcmonMCP. Three examples are given below.
+
+Example 1: Cline
+
+To use GhidraMCP with Cline, this requires manually running the MCP server as well. First run the following command:
+
+python procmon-mcp.py --input-file C:\procmon_files\trace_log.xml --transport sse --mcp-port 8082
+
+Specify the path to the procmon XML. If all other arguments are unspecified, they will default to the above. Once the MCP server is running, open up Cline and select MCP Servers at the top.
+
+Cline select
+
+Then select Remote Servers and add the following, ensuring that the url matches the MCP host and port:
+
+    Server Name: ProcmonMCP
+    Server URL: http://127.0.0.1:8081/sse
+
 ## Available MCP Tools
 
 Once the server is running with a loaded file and connected to an MCP client, the following tools are available:
