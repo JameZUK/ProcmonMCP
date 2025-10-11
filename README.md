@@ -88,7 +88,7 @@ The server requires specifying the path to the Procmon XML file to pre-load for 
     python procmon-mcp.py --input-file C:\procmon_files\trace_log.xml --transport sse --mcp-port 8082 --debug --no-stack-traces
     ```
 
-MCP Clients
+## MCP Clients
 
 Theoretically, any MCP client should work with ProcmonMCP. Three examples are given below.
 
