@@ -57,7 +57,7 @@ This project was inspired by the approach taken in the [GhidraMCP project](https
     # modelcontextprotocol is required
     # lxml is highly recommended for performance
     # psutil is optional for memory reporting
-    pip install modelcontextprotocol lxml psutil
+    pip install "mcp[cli]" lxml psutil
     ```
     *(If you choose not to install `lxml`, the script will use the slower built-in XML parser. If you don't install `psutil`, memory usage won't be reported after loading.)*
 
