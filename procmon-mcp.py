@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import sys
 import os
 import logging
 import argparse
@@ -9,7 +10,7 @@ import time # For timing
 from collections import defaultdict # For counting
 import dataclasses # For XML data structures and log data container
 import re # For regex filtering
-from datetime import datetime, timezone, time as dt_time # For time-based filtering & UTC timestamps
+from datetime import datetime, timezone, time as dt_time, timedelta # For time-based filtering & UTC timestamps
 import csv # For CSV export
 import json # For JSON export
 
@@ -17,11 +18,25 @@ import json # For JSON export
 import gzip
 import bz2
 import lzma
+import contextlib
 
 # --- Profiling Imports ---
 import cProfile
 import pstats
 import io as pstats_io # To capture pstats output
+
+# --- Python Version Check ---
+# This script requires Python 3.7+ for async/await, dataclasses, and modern typing
+MIN_PYTHON_VERSION = (3, 7)
+if sys.version_info < MIN_PYTHON_VERSION:
+    version_str = ".".join(map(str, MIN_PYTHON_VERSION))
+    sys.stderr.write(
+        f"CRITICAL ERROR: This script requires Python {version_str} or newer.\n"
+        f"You are running Python {sys.version_info.major}.{sys.version_info.minor}.\n"
+        "Please upgrade your Python environment to run this tool.\n"
+    )
+    sys.exit(1)
+# --- End Python Version Check ---
 
 # --- XML Parser Choice ---
 LXML_AVAILABLE = False
@@ -71,7 +86,8 @@ try:
     logger.info("MCP SDK found.")
 except ImportError:
     MCP_SDK_AVAILABLE = False
-    logger.error("MCP SDK (modelcontextprotocol) not found. Please install it: pip install modelcontextprotocol")
+    logger.error("MCP SDK (mcp[cli]) not found. Mock objects will be used for offline execution.")
+    logger.error("To run as a server, please install the SDK: pip install \"mcp[cli]\"")
     # Mock objects for offline testing/execution
     class MockSettings: host = "127.0.0.1"; port = 8081; log_level = "INFO"
     class MockMCP:
@@ -90,7 +106,9 @@ PROCMON_TIMESTAMP_FORMAT = "%H:%M:%S.%f" # Format used in Procmon XML Time_of_Da
 PROGRESS_REPORT_INTERVAL = 250000 # Report progress every N events during loading/processing
 PROGRESS_REPORT_SECONDS = 5.0 # Also report progress every N seconds
 # Define a base date (epoch) for creating full timestamps from Time_of_Day.
-# This is necessary because XML only provides time, not date. Assumes logs don't span midnight relative to this arbitrary date for accurate time-only filtering.
+# This is necessary because XML only provides time, not date.
+# **NOTE**: This is now the *starting* date; the parser will advance this date
+#           if it detects a midnight rollover.
 BASE_DATE = datetime(1970, 1, 1, tzinfo=timezone.utc)
 # Known operation strings for specific tools
 OP_PROCESS_CREATE = "Process Create"
@@ -332,6 +350,13 @@ def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
     """
     Parses HH:MM:SS.ffffff[f...] string to a UTC float timestamp relative to BASE_DATE.
     Handles arbitrary digits in fractional seconds by truncating to 6.
+    
+    *** WARNING ***: This function does NOT handle midnight rollovers by itself.
+    It relies on a fixed BASE_DATE.
+    The main loading function _parse_xml_stream_for_loading now contains
+    inline logic to handle rollovers and does NOT use this function.
+    This function is kept for the time-only filter parsing in 
+    _iter_filtered_event_indices.
     """
     if ts_str is None: return None
     try:
@@ -459,6 +484,9 @@ def _parse_xml_stream_for_loading(
     Respects selective loading flags. Stricter about missing core fields (pid, ts).
     Logs the XML of skipped events. Includes percentage progress if total_size provided.
 
+    *** NOTE ***: This function now contains stateful logic to handle
+    timestamp rollovers (e.g., spanning midnight).
+
     Yields:
         Optimized event dictionaries.
     """
@@ -480,6 +508,11 @@ def _parse_xml_stream_for_loading(
     last_report_time = start_time
     current_event_data: Optional[Dict[str, Any]] = None # Store data between start/end
     current_stack_frames: Optional[List[List]] = None # Store OPTIMIZED frame data
+
+    # --- ADDED: State variables for timestamp midnight rollover ---
+    current_processing_date = BASE_DATE.date() # Start with the base date
+    last_parsed_time: Optional[dt_time] = None   # Track the last event's time
+    # --- END ADDITION ---
 
     # find_text_func is now globally set to the faster _find_text_ignore_ns
 
@@ -508,13 +541,43 @@ def _parse_xml_stream_for_loading(
 
                     try:
                         # --- Extract Core Fields Efficiently ---
-                        # Use the optimized find_text_func directly
                         pid_str = find_text_func(elem, 'PID')
                         ts_str = find_text_func(elem, 'Time_of_Day')
                         current_event_data['pid_str'] = pid_str # Store raw for logging if needed
                         current_event_data['ts_str'] = ts_str
                         current_event_data['pid'] = ProcessInfo._safe_text_to_int(pid_str)
-                        current_event_data['ts'] = _parse_timestamp_str(ts_str)
+                        
+                        # --- MODIFIED: Inline timestamp parsing to handle midnight rollover ---
+                        parsed_time_obj: Optional[dt_time] = None
+                        ts_float: Optional[float] = None
+                        if ts_str:
+                            try:
+                                # Parse the time string (logic from _parse_timestamp_str)
+                                parts = ts_str.split('.', 1)
+                                time_part = parts[0]
+                                if len(parts) > 1:
+                                    fractional_part = parts[1][:6].ljust(6, '0')
+                                else:
+                                    fractional_part = "000000"
+                                ts_str_corrected = f"{time_part}.{fractional_part}"
+                                parsed_time_obj = datetime.strptime(ts_str_corrected, PROCMON_TIMESTAMP_FORMAT).time()
+
+                                # Check for midnight rollover
+                                if last_parsed_time and parsed_time_obj < last_parsed_time:
+                                    current_processing_date += timedelta(days=1)
+                                    logger.info(f"Midnight rollover detected at event #{event_count}. Advancing date to {current_processing_date}.")
+
+                                # Combine with the *current* processing date
+                                full_dt = datetime.combine(current_processing_date, parsed_time_obj, tzinfo=timezone.utc)
+                                ts_float = full_dt.timestamp()
+                                last_parsed_time = parsed_time_obj # Update state
+
+                            except (ValueError, TypeError, IndexError) as e:
+                                logger.warning(f"Could not parse timestamp string '{ts_str}': {e}")
+                        
+                        current_event_data['ts'] = ts_float
+                        # --- END MODIFICATION ---
+
 
                         # --- Extract Other Simple Fields ---
                         current_event_data['seq'] = ProcessInfo._safe_text_to_int(find_text_func(elem, 'SequenceNumber'))
@@ -851,7 +914,18 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
             # --- Pass 2: Parse Events and Optimize ---
             # Use the already opened raw_f with the appropriate compression opener
             # This ensures the raw_f handle stays open for the duration of Pass 2
-            with open_func(raw_f, file_mode) as f_stream_pass2:
+# --- Define a context manager for the stream ---
+            # It's either the compression opener (gzip.open, etc.) or a dummy context
+            if compression is not None:
+                stream_context = open_func(raw_f, file_mode)
+            else:
+                # If not compressed, open_func is 'open' and must not be used on raw_f.
+                # We just use raw_f directly. We need a dummy context manager
+                # that just returns raw_f and does nothing on __exit__.
+                # (import contextlib should be at top of file)
+                stream_context = contextlib.nullcontext(raw_f)
+
+            with stream_context as f_stream_pass2:
                 event_iterator = _parse_xml_stream_for_loading(
                     f_stream_pass2, log_data.interners, log_data.processes_by_index,
                     load_stack=log_data.load_stack_traces,
@@ -906,7 +980,7 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
     # --- Error Handling for Loading ---
     except (FileNotFoundError, ValueError) as e: logger.error(f"File error: {e}"); raise
     except ET_impl.XMLSyntaxError as e: logger.error(f"XML Syntax Error in {filename_abs}: {e}"); raise RuntimeError(f"Invalid XML: {e}") from e
-    except (gzip.BadGzipFile, bz2.BZ2Error, lzma.LZMAError, OSError) as e: # Catch specific compression errors + general IO
+    except OSError as e: # Catch file read/decompression errors (OSError is base for gzip, bz2, lzma errors)
         logger.error(f"File read/decompression error for {filename_abs}: {e}")
         raise RuntimeError(f"File read/decompression failed for '{filename_abs}'.") from e
     except Exception as e:
@@ -965,12 +1039,13 @@ async def _iter_filtered_event_indices(
             is_time_only = False
             if isinstance(time_filter_val, str):
                 try: # Try HH:MM:SS.ffffff format first
+                    # Use _parse_timestamp_str but only extract the time part relative to epoch
                     parsed_time_obj = datetime.strptime(time_filter_val, PROCMON_TIMESTAMP_FORMAT).time()
                     # Convert to seconds since midnight for comparison
                     ts_val = (parsed_time_obj.hour * 3600 + parsed_time_obj.minute * 60 +
                               parsed_time_obj.second + parsed_time_obj.microsecond / 1e6)
                     is_time_only = True
-                    logger.warning(f"Using time-only string filter for: {time_filter_val}")
+                    logger.info(f"Using time-only string filter for: {time_filter_val}")
                 except ValueError:
                     try: # Fallback to float (Unix timestamp)
                         ts_val = float(time_filter_val)
@@ -1071,6 +1146,7 @@ async def _iter_filtered_event_indices(
                 current_event_compare_val = event_ts_float
                 if is_start_time_only or is_end_time_only: # Compare only time part
                     try:
+                        # Use timezone.utc since our loaded timestamps are UTC
                         event_dt_obj = datetime.fromtimestamp(event_ts_float, timezone.utc)
                         current_event_compare_val = (event_dt_obj.hour * 3600 + event_dt_obj.minute * 60 +
                                                      event_dt_obj.second + event_dt_obj.microsecond / 1e6)
@@ -1162,6 +1238,7 @@ def _get_formatted_event_details(log_data: ProcmonLogData, event_index: int) -> 
         details['timestamp_unix'] = ts_float # Store raw float timestamp
         try:
             # Format timestamp string if float exists
+            # All our loaded timestamps are UTC
             details['timestamp'] = datetime.fromtimestamp(ts_float, timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT) if ts_float else None
         except Exception:
             details['timestamp'] = "<Invalid Timestamp>" # Handle formatting errors
@@ -1907,9 +1984,12 @@ async def export_query_results(
     """
     Queries events using the specified filters and exports the full details
     of matching events to a local file (CSV or JSON format).
+    *** SECURITY ***: Output files are restricted to the script's current working
+    directory or subdirectories. Absolute paths or paths with '..' are denied.
 
     Args:
         output_file (str): The desired path for the output file (e.g., 'filtered_events.csv').
+                           Must be relative to the script's working directory.
         output_format (str): The desired output format ('csv' or 'json', defaults to 'csv').
         filter_*: Optional filter parameters (see 'query_events' tool for details).
 
@@ -1928,24 +2008,38 @@ async def export_query_results(
     if not output_file:
          raise ValueError("Output file name cannot be empty.")
 
-    # --- Path Validation (Simplified - assumes CWD or absolute path is okay) ---
-    # WARNING: This is less secure than the original get_secure_path.
-    # Production use might require re-adding path validation based on deployment context.
+    # --- MODIFIED: Path Validation (Hardened) ---
     try:
-        abs_output_path = os.path.abspath(output_file)
-        # Basic check to prevent writing outside current working directory if relative path used
-        if not output_file.startswith('/') and not output_file.startswith('\\') and ".." in output_file:
-            # A very basic check, might need refinement depending on security needs
-            raise ValueError("Output path appears to traverse directories ('..'). Please use absolute paths or paths within the current directory.")
+        # Define the single, allowed base directory for all outputs
+        allowed_dir = os.path.abspath(os.getcwd())
+        
+        # Safely join the allowed directory with the user's requested file path
+        # This treats 'output_file' as relative *to* 'allowed_dir'
+        # If 'output_file' is an absolute path (e.g., /etc/passwd), 
+        # os.path.join will discard 'allowed_dir' and just use the absolute path.
+        abs_output_path = os.path.abspath(os.path.join(allowed_dir, output_file))
+        
+        # THE CRITICAL CHECK:
+        # Ensure the final, resolved path is still *within* the allowed directory.
+        if os.path.commonpath([abs_output_path, allowed_dir]) != allowed_dir:
+            await ctx.error(f"Path Traversal Denied: Output path '{abs_output_path}' is outside the allowed directory '{allowed_dir}'.")
+            raise ValueError(f"Invalid output path. Must be relative and inside the directory: {allowed_dir}")
+        
+        # Now it's safe to check for/create the directory
         output_dir = os.path.dirname(abs_output_path)
         if output_dir and not os.path.exists(output_dir):
-            try: os.makedirs(output_dir); logger.info(f"Created output directory: {output_dir}")
-            except OSError as e: raise ValueError(f"Could not create output directory '{output_dir}': {e}") from e
-        await ctx.info(f"Output path set to: {abs_output_path}")
+            try: 
+                os.makedirs(output_dir)
+                logger.info(f"Created output directory: {output_dir}")
+            except OSError as e: 
+                raise ValueError(f"Could not create output directory '{output_dir}': {e}") from e
+        
+        await ctx.info(f"Validated output path: {abs_output_path}")
+
     except ValueError as e:
         await ctx.error(f"Invalid output file path: {e}")
         raise e
-    # --- End Simplified Path Validation ---
+    # --- End Hardened Path Validation ---
 
     if not LOADED_DATA or not LOADED_DATA.is_loaded():
         await ctx.error(f"Export failed: Event data not loaded.")
@@ -2176,8 +2270,8 @@ if __name__ == "__main__":
 
     # --- Dependency Checks ---
     if not MCP_SDK_AVAILABLE:
-        logger.critical("CRITICAL: Model Context Protocol SDK (modelcontextprotocol) is not installed.")
-        logger.critical("Please install it: pip install modelcontextprotocol")
+        logger.critical("CRITICAL: Model Context Protocol SDK (mcp[cli]) is not installed.")
+        logger.critical("Please install it: pip install \"mcp[cli]\"")
         exit(1)
 
     # --- Profiling Setup ---
