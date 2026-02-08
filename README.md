@@ -94,7 +94,7 @@ Theoretically, any MCP client should work with ProcmonMCP. Three examples are gi
 
 Example 1: Cline
 
-To use GhidraMCP with Cline, this requires manually running the MCP server as well. First run the following command:
+To use ProcmonMCP with Cline, this requires manually running the MCP server as well. First run the following command:
 
 python procmon-mcp.py --input-file C:\procmon_files\trace_log.xml --transport sse --mcp-port 8082
 
