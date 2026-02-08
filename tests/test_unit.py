@@ -1,4 +1,4 @@
-"""Unit tests for procmon-mcp.py core components."""
+"""Unit tests for ProcmonMCP core components."""
 import sys
 import os
 import re
@@ -6,12 +6,10 @@ import pytest
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 
-# Add parent directory to path so we can import the module
+# Add parent directory to path so we can import the package
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import the module (this will trigger some module-level code)
-import importlib
-procmon_mcp = importlib.import_module("procmon-mcp")
+import procmon_mcp
 
 # --- StringInterner Tests ---
 
