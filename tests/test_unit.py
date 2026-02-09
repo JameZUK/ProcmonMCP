@@ -369,3 +369,74 @@ class TestProcmonLogData:
         interner = procmon_mcp.StringInterner()
         log_data.interners["test_key"] = interner
         assert log_data.get_id("test_key", "missing") is None
+
+    def test_default_indices_are_defaultdicts(self):
+        log_data = procmon_mcp.ProcmonLogData()
+        # All indices should support defaultdict behavior
+        log_data.pname_id_index[0].append(1)
+        log_data.op_id_index[0].append(2)
+        log_data.pid_index[100].append(3)
+        log_data.path_id_index[5].append(4)
+        assert log_data.pname_id_index[0] == [1]
+        assert log_data.op_id_index[0] == [2]
+        assert log_data.pid_index[100] == [3]
+        assert log_data.path_id_index[5] == [4]
+
+    def test_pid_index_stores_event_indices(self):
+        log_data = procmon_mcp.ProcmonLogData()
+        # Simulate indexing events by PID
+        log_data.pid_index[1234].append(0)
+        log_data.pid_index[1234].append(5)
+        log_data.pid_index[1234].append(10)
+        log_data.pid_index[5678].append(3)
+        assert log_data.pid_index[1234] == [0, 5, 10]
+        assert log_data.pid_index[5678] == [3]
+        assert log_data.pid_index.get(9999, []) == []
+
+    def test_path_id_index_stores_event_indices(self):
+        log_data = procmon_mcp.ProcmonLogData()
+        log_data.path_id_index[0].append(1)
+        log_data.path_id_index[0].append(2)
+        log_data.path_id_index[1].append(3)
+        assert log_data.path_id_index[0] == [1, 2]
+        assert log_data.path_id_index[1] == [3]
+
+    def test_pid_index_set_intersection(self):
+        """Test the pattern used by get_process_lifetime: intersecting PID index with op index."""
+        log_data = procmon_mcp.ProcmonLogData()
+        # PID 100 has events at indices 0, 1, 5, 10
+        log_data.pid_index[100] = [0, 1, 5, 10]
+        # "Process Create" operation has events at indices 0, 3, 7
+        log_data.op_id_index[42] = [0, 3, 7]
+        # Intersection should find event 0
+        pid_set = set(log_data.pid_index.get(100, []))
+        create_indices = log_data.op_id_index.get(42, [])
+        found = None
+        for idx in create_indices:
+            if idx in pid_set:
+                found = idx
+                break
+        assert found == 0
+
+    def test_path_id_index_substring_search(self):
+        """Test the pattern used by find_file_access: searching unique paths then collecting indices."""
+        log_data = procmon_mcp.ProcmonLogData()
+        interner = procmon_mcp.StringInterner()
+        # Intern some paths
+        id_sys32 = interner.get_id("C:\\Windows\\System32\\ntdll.dll")
+        id_sys32b = interner.get_id("C:\\Windows\\System32\\kernel32.dll")
+        id_temp = interner.get_id("C:\\Users\\temp\\file.txt")
+        log_data.interners["path"] = interner
+        # Index events
+        log_data.path_id_index[id_sys32] = [0, 5, 10]
+        log_data.path_id_index[id_sys32b] = [2, 7]
+        log_data.path_id_index[id_temp] = [1, 3]
+        # Find paths matching "system32" (case-insensitive)
+        search = "system32"
+        matching = []
+        for path_id, indices in log_data.path_id_index.items():
+            path_str = log_data.get_string("path", path_id)
+            if path_str and search.lower() in path_str.lower():
+                matching.extend(indices)
+        matching.sort()
+        assert matching == [0, 2, 5, 7, 10]

@@ -54,14 +54,20 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
                     logger.warning("Found end of procmon before processlist.")
                     break
                 parsing_stage = "seeking_processlist"
+                # Fall through intentionally: first non-procmon element
+                # may be the processlist or a process element itself.
 
             if parsing_stage == "seeking_processlist":
                 if tag == 'process':
                     parsing_stage = "parsing_processlist"
+                    # Fall through intentionally: process the first
+                    # <process> element immediately below.
                 elif tag == 'processlist':
                     logger.info("Found empty <processlist>.")
                     _clear_elem(elem)
                     break
+                else:
+                    continue  # Skip unrelated elements while seeking
 
             if parsing_stage == "parsing_processlist":
                 if tag == 'process':
@@ -467,10 +473,16 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
 
                         pname_id = opt_event.get('pname_id')
                         op_id = opt_event.get('op_id')
+                        pid = opt_event.get('pid')
+                        path_id = opt_event.get('path_id')
                         if pname_id is not None:
                             log_data.pname_id_index[pname_id].append(idx)
                         if op_id is not None:
                             log_data.op_id_index[op_id].append(idx)
+                        if pid is not None:
+                            log_data.pid_index[pid].append(idx)
+                        if path_id is not None:
+                            log_data.path_id_index[path_id].append(idx)
 
                 except Exception as consume_err:
                     logger.error(f"[Loader] Error during iterator consumption/indexing after {consumed_count} events: {consume_err}", exc_info=True)
@@ -488,7 +500,7 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
         logger.info(f"--- Loading Summary ---")
         logger.info(f" Successfully loaded and optimized {len(log_data.events):,} events from {log_data.loaded_filename}.")
         logger.info(f" Found {len(log_data.processes_by_index)} unique processes (by index).")
-        logger.info(f" Built PName index for {len(log_data.pname_id_index)} names and OP index for {len(log_data.op_id_index)} operations.")
+        logger.info(f" Built PName index for {len(log_data.pname_id_index)} names, OP index for {len(log_data.op_id_index)} operations, PID index for {len(log_data.pid_index)} PIDs, Path index for {len(log_data.path_id_index)} paths.")
         logger.info(f" Total loading and optimization time: {overall_end_time - overall_start_time:.2f} seconds.")
         if logger.isEnabledFor(logging.DEBUG):
             for name, interner in log_data.interners.items():

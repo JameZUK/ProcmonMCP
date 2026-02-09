@@ -182,6 +182,8 @@ class ProcmonLogData:
     # Indices
     pname_id_index: Dict[int, List[int]] = dataclasses.field(default_factory=lambda: defaultdict(list))
     op_id_index: Dict[int, List[int]] = dataclasses.field(default_factory=lambda: defaultdict(list))
+    pid_index: Dict[int, List[int]] = dataclasses.field(default_factory=lambda: defaultdict(list))
+    path_id_index: Dict[int, List[int]] = dataclasses.field(default_factory=lambda: defaultdict(list))
 
     def get_string(self, interner_key: str, id_val: Optional[int]) -> Optional[str]:
         """Looks up a string from its ID using the stored interners."""

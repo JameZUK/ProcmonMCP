@@ -44,6 +44,8 @@ async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
         summary["index_stats"] = {
             "pname_indexed_count": len(log_data.pname_id_index),
             "op_indexed_count": len(log_data.op_id_index),
+            "pid_indexed_count": len(log_data.pid_index),
+            "path_indexed_count": len(log_data.path_id_index),
         }
         summary["selective_loading"] = {
             "stack_traces": log_data.load_stack_traces,
@@ -499,21 +501,26 @@ async def get_process_lifetime(pid: int, ctx: Context) -> Dict[str, Optional[flo
     if pid not in log_data.processes_by_pid:
         await ctx.warning(f"[get_process_lifetime] PID {pid} not found in initial process list. It might have started/exited before the list snapshot.")
 
-    # Use operation indices to narrow the search
+    # Use PID index intersected with operation indices for fast lookup
+    pid_event_set = set(log_data.pid_index.get(pid, []))
+    if not pid_event_set:
+        await ctx.info(f"[get_process_lifetime] No events found for PID {pid}.")
+        result = {"create_timestamp": create_ts, "exit_timestamp": exit_ts}
+        await ctx.info(f"[get_process_lifetime] PID {pid}: {result}")
+        return result
+
     if create_op_id is not None:
         create_indices = log_data.op_id_index.get(create_op_id, [])
         for idx in create_indices:
-            event_dict = log_data.events[idx]
-            if event_dict.get('pid') == pid:
-                create_ts = event_dict.get('ts')
+            if idx in pid_event_set:
+                create_ts = log_data.events[idx].get('ts')
                 break
 
     if exit_op_id is not None:
         exit_indices = log_data.op_id_index.get(exit_op_id, [])
         for idx in reversed(exit_indices):
-            event_dict = log_data.events[idx]
-            if event_dict.get('pid') == pid:
-                exit_ts = event_dict.get('ts')
+            if idx in pid_event_set:
+                exit_ts = log_data.events[idx].get('ts')
                 break
 
     result = {"create_timestamp": create_ts, "exit_timestamp": exit_ts}
@@ -527,7 +534,7 @@ async def find_file_access(path_contains: str, limit: int = 100, *, ctx: Context
     Finds events related to file system access where the event's 'Path' field contains the given substring (case-insensitive).
     Returns a list of event summaries (up to the specified limit) for matching events.
     Each summary includes index, timestamp, process, PID, operation, path, and result.
-    Note: This performs a linear scan; it does not use path-based indexing.
+    Uses path_id_index to check unique paths first (O(unique_paths)) instead of scanning all events.
     """
     log_data = await _check_loaded(ctx, "find_file_access")
     await ctx.info(f"[find_file_access] Starting for path containing: '{path_contains}' (limit={limit})")
@@ -538,28 +545,49 @@ async def find_file_access(path_contains: str, limit: int = 100, *, ctx: Context
     count = 0
     path_contains_lower = path_contains.lower()
 
-    for idx, event_dict in enumerate(log_data.events):
+    # Phase 1: Find all path_ids whose string contains the substring
+    # This is O(unique_paths) instead of O(total_events)
+    matching_path_ids = []
+    for path_id, event_indices in log_data.path_id_index.items():
+        path_str = log_data.get_string(IK_PATH, path_id)
+        if path_str and path_contains_lower in path_str.lower():
+            matching_path_ids.append((path_id, path_str, event_indices))
+
+    if not matching_path_ids:
+        await ctx.info(f"[find_file_access] No paths matching '{path_contains}' found in {len(log_data.path_id_index)} unique paths.")
+        return []
+
+    await ctx.info(f"[find_file_access] Found {len(matching_path_ids)} matching unique paths out of {len(log_data.path_id_index)}.")
+
+    # Phase 2: Collect events from matching paths, sorted by event index
+    # Merge-sort approach: collect all candidate indices, sort, then take up to limit
+    candidate_indices = []
+    for _, _, event_indices in matching_path_ids:
+        candidate_indices.extend(event_indices)
+    candidate_indices.sort()
+
+    # Phase 3: Build summaries up to limit
+    for idx in candidate_indices:
         if count >= limit:
             break
-
+        event_dict = log_data.events[idx]
         path_id = event_dict.get('path_id')
-        if path_id is not None:
-            path_str = log_data.get_string(IK_PATH, path_id)
-            if path_str and path_contains_lower in path_str.lower():
-                try:
-                    ts_display = datetime.fromtimestamp(event_dict['ts'], timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT) if event_dict.get('ts') else None
-                    summary = {
-                        'event_index': idx, 'timestamp': ts_display,
-                        'process_name': log_data.get_string(IK_PROCESS_NAME, event_dict.get('pname_id')),
-                        'pid': event_dict.get('pid'),
-                        'operation': log_data.get_string(IK_OPERATION, event_dict.get('op_id')),
-                        'path': path_str,
-                        'result': log_data.get_string(IK_RESULT, event_dict.get('res_id')),
-                    }
-                    found_events.append(summary)
-                    count += 1
-                except Exception as e:
-                    logger.warning(f"Error creating summary for file access event {idx}: {e}")
+        # Find the cached path_str for this path_id
+        path_str = log_data.get_string(IK_PATH, path_id)
+        try:
+            ts_display = datetime.fromtimestamp(event_dict['ts'], timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT) if event_dict.get('ts') else None
+            summary = {
+                'event_index': idx, 'timestamp': ts_display,
+                'process_name': log_data.get_string(IK_PROCESS_NAME, event_dict.get('pname_id')),
+                'pid': event_dict.get('pid'),
+                'operation': log_data.get_string(IK_OPERATION, event_dict.get('op_id')),
+                'path': path_str,
+                'result': log_data.get_string(IK_RESULT, event_dict.get('res_id')),
+            }
+            found_events.append(summary)
+            count += 1
+        except Exception as e:
+            logger.warning(f"Error creating summary for file access event {idx}: {e}")
 
     await ctx.info(f"[find_file_access] Completed. {len(found_events)} events matching '{path_contains}' (limit {limit}).")
     return found_events
