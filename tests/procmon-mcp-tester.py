@@ -16,6 +16,13 @@ try:
     from mcp import ClientSession, types
     from mcp.client.sse import sse_client
     logger.info("MCP SDK components imported successfully.")
+    HAS_STREAMABLE_HTTP = False
+    try:
+        from mcp.client.streamable_http import streamablehttp_client
+        HAS_STREAMABLE_HTTP = True
+        logger.info("Streamable HTTP client available.")
+    except ImportError:
+        logger.info("Streamable HTTP client not available (older SDK version).")
 except ImportError as e:
     logger.critical(f"MCP SDK import failed: {e}")
     logger.critical("Please ensure the MCP Python SDK is installed correctly.")
@@ -152,6 +159,20 @@ async def test_tools_with_session(session: ClientSession):
             logger.info("Session initialized.")
     except Exception as e:
         logger.error(f"Error during session initialization: {e}", exc_info=True)
+
+    # 0. get_status
+    print(f"\n--- Testing: get_status ---")
+    try:
+        raw = await session.call_tool("get_status", arguments={})
+        parsed = extract_json_from_result(raw)
+        if results.assert_is_dict("get_status: returns dict", parsed,
+                                  required_keys=["file_loaded", "message", "available_actions"]):
+            results.assert_true("get_status: file_loaded is bool",
+                                isinstance(parsed.get("file_loaded"), bool))
+            results.assert_is_list("get_status: available_actions is list",
+                                   parsed.get("available_actions"), min_length=1)
+    except Exception as e:
+        results.record_fail("get_status: call succeeded", str(e))
 
     # 1. get_loaded_file_summary
     print(f"\n--- Testing: get_loaded_file_summary ---")
@@ -426,12 +447,26 @@ async def main(host: str, port: int, transport: str):
     try:
         if transport == "stdio":
             logger.error("Testing via stdio from this script is not directly supported.")
-            logger.error("Please run the server with SSE for client testing.")
+            logger.error("Please run the server with SSE or streamable-http for client testing.")
             sys.exit(1)
+
+        elif transport == "streamable-http":
+            if not HAS_STREAMABLE_HTTP:
+                logger.error("Streamable HTTP client not available. Upgrade MCP SDK: pip install 'mcp[cli]>=1.8.0'")
+                sys.exit(1)
+            url = f"http://{host}:{port}/mcp"
+            logger.info(f"Connecting via Streamable HTTP to: {url}...")
+
+            async with streamablehttp_client(url) as streams:
+                logger.info("Streamable HTTP client connected.")
+                read_stream, write_stream = streams[0], streams[1]
+                async with ClientSession(read_stream, write_stream) as session:
+                    logger.info("ClientSession created. Running tests...")
+                    all_passed = await test_tools_with_session(session)
 
         elif transport == "sse":
             sse_url = f"http://{host}:{port}/sse"
-            logger.info(f"Connecting via SSE to: {sse_url}...")
+            logger.info(f"Connecting via SSE (deprecated) to: {sse_url}...")
 
             async with sse_client(sse_url) as streams:
                 logger.info("SSE client connected.")
@@ -457,8 +492,9 @@ if __name__ == "__main__":
                         help="Host where the MCP server is running (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8081,
                         help="Port where the MCP server is running (default: 8081)")
-    parser.add_argument("--transport", type=str, default="sse", choices=["stdio", "sse"],
-                        help="MCP transport (default: sse)")
+    parser.add_argument("--transport", type=str, default="streamable-http",
+                        choices=["stdio", "sse", "streamable-http"],
+                        help="MCP transport (default: streamable-http)")
 
     args = parser.parse_args()
     asyncio.run(main(args.host, args.port, args.transport))

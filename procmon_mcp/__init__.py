@@ -1,4 +1,4 @@
-"""ProcmonMCP - MCP server for analyzing Process Monitor XML log files."""
+"""ProcmonMCP - MCP server for analysing Process Monitor XML log files."""
 
 # Core infrastructure
 from .compat import (
@@ -26,6 +26,9 @@ from .models import StringInterner, StackFrame, ProcessInfo, ProcmonLogData
 
 # Parser
 from .parser import load_procmon_xml
+
+# User configuration
+from .config import load_config, save_config, get_last_file, set_last_file
 
 # Filtering and formatting
 from .filters import _iter_filtered_event_indices

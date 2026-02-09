@@ -10,19 +10,185 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-from .compat import Context
+from .compat import Context, PSUTIL_AVAILABLE
 from .constants import (
     PROCMON_TIMESTAMP_FORMAT, PROGRESS_REPORT_INTERVAL, PROGRESS_REPORT_SECONDS,
     OP_PROCESS_CREATE, OP_PROCESS_EXIT, NETWORK_OPERATIONS,
     IK_PROCESS_NAME, IK_OPERATION, IK_PATH, IK_RESULT, IK_CATEGORY,
     IK_STACK_PATH, IK_STACK_LOCATION,
 )
+from . import server
 from .server import tool_decorator, _check_loaded
 from .filters import _iter_filtered_event_indices
 from .formatters import _get_formatted_event_details
+from .helpers import _format_bytes
 
 logger = logging.getLogger(__name__)
 
+
+# ---- Lifecycle tools (load_file, get_status) ----
+
+@tool_decorator
+async def get_status(ctx: Context) -> Dict[str, Any]:
+    """
+    Returns the current status of the ProcmonMCP server.
+    Shows whether a file is loaded, loading progress, and available actions.
+    Call this tool first to understand the current state before using other tools.
+    """
+    await ctx.info("[get_status] Checking server state...")
+    try:
+        status: Dict[str, Any] = {
+            "file_loaded": False,
+            "loading_in_progress": server.LOADING_IN_PROGRESS,
+        }
+
+        if server.LOADING_IN_PROGRESS:
+            status["message"] = "A file is currently being loaded. Please wait for loading to complete."
+            status["available_actions"] = ["get_status (to check progress)"]
+        elif server.LOADED_DATA and server.LOADED_DATA.is_loaded():
+            status["file_loaded"] = True
+            status["loaded_filename"] = server.LOADED_DATA.loaded_filename
+            status["event_count"] = len(server.LOADED_DATA.events)
+            status["process_count"] = len(server.LOADED_DATA.processes_by_index)
+            status["compression"] = server.LOADED_DATA.loaded_compression
+            status["message"] = f"File '{server.LOADED_DATA.loaded_filename}' is loaded and ready for analysis."
+            status["available_actions"] = [
+                "All analysis tools (query_events, list_processes, etc.)",
+                "load_file (to load a different file)",
+            ]
+
+            # Memory usage
+            if PSUTIL_AVAILABLE:
+                try:
+                    import psutil
+                    process = psutil.Process(os.getpid())
+                    mem_info = process.memory_info()
+                    status["memory_usage_rss"] = _format_bytes(mem_info.rss)
+                except Exception:
+                    pass
+        else:
+            # Check config for last-used file
+            from .config import get_last_file
+            last_file = get_last_file()
+            status["message"] = "No file loaded. Use the 'load_file' tool to open a Procmon XML file."
+            status["available_actions"] = ["load_file"]
+            if last_file:
+                status["last_used_file"] = last_file
+                status["hint"] = f"Your last loaded file was: {last_file}"
+
+        await ctx.info(f"[get_status] Completed. Loaded: {status['file_loaded']}")
+        return status
+
+    except Exception as e:
+        await ctx.error(f"[get_status] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Internal error checking status: {e}")
+
+
+@tool_decorator
+async def load_file(
+    file_path: str,
+    no_stack_traces: bool = False,
+    no_extra_data: bool = False,
+    *,
+    ctx: Context,
+) -> Dict[str, Any]:
+    """
+    Loads a Procmon XML file for analysis. Supports .xml, .xml.gz, .xml.bz2, and .xml.xz formats.
+    This replaces any previously loaded data.
+
+    Provides progress feedback during loading via MCP notifications.
+
+    Args:
+        file_path: Absolute or relative path to the Procmon XML file.
+        no_stack_traces: If True, skip loading stack traces (saves memory for large files).
+        no_extra_data: If True, skip loading extra/unknown event fields (saves memory).
+    """
+    from .parser import load_procmon_xml
+    from .config import set_last_file
+
+    await ctx.info(f"[load_file] Starting load for: {file_path}")
+
+    if server.LOADING_IN_PROGRESS:
+        await ctx.error("[load_file] A file is already being loaded. Please wait.")
+        raise RuntimeError("A file load is already in progress.")
+
+    # Validate path
+    abs_path = os.path.abspath(file_path)
+    if not os.path.exists(abs_path):
+        await ctx.error(f"[load_file] File not found: {abs_path}")
+        raise FileNotFoundError(f"File not found: {abs_path}")
+    if not os.path.isfile(abs_path):
+        await ctx.error(f"[load_file] Path is not a file: {abs_path}")
+        raise ValueError(f"Path is not a file: {abs_path}")
+
+    load_stacks = not no_stack_traces
+    load_extra = not no_extra_data
+
+    server.LOADING_IN_PROGRESS = True
+    try:
+        await ctx.info(f"[load_file] Loading '{os.path.basename(abs_path)}' "
+                       f"(stacks={'yes' if load_stacks else 'no'}, extra={'yes' if load_extra else 'no'})...")
+
+        start_time = time.time()
+        new_data = load_procmon_xml(abs_path, load_stacks, load_extra)
+
+        if not new_data or not new_data.is_loaded():
+            await ctx.error("[load_file] File loading failed. Check server logs for details.")
+            raise RuntimeError(f"Failed to load file: {abs_path}")
+
+        elapsed = time.time() - start_time
+
+        # Replace global data
+        server.LOADED_DATA = new_data
+
+        # Save to config
+        set_last_file(abs_path)
+
+        result = {
+            "success": True,
+            "loaded_filename": new_data.loaded_filename,
+            "event_count": len(new_data.events),
+            "process_count": len(new_data.processes_by_index),
+            "compression": new_data.loaded_compression,
+            "load_time_seconds": round(elapsed, 2),
+            "stack_traces_loaded": load_stacks,
+            "extra_data_loaded": load_extra,
+            "index_stats": {
+                "pname_indexed_count": len(new_data.pname_id_index),
+                "op_indexed_count": len(new_data.op_id_index),
+                "pid_indexed_count": len(new_data.pid_index),
+                "path_indexed_count": len(new_data.path_id_index),
+            },
+            "message": f"Successfully loaded {len(new_data.events):,} events and "
+                       f"{len(new_data.processes_by_index)} processes from "
+                       f"'{new_data.loaded_filename}' in {elapsed:.1f}s.",
+        }
+
+        # Memory usage
+        if PSUTIL_AVAILABLE:
+            try:
+                import psutil
+                process = psutil.Process(os.getpid())
+                mem_info = process.memory_info()
+                result["memory_usage_rss"] = _format_bytes(mem_info.rss)
+            except Exception:
+                pass
+
+        await ctx.info(f"[load_file] Completed. {result['message']}")
+        return result
+
+    except (FileNotFoundError, ValueError):
+        raise
+    except Exception as e:
+        await ctx.error(f"[load_file] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Error loading file: {e}")
+    finally:
+        server.LOADING_IN_PROGRESS = False
+
+
+# ---- Analysis tools ----
 
 @tool_decorator
 async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:

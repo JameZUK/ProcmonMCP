@@ -440,3 +440,52 @@ class TestProcmonLogData:
                 matching.extend(indices)
         matching.sort()
         assert matching == [0, 2, 5, 7, 10]
+
+
+# --- Config Module Tests ---
+
+class TestConfig:
+    def test_load_config_returns_defaults_when_no_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("procmon_mcp.config.CONFIG_FILE", str(tmp_path / "nonexistent.json"))
+        from procmon_mcp.config import load_config
+        config = load_config()
+        assert config["last_file"] is None
+        assert config["no_stack_traces"] is False
+        assert config["no_extra_data"] is False
+
+    def test_save_and_load_config_roundtrip(self, tmp_path, monkeypatch):
+        config_file = str(tmp_path / "config.json")
+        monkeypatch.setattr("procmon_mcp.config.CONFIG_DIR", str(tmp_path))
+        monkeypatch.setattr("procmon_mcp.config.CONFIG_FILE", config_file)
+        from procmon_mcp.config import save_config, load_config
+        save_config({"last_file": "/tmp/test.xml", "no_stack_traces": True, "no_extra_data": False})
+        loaded = load_config()
+        assert loaded["last_file"] == "/tmp/test.xml"
+        assert loaded["no_stack_traces"] is True
+        assert loaded["no_extra_data"] is False
+
+    def test_set_and_get_last_file(self, tmp_path, monkeypatch):
+        config_file = str(tmp_path / "config.json")
+        monkeypatch.setattr("procmon_mcp.config.CONFIG_DIR", str(tmp_path))
+        monkeypatch.setattr("procmon_mcp.config.CONFIG_FILE", config_file)
+        from procmon_mcp.config import set_last_file, get_last_file
+        set_last_file("/home/user/capture.xml.gz")
+        assert get_last_file() == "/home/user/capture.xml.gz"
+
+    def test_load_config_handles_corrupt_json(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        config_file.write_text("not valid json {{{")
+        monkeypatch.setattr("procmon_mcp.config.CONFIG_FILE", str(config_file))
+        from procmon_mcp.config import load_config
+        config = load_config()
+        # Should return defaults without crashing
+        assert config["last_file"] is None
+
+    def test_load_config_ignores_unknown_keys(self, tmp_path, monkeypatch):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"last_file": "/tmp/x.xml", "unknown_key": 42}')
+        monkeypatch.setattr("procmon_mcp.config.CONFIG_FILE", str(config_file))
+        from procmon_mcp.config import load_config
+        config = load_config()
+        assert config["last_file"] == "/tmp/x.xml"
+        assert "unknown_key" not in config
