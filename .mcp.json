@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "procmon": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "procmon_mcp"]
+    }
+  }
+}

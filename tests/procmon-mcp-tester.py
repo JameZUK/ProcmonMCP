@@ -1,398 +1,500 @@
 # -*- coding: utf-8 -*-
+"""Integration test client for ProcmonMCP with assertions and pass/fail tracking."""
 import asyncio
 import json
 import argparse
 import logging
-from typing import Any, Dict, List, Optional, Union
 import sys
-from urllib.parse import urlparse # To validate URL scheme
+from typing import Any, Dict, List, Optional, Union
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Import MCP Client library ---
-# Assumes SDK from https://github.com/modelcontextprotocol/python-sdk is installed
-# If these imports fail, the script will raise an ImportError and exit.
 try:
-    from mcp import ClientSession, types # Core session and types
-    from mcp.client.sse import sse_client # Specific transport client for SSE
+    from mcp import ClientSession, types
+    from mcp.client.sse import sse_client
     logger.info("MCP SDK components imported successfully.")
+    HAS_STREAMABLE_HTTP = False
+    try:
+        from mcp.client.streamable_http import streamablehttp_client
+        HAS_STREAMABLE_HTTP = True
+        logger.info("Streamable HTTP client available.")
+    except ImportError:
+        logger.info("Streamable HTTP client not available (older SDK version).")
 except ImportError as e:
     logger.critical(f"MCP SDK import failed: {e}")
     logger.critical("Please ensure the MCP Python SDK is installed correctly.")
-    logger.critical("Install using: pip install git+https://github.com/modelcontextprotocol/python-sdk.git")
-    sys.exit(1) # Exit if SDK cannot be imported
+    sys.exit(1)
+
+
+# --- Test Results Tracker ---
+class TestResults:
+    """Tracks pass/fail counts and messages for integration tests."""
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.errors: List[str] = []
+
+    def record_pass(self, test_name: str, detail: str = ""):
+        self.passed += 1
+        msg = f"  PASS: {test_name}"
+        if detail:
+            msg += f" ({detail})"
+        print(msg)
+
+    def record_fail(self, test_name: str, detail: str = ""):
+        self.failed += 1
+        msg = f"  FAIL: {test_name}"
+        if detail:
+            msg += f" - {detail}"
+        print(msg)
+        self.errors.append(f"{test_name}: {detail}")
+
+    def assert_is_dict(self, test_name: str, value: Any, required_keys: Optional[List[str]] = None) -> bool:
+        if not isinstance(value, dict):
+            self.record_fail(test_name, f"Expected dict, got {type(value).__name__}")
+            return False
+        if required_keys:
+            missing = [k for k in required_keys if k not in value]
+            if missing:
+                self.record_fail(test_name, f"Missing keys: {missing}")
+                return False
+        self.record_pass(test_name)
+        return True
+
+    def assert_is_list(self, test_name: str, value: Any, min_length: int = 0) -> bool:
+        if not isinstance(value, list):
+            self.record_fail(test_name, f"Expected list, got {type(value).__name__}")
+            return False
+        if len(value) < min_length:
+            self.record_fail(test_name, f"Expected at least {min_length} items, got {len(value)}")
+            return False
+        self.record_pass(test_name)
+        return True
+
+    def assert_positive_int(self, test_name: str, value: Any) -> bool:
+        if not isinstance(value, int) or value <= 0:
+            self.record_fail(test_name, f"Expected positive int, got {value!r}")
+            return False
+        self.record_pass(test_name)
+        return True
+
+    def assert_true(self, test_name: str, condition: bool, detail: str = "") -> bool:
+        if condition:
+            self.record_pass(test_name, detail)
+            return True
+        self.record_fail(test_name, detail)
+        return False
+
+    def print_summary(self):
+        total = self.passed + self.failed
+        print(f"\n{'='*50}")
+        print(f"Integration Test Summary: {self.passed}/{total} passed, {self.failed} failed")
+        if self.errors:
+            print(f"\nFailures:")
+            for err in self.errors:
+                print(f"  - {err}")
+        print(f"{'='*50}")
+
 
 # --- Helper Function to Extract and Parse JSON Result ---
 def extract_json_from_result(raw_result: Any, expect_list: bool = False) -> Optional[Union[Dict, List]]:
-    """
-    Extracts the JSON string(s) from the MCP tool result object and parses it.
-
-    Handles cases where:
-    - content[0].text contains a single JSON object/list.
-    - content is empty.
-    - content contains multiple items, each with a JSON object in .text (if expect_list is True).
-
-    Args:
-        raw_result: The raw result object from session.call_tool.
-        expect_list: If True, attempts to parse multiple content items into a list.
-
-    Returns:
-        The parsed Python object (dict or list), or None if parsing fails or structure is unexpected.
-    """
+    """Extracts and parses JSON from MCP tool result."""
     try:
-        # Check the basic structure of the result object
         if not hasattr(raw_result, 'content') or not isinstance(raw_result.content, list):
-            logger.warning(f"Unexpected result structure: 'content' attribute missing or not a list: {raw_result}")
+            logger.warning(f"Unexpected result structure: {raw_result}")
             return None
-
-        # Handle empty content list
         if not raw_result.content:
-            logger.debug("Result content list is empty.")
-            # Return empty list/dict based on expectation
             return [] if expect_list else {}
 
-        # If expecting a list AND there are multiple content items, parse each
         if expect_list and len(raw_result.content) > 1:
             parsed_list = []
             for i, item in enumerate(raw_result.content):
                 if hasattr(item, 'text') and isinstance(item.text, str):
                     try:
-                        parsed_item = json.loads(item.text)
-                        parsed_list.append(parsed_item)
+                        parsed_list.append(json.loads(item.text))
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse JSON from list item {i}: {e}")
-                        logger.debug(f"Raw text content of item {i}: {item.text}")
-                        # Skip this item
                 else:
-                     logger.warning(f"List item {i} has unexpected structure: {item}")
-            return parsed_list # Return list of successfully parsed items
+                    logger.warning(f"List item {i} has unexpected structure: {item}")
+            return parsed_list
 
-        # Handle single content item (or first item if list not expected explicitly)
         elif len(raw_result.content) >= 1:
-             item = raw_result.content[0]
-             if hasattr(item, 'text') and isinstance(item.text, str):
-                 json_string = item.text
-                 parsed_data = json.loads(json_string)
-                 # Optional: Warn if a list was expected but got something else
-                 if expect_list and not isinstance(parsed_data, list):
-                      logger.warning(f"Expected a list result, but parsed single item is type {type(parsed_data)}.")
-                 return parsed_data
-             else:
-                 logger.warning(f"Result content item 0 has unexpected structure: {item}")
-                 return None
-        else:
-             # Should be caught by the initial empty check
-             logger.warning("Result content list was unexpectedly empty after initial check.")
-             return None
+            item = raw_result.content[0]
+            if hasattr(item, 'text') and isinstance(item.text, str):
+                parsed_data = json.loads(item.text)
+                return parsed_data
+            else:
+                logger.warning(f"Result content item 0 has unexpected structure: {item}")
+                return None
 
-    except json.JSONDecodeError as e:
-        # Log specific JSON error and the content that failed
-        logger.error(f"Failed to parse JSON from result text: {e}")
-        json_text_content = "<N/A>"
-        if hasattr(raw_result, 'content') and raw_result.content and hasattr(raw_result.content[0], 'text'):
-            json_text_content = raw_result.content[0].text
-        logger.debug(f"Raw text content leading to JSON error: {json_text_content}")
         return None
-    except AttributeError as e:
-        logger.error(f"Attribute error accessing result content: {e}")
-        logger.debug(f"Raw result object: {raw_result}")
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse JSON from result text: {e}")
         return None
     except Exception as e:
         logger.error(f"Unexpected error extracting/parsing result: {e}", exc_info=True)
         return None
 
 
-# --- Helper Function for Printing Results ---
-def print_result(tool_name: str, params: Dict[str, Any], parsed_result: Optional[Union[Dict, List]], raw_result: Any = None):
-    """Formats and prints the results of a tool call clearly."""
-    print(f"\n{'='*15} Testing Tool: {tool_name} {'='*15}")
-    if params:
-        print("Parameters:")
-        try: print(json.dumps(params, indent=2))
-        except TypeError: print(str(params)) # Fallback for non-serializable params
-    else: print("Parameters: None")
-    print("-" * (32 + len(tool_name))) # Separator line
-    print("Result (Parsed JSON):")
-    if isinstance(parsed_result, (dict, list)):
-        # Pretty print the parsed JSON
-        try: print(json.dumps(parsed_result, indent=2, default=str))
-        except Exception as e: logger.warning(f"Could not JSON serialize parsed result for {tool_name}: {e}"); print(parsed_result)
-    elif parsed_result is None:
-        print("None (or failed to parse/empty content)") # Clarify potential reason
-        # Log the raw result if parsing failed or content was empty for debugging
-        if raw_result:
-             logger.debug(f"Raw result object for {tool_name} when parsed result was None: {raw_result}")
-    else: # Should not happen if extract_json_from_result works correctly
-        print(parsed_result)
-    print(f"{'='*15} End Test: {tool_name} {'='*15}\n")
-
 # --- Tool Testing Function ---
-async def test_tools_with_session(session: ClientSession): # Expecting a ClientSession instance
-    """Runs the sequence of tool tests using the provided ClientSession object."""
+async def test_tools_with_session(session: ClientSession):
+    """Runs tool tests with assertions."""
     logger.info("Starting tool test sequence...")
+    results = TestResults()
 
-    # Dictionary to store intermediate results for chaining tests
     test_data = {
-        "pid_to_test": 4, # Default PID to test (System process)
-        "pid_to_test_alt": None, # Will try to find another PID from list_processes
-        "process_name_to_test": "svchost.exe", # Common process name to test
-        "event_index_to_test": None # Will try to get an index from query_events
+        "pid_to_test": 4,
+        "pid_to_test_alt": None,
+        "process_name_to_test": "svchost.exe",
+        "event_index_to_test": None,
     }
 
-    # --- Tool Test Sequence ---
-    # Use session.call_tool("tool_name", arguments={...})
-
-    # 0. Initialize (Optional but good practice according to example)
-    tool_name = "session.initialize"
+    # Initialize session
     try:
         if hasattr(session, 'initialize'):
-             logger.info("Calling session.initialize()...")
-             await session.initialize()
-             logger.info("Session initialized.")
-        else:
-             logger.info("Session object does not have an initialize method, skipping.")
+            await session.initialize()
+            logger.info("Session initialized.")
     except Exception as e:
         logger.error(f"Error during session initialization: {e}", exc_info=True)
 
-    # 1. get_loaded_file_summary
-    tool_name = "get_loaded_file_summary"
+    # 0. get_status
+    print(f"\n--- Testing: get_status ---")
     try:
-        params = {}
-        raw_result = await session.call_tool(tool_name, arguments=params)
-        parsed_result = extract_json_from_result(raw_result) # Expect dict
-        print_result(tool_name, params, parsed_result, raw_result)
-    except Exception as e: logger.error(f"Error calling {tool_name}: {e}", exc_info=True); print_result(tool_name, params, f"ERROR: {e}")
+        raw = await session.call_tool("get_status", arguments={})
+        parsed = extract_json_from_result(raw)
+        if results.assert_is_dict("get_status: returns dict", parsed,
+                                  required_keys=["file_loaded", "message", "available_actions"]):
+            results.assert_true("get_status: file_loaded is bool",
+                                isinstance(parsed.get("file_loaded"), bool))
+            results.assert_is_list("get_status: available_actions is list",
+                                   parsed.get("available_actions"), min_length=1)
+    except Exception as e:
+        results.record_fail("get_status: call succeeded", str(e))
+
+    # 1. get_loaded_file_summary
+    print(f"\n--- Testing: get_loaded_file_summary ---")
+    try:
+        raw = await session.call_tool("get_loaded_file_summary", arguments={})
+        parsed = extract_json_from_result(raw)
+        if results.assert_is_dict("summary: returns dict", parsed,
+                                  required_keys=["loaded_filename", "event_count", "process_count"]):
+            results.assert_positive_int("summary: event_count > 0", parsed.get("event_count", 0))
+            results.assert_positive_int("summary: process_count > 0", parsed.get("process_count", 0))
+            results.assert_is_dict("summary: has index_stats", parsed.get("index_stats"),
+                                   required_keys=["pname_indexed_count", "op_indexed_count",
+                                                   "pid_indexed_count", "path_indexed_count"])
+            results.assert_is_dict("summary: has interner_stats", parsed.get("interner_stats"))
+            results.assert_is_dict("summary: has selective_loading", parsed.get("selective_loading"),
+                                   required_keys=["stack_traces", "extra_data"])
+    except Exception as e:
+        results.record_fail("summary: call succeeded", str(e))
 
     # 2. get_metadata
-    tool_name = "get_metadata"
+    print(f"\n--- Testing: get_metadata ---")
     try:
-        params = {}
-        raw_result = await session.call_tool(tool_name, arguments=params)
-        parsed_result = extract_json_from_result(raw_result) # Expect dict
-        print_result(tool_name, params, parsed_result, raw_result)
-    except Exception as e: logger.error(f"Error calling {tool_name}: {e}", exc_info=True); print_result(tool_name, params, f"ERROR: {e}")
+        raw = await session.call_tool("get_metadata", arguments={})
+        parsed = extract_json_from_result(raw)
+        if results.assert_is_dict("metadata: returns dict", parsed,
+                                  required_keys=["loaded_filename", "event_count_loaded", "process_count_loaded"]):
+            results.assert_positive_int("metadata: event_count_loaded > 0", parsed.get("event_count_loaded", 0))
+    except Exception as e:
+        results.record_fail("metadata: call succeeded", str(e))
 
     # 3. list_processes
-    tool_name = "list_processes"
-    process_list_result: Optional[List[Dict]] = None
+    print(f"\n--- Testing: list_processes ---")
+    process_list = None
     try:
-        params = {}
-        raw_result = await session.call_tool(tool_name, arguments=params)
-        # Tell helper to expect a list, potentially from multiple content items
-        parsed_result = extract_json_from_result(raw_result, expect_list=True)
-        if isinstance(parsed_result, list):
-             process_list_result = parsed_result
-        else:
-             logger.error(f"{tool_name} did not return a list as expected (parsed type: {type(parsed_result)}).")
-             process_list_result = None
-
-        print_result(tool_name, params, process_list_result, raw_result)
-        # Check process_list_result is not None before len()
-        if process_list_result and len(process_list_result) > 1:
-            for proc in process_list_result:
+        raw = await session.call_tool("list_processes", arguments={})
+        parsed = extract_json_from_result(raw, expect_list=True)
+        if results.assert_is_list("list_processes: returns list", parsed, min_length=1):
+            process_list = parsed
+            first = parsed[0]
+            results.assert_is_dict("list_processes: first item is dict with pid",
+                                   first, required_keys=["pid", "process_name"])
+            # All entries should have pid
+            all_have_pid = all(isinstance(p.get("pid"), int) for p in parsed)
+            results.assert_true("list_processes: all entries have int pid", all_have_pid)
+            # Find alt PID
+            for proc in parsed:
                 pid = proc.get("pid")
                 if pid is not None and pid != test_data["pid_to_test"]:
                     test_data["pid_to_test_alt"] = pid
-                    logger.info(f"Found alternative PID for testing: {test_data['pid_to_test_alt']}")
                     break
-    except Exception as e: logger.error(f"Error calling {tool_name}: {e}", exc_info=True); print_result(tool_name, params, f"ERROR: {e}")
+    except Exception as e:
+        results.record_fail("list_processes: call succeeded", str(e))
 
     # 4. get_process_details
     pids_to_check = [test_data["pid_to_test"]]
-    if test_data["pid_to_test_alt"] is not None: pids_to_check.append(test_data["pid_to_test_alt"])
+    if test_data["pid_to_test_alt"] is not None:
+        pids_to_check.append(test_data["pid_to_test_alt"])
+    print(f"\n--- Testing: get_process_details ---")
     for pid_val in pids_to_check:
-         tool_name_display = f"get_process_details (PID: {pid_val})"
-         tool_name_call = "get_process_details"
-         try:
-             params = {"pid": pid_val}
-             raw_result = await session.call_tool(tool_name_call, arguments=params)
-             parsed_result = extract_json_from_result(raw_result) # Expect dict
-             print_result(tool_name_display, params, parsed_result, raw_result)
-         except Exception as e: logger.error(f"Error calling {tool_name_call} for PID {pid_val}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+        try:
+            raw = await session.call_tool("get_process_details", arguments={"pid": pid_val})
+            parsed = extract_json_from_result(raw)
+            if results.assert_is_dict(f"process_details(pid={pid_val}): returns dict", parsed):
+                results.assert_true(f"process_details(pid={pid_val}): has process_id",
+                                    parsed.get("process_id") == pid_val,
+                                    f"expected {pid_val}, got {parsed.get('process_id')}")
+        except Exception as e:
+            results.record_fail(f"process_details(pid={pid_val}): call succeeded", str(e))
 
-    # 5. query_events
-    query_results_parsed: Optional[List[Dict]] = None
-    tool_name_call = "query_events"
-    tool_name_display = "query_events (no filters)"
+    # 5. query_events (no filters)
+    print(f"\n--- Testing: query_events ---")
     try:
-        params = {"limit": 5}
-        raw_result = await session.call_tool(tool_name_call, arguments=params)
-        parsed_result = extract_json_from_result(raw_result, expect_list=True) # Expect list
-        if isinstance(parsed_result, list):
-             query_results_parsed = parsed_result
-        else:
-             logger.error(f"{tool_name_call} did not return a list as expected (parsed type: {type(parsed_result)}).")
-             query_results_parsed = None
+        raw = await session.call_tool("query_events", arguments={"limit": 5})
+        parsed = extract_json_from_result(raw, expect_list=True)
+        if results.assert_is_list("query_events(no filter): returns list", parsed, min_length=1):
+            first = parsed[0]
+            results.assert_is_dict("query_events: first item has required keys", first,
+                                   required_keys=["event_index", "timestamp", "process_name", "pid", "operation"])
+            idx = first.get("event_index")
+            if isinstance(idx, int):
+                test_data["event_index_to_test"] = idx
+            results.assert_true("query_events(limit=5): at most 5 results",
+                                len(parsed) <= 5, f"got {len(parsed)}")
+    except Exception as e:
+        results.record_fail("query_events(no filter): call succeeded", str(e))
 
-        print_result(tool_name_display, params, query_results_parsed, raw_result)
-        # Check query_results_parsed is not None before len()
-        if query_results_parsed and len(query_results_parsed) > 0:
-            idx_val = query_results_parsed[0].get("event_index")
-            if isinstance(idx_val, int): test_data["event_index_to_test"] = idx_val; logger.info(f"Found event index for testing: {test_data['event_index_to_test']}")
-            else: logger.warning(f"First query result missing valid 'event_index': {query_results_parsed[0]}")
-        elif query_results_parsed is not None: # It's an empty list
-             logger.info(f"{tool_name_display} returned an empty list.")
-        # else: parsing failed, error already logged by extract_json_from_result
-
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-
-    # Other query_events scenarios (apply same parsing logic)
+    # query_events with process filter
     process_filter = test_data["process_name_to_test"]
-    tool_name_display = f"query_events (filter_process='{process_filter}')"
-    try: params = {"filter_process": process_filter, "limit": 5}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result)
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-    op_filter = "RegQueryKey"; tool_name_display = f"query_events (filter_operation='{op_filter}')"
-    try: params = {"filter_operation": op_filter, "limit": 5}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result)
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-    res_filter = "SUCCESS"; tool_name_display = f"query_events (filter_result='{res_filter}')"
-    try: params = {"filter_result": res_filter, "limit": 5}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result)
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-    path_filter = "Software\\Microsoft"; tool_name_display = f"query_events (filter_path_contains='{path_filter}')"
-    try: params = {"filter_path_contains": path_filter, "limit": 5}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result)
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-    tool_name_display = "query_events (combined filters)"
-    try: params = {"filter_process": process_filter, "filter_operation": op_filter, "filter_result": res_filter, "limit": 5}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result)
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+    try:
+        raw = await session.call_tool("query_events",
+                                      arguments={"filter_process": process_filter, "limit": 5})
+        parsed = extract_json_from_result(raw, expect_list=True)
+        if results.assert_is_list(f"query_events(process={process_filter}): returns list", parsed):
+            if parsed:
+                all_match = all(e.get("process_name") == process_filter for e in parsed)
+                results.assert_true(f"query_events(process={process_filter}): all match filter",
+                                    all_match, "some events don't match process filter")
+    except Exception as e:
+        results.record_fail(f"query_events(process={process_filter}): call succeeded", str(e))
+
+    # query_events with operation filter
+    op_filter = "RegQueryKey"
+    try:
+        raw = await session.call_tool("query_events",
+                                      arguments={"filter_operation": op_filter, "limit": 5})
+        parsed = extract_json_from_result(raw, expect_list=True)
+        if results.assert_is_list(f"query_events(op={op_filter}): returns list", parsed):
+            if parsed:
+                all_match = all(e.get("operation") == op_filter for e in parsed)
+                results.assert_true(f"query_events(op={op_filter}): all match filter",
+                                    all_match, "some events don't match operation filter")
+    except Exception as e:
+        results.record_fail(f"query_events(op={op_filter}): call succeeded", str(e))
+
+    # query_events with path_contains filter
+    path_filter = "Software\\Microsoft"
+    try:
+        raw = await session.call_tool("query_events",
+                                      arguments={"filter_path_contains": path_filter, "limit": 5})
+        parsed = extract_json_from_result(raw, expect_list=True)
+        if results.assert_is_list(f"query_events(path_contains): returns list", parsed):
+            if parsed:
+                all_match = all(path_filter.lower() in (e.get("path") or "").lower() for e in parsed)
+                results.assert_true(f"query_events(path_contains): all paths contain '{path_filter}'",
+                                    all_match, "some paths don't contain the filter substring")
+    except Exception as e:
+        results.record_fail(f"query_events(path_contains): call succeeded", str(e))
 
     # 6. get_event_details
+    print(f"\n--- Testing: get_event_details ---")
     event_idx = test_data["event_index_to_test"]
-    tool_name_display = f"get_event_details (index={event_idx})"
-    tool_name_call = "get_event_details"
-    if event_idx is not None:
-        try: params = {"event_index": event_idx}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result); print_result(tool_name_display, params, parsed_result, raw_result)
-        except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-    else: logger.warning(f"Skipping {tool_name_display} test: No valid event_index found."); print_result(tool_name_display, {}, None) # Pass None for parsed_result
-
-    # 7. get_event_stack_trace
-    tool_name_display = f"get_event_stack_trace (index={event_idx})"
-    tool_name_call = "get_event_stack_trace"
     if event_idx is not None:
         try:
-            params = {"event_index": event_idx}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result) # Expect list
-            if isinstance(parsed_result, list) and not parsed_result: print("  (Note: Result is empty. This is expected if stacks were not loaded via --no-stack-traces on the server, or if this specific event had no stack).")
-        except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-    else: logger.warning(f"Skipping {tool_name_display} test: No valid event_index found."); print_result(tool_name_display, {}, None)
+            raw = await session.call_tool("get_event_details", arguments={"event_index": event_idx})
+            parsed = extract_json_from_result(raw)
+            if results.assert_is_dict(f"event_details(idx={event_idx}): returns dict", parsed,
+                                      required_keys=["event_index", "timestamp", "process_name", "pid", "operation"]):
+                results.assert_true(f"event_details: event_index matches",
+                                    parsed.get("event_index") == event_idx,
+                                    f"expected {event_idx}, got {parsed.get('event_index')}")
+        except Exception as e:
+            results.record_fail(f"event_details(idx={event_idx}): call succeeded", str(e))
+    else:
+        results.record_fail("event_details: skipped", "no event_index available")
+
+    # 7. get_event_stack_trace
+    print(f"\n--- Testing: get_event_stack_trace ---")
+    if event_idx is not None:
+        try:
+            raw = await session.call_tool("get_event_stack_trace", arguments={"event_index": event_idx})
+            parsed = extract_json_from_result(raw, expect_list=True)
+            if results.assert_is_list(f"stack_trace(idx={event_idx}): returns list", parsed):
+                if parsed:
+                    results.assert_is_dict("stack_trace: first frame has keys",
+                                           parsed[0], required_keys=["depth", "address", "path", "location"])
+        except Exception as e:
+            results.record_fail(f"stack_trace(idx={event_idx}): call succeeded", str(e))
+    else:
+        results.record_fail("stack_trace: skipped", "no event_index available")
 
     # 8. count_events_by_process
-    tool_name = "count_events_by_process"
-    try: params = {}; raw_result = await session.call_tool(tool_name, arguments=params); parsed_result = extract_json_from_result(raw_result); print_result(tool_name, params, parsed_result, raw_result) # Expect dict
-    except Exception as e: logger.error(f"Error calling {tool_name}: {e}", exc_info=True); print_result(tool_name, {}, f"ERROR: {e}")
+    print(f"\n--- Testing: count_events_by_process ---")
+    try:
+        raw = await session.call_tool("count_events_by_process", arguments={})
+        parsed = extract_json_from_result(raw)
+        if results.assert_is_dict("count_by_process: returns dict", parsed):
+            results.assert_true("count_by_process: has entries",
+                                len(parsed) > 0, f"got {len(parsed)} entries")
+            all_int_values = all(isinstance(v, int) and v > 0 for v in parsed.values())
+            results.assert_true("count_by_process: all values are positive ints", all_int_values)
+    except Exception as e:
+        results.record_fail("count_by_process: call succeeded", str(e))
 
     # 9. summarize_operations_by_process
-    process_filter = test_data["process_name_to_test"]
-    tool_name_display = f"summarize_operations_by_process (process='{process_filter}')"
-    tool_name_call = "summarize_operations_by_process"
-    try: params = {"process_name_filter": process_filter}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result); print_result(tool_name_display, params, parsed_result, raw_result) # Expect dict
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+    print(f"\n--- Testing: summarize_operations_by_process ---")
+    try:
+        raw = await session.call_tool("summarize_operations_by_process",
+                                      arguments={"process_name_filter": process_filter})
+        parsed = extract_json_from_result(raw)
+        if results.assert_is_dict(f"ops_by_process({process_filter}): returns dict", parsed):
+            if parsed:
+                all_int_values = all(isinstance(v, int) and v > 0 for v in parsed.values())
+                results.assert_true(f"ops_by_process({process_filter}): all values positive ints", all_int_values)
+    except Exception as e:
+        results.record_fail(f"ops_by_process({process_filter}): call succeeded", str(e))
 
     # 10. get_timing_statistics
-    tool_name_call = "get_timing_statistics"
-    tool_name_display = "get_timing_statistics (group_by='process')"
-    try: params = {"group_by": "process"}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result); print_result(tool_name_display, params, parsed_result, raw_result) # Expect dict
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-    tool_name_display = "get_timing_statistics (group_by='operation')"
-    try: params = {"group_by": "operation"}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result); print_result(tool_name_display, params, parsed_result, raw_result) # Expect dict
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+    print(f"\n--- Testing: get_timing_statistics ---")
+    for group_by in ["process", "operation"]:
+        try:
+            raw = await session.call_tool("get_timing_statistics",
+                                          arguments={"group_by": group_by})
+            parsed = extract_json_from_result(raw)
+            if results.assert_is_dict(f"timing_stats(group={group_by}): returns dict", parsed):
+                if parsed:
+                    first_key = next(iter(parsed))
+                    first_val = parsed[first_key]
+                    results.assert_is_dict(f"timing_stats(group={group_by}): first value has stats",
+                                           first_val, required_keys=["count", "min_duration", "max_duration",
+                                                                     "avg_duration", "total_duration"])
+        except Exception as e:
+            results.record_fail(f"timing_stats(group={group_by}): call succeeded", str(e))
 
     # 11. get_process_lifetime
-    tool_name_call = "get_process_lifetime"
+    print(f"\n--- Testing: get_process_lifetime ---")
     for pid_val in pids_to_check:
-         tool_name_display = f"get_process_lifetime (PID: {pid_val})"
-         try: params = {"pid": pid_val}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result); print_result(tool_name_display, params, parsed_result, raw_result) # Expect dict
-         except Exception as e: logger.error(f"Error calling {tool_name_call} for PID {pid_val}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+        try:
+            raw = await session.call_tool("get_process_lifetime", arguments={"pid": pid_val})
+            parsed = extract_json_from_result(raw)
+            results.assert_is_dict(f"lifetime(pid={pid_val}): returns dict", parsed,
+                                   required_keys=["create_timestamp", "exit_timestamp"])
+        except Exception as e:
+            results.record_fail(f"lifetime(pid={pid_val}): call succeeded", str(e))
 
     # 12. find_file_access
-    path_filter = "windows\\system32"
-    tool_name_display = f"find_file_access (path_contains='{path_filter}')"
-    tool_name_call = "find_file_access"
-    try: params = {"path_contains": path_filter, "limit": 5}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result) # Expect list
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+    print(f"\n--- Testing: find_file_access ---")
+    fa_path = "windows\\system32"
+    try:
+        raw = await session.call_tool("find_file_access",
+                                      arguments={"path_contains": fa_path, "limit": 5})
+        parsed = extract_json_from_result(raw, expect_list=True)
+        if results.assert_is_list(f"file_access('{fa_path}'): returns list", parsed):
+            if parsed:
+                results.assert_is_dict("file_access: first item has keys", parsed[0],
+                                       required_keys=["event_index", "path", "operation"])
+                all_match = all(fa_path.lower() in (e.get("path") or "").lower() for e in parsed)
+                results.assert_true(f"file_access: all paths contain '{fa_path}'",
+                                    all_match, "some paths don't contain the filter")
+                results.assert_true("file_access(limit=5): at most 5 results",
+                                    len(parsed) <= 5, f"got {len(parsed)}")
+    except Exception as e:
+        results.record_fail(f"file_access('{fa_path}'): call succeeded", str(e))
 
     # 13. find_network_connections
-    process_filter = test_data["process_name_to_test"]
-    tool_name_display = f"find_network_connections (process='{process_filter}')"
-    tool_name_call = "find_network_connections"
-    try: params = {"process_name": process_filter}; raw_result = await session.call_tool(tool_name_call, arguments=params); parsed_result = extract_json_from_result(raw_result, expect_list=True); print_result(tool_name_display, params, parsed_result, raw_result) # Expect list
-    except Exception as e: logger.error(f"Error calling {tool_name_call}: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+    print(f"\n--- Testing: find_network_connections ---")
+    try:
+        raw = await session.call_tool("find_network_connections",
+                                      arguments={"process_name": process_filter})
+        parsed = extract_json_from_result(raw, expect_list=True)
+        results.assert_is_list(f"network({process_filter}): returns list", parsed)
+    except Exception as e:
+        results.record_fail(f"network({process_filter}): call succeeded", str(e))
 
     # 14. export_query_results
-    tool_name_call = "export_query_results"
-    tool_name_display = "export_query_results (to CSV)"
-    try:
-        output_filename_csv = "mcp_test_export.csv"; params = {"output_file": output_filename_csv, "output_format": "csv", "filter_operation": "RegQueryValue", "filter_result": "SUCCESS"}
-        raw_result = await session.call_tool(tool_name_call, arguments=params)
-        parsed_result = extract_json_from_result(raw_result) # Expect dict
-        print_result(tool_name_display, params, parsed_result, raw_result)
-        # Check parsed_result for success
-        if isinstance(parsed_result, dict) and parsed_result.get("success"):
-            logger.info(f"CSV Export test reported success. File generated: {parsed_result.get('output_path')}")
-        else:
-            logger.error(f"CSV Export test failed or did not report success. Parsed Result: {parsed_result}")
-    except Exception as e: logger.error(f"Error calling {tool_name_call} for CSV: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
+    print(f"\n--- Testing: export_query_results ---")
+    for fmt in ["csv", "json"]:
+        output_file = f"mcp_test_export.{fmt}"
+        try:
+            raw = await session.call_tool("export_query_results",
+                                          arguments={"output_file": output_file,
+                                                     "output_format": fmt,
+                                                     "filter_operation": "RegQueryValue",
+                                                     "filter_result": "SUCCESS"})
+            parsed = extract_json_from_result(raw)
+            if results.assert_is_dict(f"export({fmt}): returns dict", parsed,
+                                      required_keys=["success", "output_path", "events_exported"]):
+                results.assert_true(f"export({fmt}): success is True",
+                                    parsed.get("success") is True,
+                                    f"got {parsed.get('success')}")
+        except Exception as e:
+            results.record_fail(f"export({fmt}): call succeeded", str(e))
 
-    tool_name_display = "export_query_results (to JSON)"
-    try:
-        output_filename_json = "mcp_test_export.json"; params = {"output_file": output_filename_json, "output_format": "json", "filter_operation": "RegCloseKey"}
-        raw_result = await session.call_tool(tool_name_call, arguments=params)
-        parsed_result = extract_json_from_result(raw_result) # Expect dict
-        print_result(tool_name_display, params, parsed_result, raw_result)
-        # Check parsed_result for success
-        if isinstance(parsed_result, dict) and parsed_result.get("success"):
-            logger.info(f"JSON Export test reported success. File generated: {parsed_result.get('output_path')}")
-        else:
-             logger.error(f"JSON Export test failed or did not report success. Parsed Result: {parsed_result}")
-    except Exception as e: logger.error(f"Error calling {tool_name_call} for JSON: {e}", exc_info=True); print_result(tool_name_display, params, f"ERROR: {e}")
-
-    logger.info("All tests completed.")
+    # Print summary and exit with appropriate code
+    results.print_summary()
+    return results.failed == 0
 
 
 # --- Main Execution Function ---
 async def main(host: str, port: int, transport: str):
     """Sets up connection and runs tests."""
-
-    # --- Connection Logic ---
+    all_passed = False
     try:
         if transport == "stdio":
             logger.error("Testing via stdio from this script is not directly supported.")
-            logger.error("Please run the server with stdio and interact manually, or use SSE for client testing.")
-            return # Exit if stdio requested
+            logger.error("Please run the server with SSE or streamable-http for client testing.")
+            sys.exit(1)
+
+        elif transport == "streamable-http":
+            if not HAS_STREAMABLE_HTTP:
+                logger.error("Streamable HTTP client not available. Upgrade MCP SDK: pip install 'mcp[cli]>=1.8.0'")
+                sys.exit(1)
+            url = f"http://{host}:{port}/mcp"
+            logger.info(f"Connecting via Streamable HTTP to: {url}...")
+
+            async with streamablehttp_client(url) as streams:
+                logger.info("Streamable HTTP client connected.")
+                read_stream, write_stream = streams[0], streams[1]
+                async with ClientSession(read_stream, write_stream) as session:
+                    logger.info("ClientSession created. Running tests...")
+                    all_passed = await test_tools_with_session(session)
 
         elif transport == "sse":
-            # Construct the SSE endpoint URL
             sse_url = f"http://{host}:{port}/sse"
-            logger.info(f"Attempting to connect via SSE to MCP server endpoint: {sse_url}...")
+            logger.info(f"Connecting via SSE (deprecated) to: {sse_url}...")
 
-            # Use sse_client to get read/write streams
             async with sse_client(sse_url) as streams:
-                logger.info("SSE client connected. Creating ClientSession...")
+                logger.info("SSE client connected.")
                 read_stream, write_stream = streams
-                # Use ClientSession with the obtained streams
                 async with ClientSession(read_stream, write_stream) as session:
-                    logger.info("ClientSession created. Running tool tests...")
-                    await test_tools_with_session(session) # Pass the ClientSession instance
+                    logger.info("ClientSession created. Running tests...")
+                    all_passed = await test_tools_with_session(session)
 
     except ConnectionRefusedError:
-        logger.error(f"Connection refused. Is the MCP server running at {host}:{port} and accepting SSE connections at /sse?")
-    except ImportError:
-         # This case should ideally be caught at the top, but included for safety
-         logger.critical("MCP SDK is required but not found. Cannot run tests.")
-         logger.critical("Install using: pip install git+https://github.com/modelcontextprotocol/python-sdk.git")
-         sys.exit(1)
+        logger.error(f"Connection refused. Is the MCP server running at {host}:{port}?")
     except Exception as e:
-        logger.error(f"An error occurred during connection or testing: {e}", exc_info=True)
+        logger.error(f"Error during connection or testing: {e}", exc_info=True)
+
+    if not all_passed:
+        sys.exit(1)
 
 
 # --- Script Entry Point ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Simplified Test client for the Procmon XML MCP Tool (using ClientSession).")
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host where the MCP server is running (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=8081, help="Port where the MCP server is running (default: 8081)")
-    parser.add_argument("--transport", type=str, default="sse", choices=["stdio", "sse"],
-                        help="MCP transport expected by the server (default: sse). Only SSE connection is attempted by this client.")
+    parser = argparse.ArgumentParser(
+        description="Integration test client for ProcmonMCP with assertion-based pass/fail tracking.")
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Host where the MCP server is running (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8081,
+                        help="Port where the MCP server is running (default: 8081)")
+    parser.add_argument("--transport", type=str, default="streamable-http",
+                        choices=["stdio", "sse", "streamable-http"],
+                        help="MCP transport (default: streamable-http)")
 
     args = parser.parse_args()
-
-    # Run the main async function
     asyncio.run(main(args.host, args.port, args.transport))

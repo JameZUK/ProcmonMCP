@@ -1,178 +1,366 @@
 # ProcmonMCP
 
-ProcmonMCP is a Model Context Protocol server designed to allow LLMs to autonomously analyze **Procmon XML log files**. It exposes numerous functionalities to MCP clients.
+ProcmonMCP is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows LLMs to autonomously analyse **Process Monitor (Procmon) XML log files**. It exposes a comprehensive set of analysis tools to any MCP-compatible client, including Claude Code, Claude Desktop, Cline, and others.
 
 ## Overview
 
-This project provides a Model Context Protocol (MCP) server that parses and analyzes **Process Monitor (Procmon) XML log files (`.xml`, `.xml.gz`, `.xml.bz2`, `.xml.xz`)**. It allows Large Language Models (LLMs) connected via MCP clients (like Cline) to investigate system activity captured in these logs.
+Process Monitor captures detailed system activity — file access, registry operations, network connections, process creation, and more. ProcmonMCP parses these XML logs into an optimised in-memory representation and exposes them as MCP tools, enabling an LLM to investigate system behaviour without manual data wrangling.
 
-By pre-loading a specific Procmon XML file specified via the `--input-file` argument at startup, this server optimizes the data for in-memory analysis using **string interning** and other techniques. It then exposes various tools enabling the LLM to query events, inspect process details, view metadata, export results, and perform basic analysis on the loaded log data.
+Key capabilities:
+- **Load files at runtime** — no need to restart the server to analyse a different capture
+- **String interning** for reduced memory footprint on large logs
+- **Indexed lookups** by process name, operation, PID, and file path for fast filtering
+- **Multiple transport protocols** — stdio (recommended), Streamable HTTP, and SSE (deprecated)
+- **Progress feedback** during file loading via MCP notifications
 
-This project was inspired by the approach taken in the [GhidraMCP project](https://github.com/LaurieWired/GhidraMCP).
+This project was inspired by the approach taken in [GhidraMCP](https://github.com/LaurieWired/GhidraMCP).
 
-**⚠ VERY IMPORTANT SECURITY WARNING ⚠**
-
-* Process Monitor logs can contain extremely sensitive system information (keystrokes, passwords in command lines, file contents, network traffic details, etc.).
-* This script loads **any file path** provided via the `--input-file` argument that the user running the script has read permissions for. There is **NO** directory sandboxing.
-* Exposing Procmon data via an API (like the MCP server) carries **significant security risks**. Malicious actors could potentially request sensitive information from the loaded log file.
-* **Only run this server in highly trusted environments.**
-* **NEVER run this server with Procmon logs captured from systems containing sensitive production or personal data unless you fully understand and accept the risks.**
-* **Carefully review the logs you intend to load for sensitive information BEFORE using this tool.**
-
-## Features
-
-* Load a specific Procmon **XML** file (`.xml` or compressed `.xml.gz`/`.bz2`/`.xz`) using the `--input-file` path at startup.
-* **Optimizes** loaded data using in-memory string interning for reduced memory footprint and faster querying on repetitive data.
-* Provides **progress reporting** during the potentially long loading phase.
-* Provide MCP tools for LLMs to:
-    * Query event summaries with filtering capabilities (process name/contains, operation, result, path contains/regex, detail regex, timestamp, stack module path).
-    * Retrieve detailed information for specific events by index.
-    * Get stack traces (module path, location, address) for specific events (if loaded).
-    * List unique processes found in the log's process list section.
-    * Get detailed information for specific processes by PID from the process list.
-    * Retrieve basic metadata about the loaded file.
-    * Perform basic analysis (count events by process, summarize operations by process, calculate timing statistics, find network connections, find file access).
-    * Export filtered event results to CSV or JSON files.
-* Uses `lxml` for faster XML parsing if available, with fallback to standard library `xml.etree.ElementTree`.
-* Supports `stdio` and `sse` MCP transport protocols.
-* Optional flags to skip loading stack traces (`--no-stack-traces`) or extra unknown event fields (`--no-extra-data`) to save memory.
-* Debug logging option (`--debug`).
-* Memory usage reporting if `psutil` is installed.
+> **Security Warning**
+>
+> Process Monitor logs can contain extremely sensitive system information (keystrokes, passwords in command lines, file contents, network traffic details, etc.).
+>
+> - This tool loads **any file path** that the user running the script has read permissions for. There is **no** directory sandboxing.
+> - **Only run this server in trusted environments.**
+> - **Never run this server with Procmon logs captured from systems containing sensitive production or personal data unless you fully understand and accept the risks.**
+> - **Review the logs you intend to load for sensitive information before using this tool.**
 
 ## Installation
 
-1.  **Prerequisites:**
-    * Python 3.x (developed with 3.10+ in mind).
-    * `pip` (Python package installer).
+### Prerequisites
 
-2.  **Clone the Repository (Optional):**
-    ```bash
-    git clone [https://github.com/JameZUK/ProcmonMCP](https://github.com/JameZUK/ProcmonMCP)
-    cd ProcmonMCP
-    ```
-    *(Or just download the Python script)*
+- Python 3.7 or newer (developed and tested with 3.10+)
+- `pip` (Python package installer)
 
-3.  **Install Dependencies:**
-    ```bash
-    # modelcontextprotocol is required
-    # lxml is highly recommended for performance
-    # psutil is optional for memory reporting
-    pip install "mcp[cli]" lxml psutil
-    ```
-    *(If you choose not to install `lxml`, the script will use the slower built-in XML parser. If you don't install `psutil`, memory usage won't be reported after loading.)*
+### Install from source
+
+```bash
+git clone https://github.com/JameZUK/ProcmonMCP
+cd ProcmonMCP
+pip install -r requirements.txt
+```
+
+### Dependencies
+
+| Package | Required | Purpose |
+|---------|----------|---------|
+| `mcp[cli]>=1.8.0` | Yes | MCP SDK with CLI tools and Streamable HTTP support |
+| `lxml>=4.9.0` | Recommended | Faster XML parsing (falls back to stdlib `ElementTree` if absent) |
+| `psutil>=5.9.0` | Optional | Memory usage reporting after file loading |
+
+Install all at once:
+```bash
+pip install "mcp[cli]>=1.8.0" lxml psutil
+```
+
+## Quick Start with Claude Code
+
+The recommended way to use ProcmonMCP is via **stdio** transport with Claude Code. The server starts without any file loaded — you (or the LLM) can then use the `load_file` tool to open a Procmon capture.
+
+### Option 1: Add via Claude Code CLI
+
+```bash
+# Add ProcmonMCP as a stdio server (user-wide)
+claude mcp add procmon --scope user -- python -m procmon_mcp
+
+# Or with a file pre-loaded at startup
+claude mcp add procmon --scope user -- python -m procmon_mcp --input-file /path/to/capture.xml.gz
+
+# Or scoped to the current project only
+claude mcp add procmon --scope project -- python -m procmon_mcp
+```
+
+### Option 2: Add via JSON
+
+```bash
+claude mcp add-json procmon '{
+  "type": "stdio",
+  "command": "python",
+  "args": ["-m", "procmon_mcp"]
+}'
+```
+
+### Option 3: Edit configuration files directly
+
+Claude Code reads MCP server configuration from these locations:
+
+| Scope | File | Description |
+|-------|------|-------------|
+| Project (shared, version-controlled) | `.mcp.json` in project root | Shared with the team |
+| Project (personal) | `.claude/settings.local.json` | Your local overrides |
+| User (global) | `~/.claude.json` | Available across all projects |
+
+Example `.mcp.json` for a shared project:
+
+```json
+{
+  "mcpServers": {
+    "procmon": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "procmon_mcp"]
+    }
+  }
+}
+```
+
+Example with a pre-loaded file and options:
+
+```json
+{
+  "mcpServers": {
+    "procmon": {
+      "type": "stdio",
+      "command": "python",
+      "args": [
+        "-m", "procmon_mcp",
+        "--input-file", "/path/to/capture.xml.gz",
+        "--no-stack-traces"
+      ]
+    }
+  }
+}
+```
+
+### Option 4: Streamable HTTP transport
+
+For network access or multi-client scenarios, use Streamable HTTP:
+
+```bash
+# Add as an HTTP server (start the server separately first)
+claude mcp add --transport http procmon http://127.0.0.1:8081/mcp
+```
+
+Then start the server:
+```bash
+python -m procmon_mcp --transport streamable-http --mcp-port 8081
+```
+
+### Verify the connection
+
+Once configured, verify that Claude Code can see ProcmonMCP:
+
+```bash
+claude mcp list
+```
+
+Inside a Claude Code session, you can also type `/mcp` to check the status of connected servers.
 
 ## Usage
 
-The server requires specifying the path to the Procmon XML file to pre-load for analysis.
+### Typical workflow
 
-**Command-Line Arguments:**
+1. **Start the server** (Claude Code does this automatically for stdio servers)
+2. **Check status**: The LLM calls `get_status` to see if a file is loaded
+3. **Load a file**: The LLM calls `load_file` with a path to a Procmon XML capture
+4. **Analyse**: The LLM uses the analysis tools to investigate the log data
 
-* `--input-file <path>`: **(Required)** The full path to the Procmon XML file (.xml, .gz, .bz2, .xz) to load and analyze. The script must have read permissions for this file.
-* `--transport <stdio|sse>`: (Optional) Transport protocol for MCP. Default: `stdio`.
-* `--mcp-host <ip>`: (Optional) Host address for the MCP server (only used for `sse` transport). Default: `127.0.0.1`.
-* `--mcp-port <port>`: (Optional) Port for the MCP server (only used for `sse` transport). Default: `8081`.
-* `--debug`: (Optional) Enable verbose debug logging.
-* `--log-file <path>`: (Optional) Path to a file to write logs to instead of the console.
-* `--no-stack-traces`: (Optional) Do not parse or store stack traces (saves memory).
-* `--no-extra-data`: (Optional) Do not store unknown fields found within `<event>` tags (saves memory).
+### Command-line arguments
 
-**Examples:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input-file <path>` | *(none)* | Pre-load a Procmon XML file at startup. If omitted, use `load_file` from the MCP client. |
+| `--transport <mode>` | `stdio` | Transport protocol: `stdio`, `streamable-http`, or `sse` (deprecated). |
+| `--mcp-host <ip>` | `127.0.0.1` | Host address (HTTP transports only). |
+| `--mcp-port <port>` | `8081` | Port number (HTTP transports only). |
+| `--no-stack-traces` | off | Skip loading stack traces to save memory. |
+| `--no-extra-data` | off | Skip loading unknown/extra event fields to save memory. |
+| `--debug` | off | Enable verbose debug logging. |
+| `--log-file <path>` | *(console)* | Write logs to a file instead of the console. |
+| `--profile` | off | Enable cProfile profiling (for development). |
 
-* **Run with STDIO, loading a compressed XML file:**
-    ```bash
-    python procmon-mcp.py --input-file /path/to/logs/my_capture.xml.gz
-    ```
+### Examples
 
-* **Run with SSE on port 8082, loading an uncompressed XML file, with debug logging, and skipping stacks:**
-    ```bash
-    python procmon-mcp.py --input-file C:\procmon_files\trace_log.xml --transport sse --mcp-port 8082 --debug --no-stack-traces
-    ```
+**Start with stdio (no file pre-loaded — use `load_file` from the client):**
+```bash
+python -m procmon_mcp
+```
 
-## MCP Clients
+**Pre-load a compressed XML file:**
+```bash
+python -m procmon_mcp --input-file /path/to/capture.xml.gz
+```
 
-Theoretically, any MCP client should work with ProcmonMCP. Three examples are given below.
+**Start with Streamable HTTP on a custom port:**
+```bash
+python -m procmon_mcp --transport streamable-http --mcp-port 9000
+```
 
-Example 1: Cline
+**Skip stack traces for a very large file:**
+```bash
+python -m procmon_mcp --input-file /path/to/huge_capture.xml --no-stack-traces --no-extra-data
+```
 
-To use GhidraMCP with Cline, this requires manually running the MCP server as well. First run the following command:
+## Transport Protocols
 
-python procmon-mcp.py --input-file C:\procmon_files\trace_log.xml --transport sse --mcp-port 8082
+| Transport | Use case | Status |
+|-----------|----------|--------|
+| **stdio** | Local use with Claude Code, Claude Desktop, etc. | **Recommended** |
+| **streamable-http** | Network access, multiple clients, remote deployment | Supported |
+| **sse** | Legacy MCP clients that do not yet support Streamable HTTP | **Deprecated** (MCP spec 2025-03-26) |
 
-Specify the path to the procmon XML. If all other arguments are unspecified, they will default to the above. Once the MCP server is running, open up Cline and select MCP Servers at the top.
+### stdio (recommended)
 
-Cline select
+The simplest and most reliable transport. Claude Code spawns the server as a child process and communicates over stdin/stdout. No network configuration required.
 
-Then select Remote Servers and add the following, ensuring that the url matches the MCP host and port:
+### Streamable HTTP
 
-    Server Name: ProcmonMCP
-    Server URL: http://127.0.0.1:8081/sse
+Uses a single HTTP endpoint (`/mcp`) for all communication. Supports session management, optional SSE streaming for long-running operations, and is designed for scalability.
+
+```bash
+python -m procmon_mcp --transport streamable-http --mcp-host 0.0.0.0 --mcp-port 8081
+```
+
+The server will be available at `http://<host>:<port>/mcp`.
+
+### SSE (deprecated)
+
+> **Deprecated since MCP specification 2025-03-26.** SSE is retained for backwards compatibility but will be removed in a future release. Please migrate to `streamable-http` or `stdio`.
+
+```bash
+python -m procmon_mcp --transport sse --mcp-port 8081
+```
+
+## User Configuration
+
+ProcmonMCP stores user preferences in `~/.procmonmcp/config.json`. This file is created automatically and remembers:
+
+- The last loaded file path (shown as a hint in `get_status` when no file is loaded)
+- Loading preferences (`no_stack_traces`, `no_extra_data`)
+
+No API keys or authentication tokens are required — ProcmonMCP is a purely local analysis tool.
 
 ## Available MCP Tools
 
-Once the server is running with a loaded file and connected to an MCP client, the following tools are available:
+### Lifecycle Tools
 
-* `get_loaded_file_summary()`: Returns basic summary (filename, type, compression, counts, interner stats, selective loading flags) of the loaded file.
-* `query_events(...)`: Queries events with various filters (see docstring/code for all filters like `filter_process`, `filter_path_contains`, `filter_start_time`, `filter_path_regex`, `filter_stack_module_path`, etc.) and returns a list of event summaries including their index. Use the `limit` parameter (default 50).
-* `get_event_details(event_index)`: Gets detailed properties for a specific event by its index (returned by `query_events`).
-* `get_event_stack_trace(event_index)`: Gets the stack trace (list of frames with address, path, location) for a specific event by index (only works if `--no-stack-traces` was **not** used).
-* `list_processes()`: Lists summaries (PID, Name, ImagePath, ParentPID) of unique processes found in the file's process list section.
-* `get_process_details(pid)`: Gets detailed properties for a specific process by PID from the file's process list section.
-* `get_metadata()`: Retrieves basic metadata about the loaded file (filename, type, counts). **(Corrected)**
-* `count_events_by_process()`: Counts events per process name across all loaded events.
-* `summarize_operations_by_process(process_name_filter)`: Counts operations for a specific process name (case-sensitive match).
-* `get_timing_statistics(group_by)`: Calculates event duration statistics, grouped by 'process' (default) or 'operation'.
-* `get_process_lifetime(pid)`: Finds the 'Process Create' and 'Process Exit' event timestamps (unix float) for a given PID by scanning events.
-* `find_file_access(path_contains, limit=100)`: Finds file system events where the path contains the given substring (case-insensitive).
-* `find_network_connections(process_name)`: Finds unique remote network endpoints (IP:port) accessed by a specific process name (case-sensitive match).
-* `export_query_results(...)`: Queries events using the same filters as `query_events` and exports the full details of **all** matching events to a specified file (CSV or JSON). Useful for offline analysis.
+| Tool | Description |
+|------|-------------|
+| `get_status()` | Returns the current server state — whether a file is loaded, loading progress, memory usage, and available actions. **Call this first.** |
+| `load_file(file_path, no_stack_traces?, no_extra_data?)` | Loads a Procmon XML file (.xml, .gz, .bz2, .xz) for analysis. Provides progress feedback. Replaces any previously loaded data. |
 
-*(Refer to the tool docstrings within the script or use the client's `tools/list` command for detailed argument descriptions.)*
+### Data Retrieval Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_loaded_file_summary()` | Returns a detailed summary of the loaded file — filename, counts, compression, index stats, interner stats, and selective loading flags. |
+| `get_metadata()` | Returns basic metadata (filename, type, event/process counts). |
+| `list_processes()` | Lists unique processes (PID, name, image path, parent PID) from the process list section. |
+| `get_process_details(pid)` | Returns detailed properties for a specific process by PID. |
+| `query_events(...)` | Queries events with flexible filters — by process, operation, result, path (contains/regex), detail (regex), timestamp range, and stack module path. Returns event summaries with index. |
+| `get_event_details(event_index)` | Returns all properties for a specific event by its index. |
+| `get_event_stack_trace(event_index)` | Returns the call stack for a specific event (module path, location, address). |
+
+### Analysis Tools
+
+| Tool | Description |
+|------|-------------|
+| `count_events_by_process()` | Counts events per process name. |
+| `summarize_operations_by_process(process_name_filter)` | Counts operations for a specific process. |
+| `get_timing_statistics(group_by)` | Calculates duration statistics grouped by process or operation. |
+| `get_process_lifetime(pid)` | Finds the Process Create and Process Exit timestamps for a given PID. |
+| `find_file_access(path_contains, limit?)` | Finds file system events matching a path substring (case-insensitive). |
+| `find_network_connections(process_name)` | Finds unique remote network endpoints accessed by a process. |
+
+### Export Tools
+
+| Tool | Description |
+|------|-------------|
+| `export_query_results(...)` | Exports filtered events to CSV or JSON file. Uses the same filters as `query_events`. |
+
+## MCP Clients
+
+ProcmonMCP works with any MCP-compatible client. Below are setup instructions for popular clients.
+
+### Claude Code (recommended)
+
+See the [Quick Start with Claude Code](#quick-start-with-claude-code) section above.
+
+### Claude Desktop
+
+Add the following to your Claude Desktop configuration file:
+- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "procmon": {
+      "command": "python",
+      "args": ["-m", "procmon_mcp"]
+    }
+  }
+}
+```
+
+### Cline
+
+For Cline with Streamable HTTP transport, first start the server:
+
+```bash
+python -m procmon_mcp --transport streamable-http --mcp-port 8081
+```
+
+Then in Cline, select MCP Servers and add:
+- **Server Name:** ProcmonMCP
+- **Server URL:** `http://127.0.0.1:8081/mcp`
 
 ## Example LLM Prompts for Malware Analysis
 
-*(Assuming a relevant Procmon XML file is loaded)*
+*(Assuming a Procmon XML file is loaded)*
 
-1.  **Initial Triage:**
-    * "Get the summary of the loaded file."
-    * "List the unique processes found in the log."
-    * "Count the events per process." (Identify high-activity processes)
-    * "Calculate timing statistics grouped by process." (Identify processes with long-duration events)
+### Initial Triage
 
-2.  **Investigating a Suspicious Process (e.g., `suspicious.exe` with PID 4568):**
-    * "Get details for process PID 4568." (Check command line, parent PID, image path)
-    * "Summarize operations for process `suspicious.exe`." (See what it mainly does - file access, registry, network?)
-    * "Query events where filter_process is `suspicious.exe` and filter_operation is `RegSetValue`, limit 10." (Check registry writes)
-    * "Query events where filter_process is `suspicious.exe` and filter_operation is `WriteFile`, limit 20." (Check file writes)
-    * "Find network connections for process `suspicious.exe`."
-    * "Query events where filter_process_contains is `suspicious` and filter_detail_regex is `some_pattern_in_details`, limit 5." (Use regex on the Detail column)
-    * "Find file access containing `temp\\suspicious_data`, limit 50."
+- "Get the summary of the loaded file."
+- "List the unique processes found in the log."
+- "Count the events per process." *(Identify high-activity processes)*
+- "Calculate timing statistics grouped by process." *(Identify long-duration events)*
 
-3.  **Looking for Persistence:**
-    * "Query events where filter_operation is `RegSetValue` and filter_path_contains is `CurrentVersion\\Run`, limit 20."
-    * "Query events where filter_operation is `RegCreateKey` and filter_path_contains is `Services`, limit 20."
-    * "Query events where filter_operation is `CreateFile` and filter_path_contains is `StartUp`, limit 10." (Check common persistence locations)
+### Investigating a Suspicious Process
 
-4.  **Troubleshooting Errors / Evasion:**
-    * "Query events where filter_result is `ACCESS DENIED`, limit 10."
-    * "Query events where filter_result is `NAME NOT FOUND`, limit 10."
-    * "Query events where filter_result is `PATH NOT FOUND`, limit 10."
-    * "Query events where filter_result is `0xc0000022`, limit 5." (Use hex codes for results if needed)
-    * (After finding an interesting error event at index 987): "Get details for event 987."
-    * (If details suggest a code issue and stacks were loaded): "Get stack trace for event 987."
+- "Get details for process PID 4568." *(Check command line, parent PID, image path)*
+- "Summarise operations for process `suspicious.exe`."
+- "Query events where filter_process is `suspicious.exe` and filter_operation is `RegSetValue`, limit 10."
+- "Find network connections for process `suspicious.exe`."
+- "Find file access containing `temp\\suspicious_data`, limit 50."
 
-5.  **Exporting Data:**
-    * "Export query results to `suspicious_reg_writes.csv` where filter_process is `suspicious.exe` and filter_operation contains `RegSet`."
-    * "Export query results to `network_activity.json` in json format where filter_operation contains `TCP` or filter_operation contains `UDP`."
+### Looking for Persistence
+
+- "Query events where filter_operation is `RegSetValue` and filter_path_contains is `CurrentVersion\\Run`, limit 20."
+- "Query events where filter_operation is `CreateFile` and filter_path_contains is `StartUp`, limit 10."
+
+### Troubleshooting Errors
+
+- "Query events where filter_result is `ACCESS DENIED`, limit 10."
+- "Query events where filter_result is `NAME NOT FOUND`, limit 10."
+- "Get details for event 987."
+- "Get stack trace for event 987."
+
+### Exporting Data
+
+- "Export query results to `suspicious_reg_writes.csv` where filter_process is `suspicious.exe` and filter_operation contains `RegSet`."
+- "Export query results to `network_activity.json` in json format."
+
+## Performance and Indexing
+
+ProcmonMCP builds four indices during file loading for fast filtered lookups:
+
+| Index | Used by | Complexity |
+|-------|---------|------------|
+| Process name (interned ID) | `query_events`, `count_events_by_process` | O(1) lookup |
+| Operation (interned ID) | `query_events`, `summarize_operations_by_process` | O(1) lookup |
+| PID | `get_process_lifetime` | O(1) lookup with set intersection |
+| File path (interned ID) | `find_file_access` | O(unique_paths) substring scan |
+
+For filters not backed by an index (e.g., regex, path contains, stack module path), ProcmonMCP falls back to a linear scan of all events. Use indexed filters first to narrow results, then apply more expensive filters.
 
 ## Limitations
 
-* **Single File:** The tool loads and analyzes only *one* file specified via `--input-file` at startup. Analyzing a different file requires restarting the server.
-* **Memory Usage:** While optimized with interning, loading extremely large XML files (millions of events, especially with highly unique string data or if stack traces are loaded) can still consume significant RAM. Use `--no-stack-traces` and `--no-extra-data` for very large files.
-* **Loading Time:** Parsing and optimizing large XML files, especially compressed ones, can take considerable time during startup (though faster than previously). Progress is reported to the console.
-* **Filter Performance:** Querying is generally fast for filters using interned IDs (process, operation, result). Filters requiring string comparisons (`_contains`), regular expressions (`_regex`), or stack inspection (`filter_stack_module_path`) are slower as they require more processing per event. The stack filter is particularly intensive. Indexing helps significantly for process name and operation filters.
-* **XML Structure:** Relies on the standard Procmon XML export structure. Malformed or non-standard XML files will likely cause parsing errors.
-* **Stack Traces:** Stack trace information (module paths, locations) depends entirely on what Procmon resolved and included in the XML export, and requires running Procmon with symbols configured correctly. Stacks are only loaded if `--no-stack-traces` is **not** used.
+- **Memory usage**: Whilst optimised with string interning, loading extremely large XML files (millions of events with stack traces) can consume significant RAM. Use `--no-stack-traces` and `--no-extra-data` for very large files.
+- **Loading time**: Parsing and optimising large XML files takes time, particularly compressed ones. Progress is reported during loading.
+- **XML structure**: Relies on the standard Procmon XML export structure. Malformed or non-standard XML will likely cause parsing errors.
+- **Stack traces**: Stack trace quality depends on what Procmon resolved and included in the XML export. Requires running Procmon with symbols configured correctly.
+- **Single file at a time**: Only one file can be loaded at any given time. Loading a new file replaces the previous data.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit pull requests or open issues.
+Contributions are welcome! Please feel free to submit pull requests or open issues on [GitHub](https://github.com/JameZUK/ProcmonMCP).
