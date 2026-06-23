@@ -232,7 +232,7 @@ class TestCompileSafeRegex:
 
     def test_valid_pattern_compiles(self):
         result = procmon_mcp._compile_safe_regex("foo.*bar", "test")
-        assert isinstance(result, re.Pattern)
+        assert result is not None and hasattr(result, "search")  # re.Pattern or RE2 matcher
 
     def test_case_insensitive(self):
         regex = procmon_mcp._compile_safe_regex("hello", "test")
@@ -246,7 +246,7 @@ class TestCompileSafeRegex:
     def test_at_max_length_ok(self):
         pattern = "a" * procmon_mcp.MAX_REGEX_LEN
         result = procmon_mcp._compile_safe_regex(pattern, "test")
-        assert isinstance(result, re.Pattern)
+        assert result is not None and hasattr(result, "search")  # re.Pattern or RE2 matcher
 
     def test_invalid_regex_raises(self):
         with pytest.raises(re.error):
@@ -1174,3 +1174,124 @@ class TestFilterByPid:
         data = self._load(tmp_path)
         res = _collect_filtered(data, filter_pid=1000, filter_operation="TCP Send")
         assert len(res) == 3  # chrome has 3 TCP Send events
+
+
+# --- Streaming Export Tests ---
+
+class TestExportStreaming:
+    def _load(self, tmp_path, n=5):
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp import server
+        path = str(tmp_path / "e.xml")
+        _write_capture(path, n, with_stack=True)
+        server.LOADED_DATA = load_procmon_xml(path, True, True)
+        return server.LOADED_DATA
+
+    def _export(self, tmp_path, out, fmt, **filters):
+        from procmon_mcp import tools
+        cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            return _drive(tools.export_query_results(out, fmt, ctx=_DummyContext(), **filters))
+        finally:
+            os.chdir(cwd)
+
+    def test_json_export_valid_and_complete(self, tmp_path):
+        import json as _json
+        self._load(tmp_path, 5)
+        r = self._export(tmp_path, "out.json", "json")
+        assert r["events_exported"] == 5
+        data = _json.loads((tmp_path / "out.json").read_text())
+        assert len(data) == 5 and data[0]["operation"] == "CreateFile"
+
+    def test_csv_export_header_and_rows(self, tmp_path):
+        import csv as _csv
+        self._load(tmp_path, 5)
+        r = self._export(tmp_path, "out.csv", "csv")
+        assert r["events_exported"] == 5
+        with (tmp_path / "out.csv").open() as f:
+            rows = list(_csv.DictReader(f))
+        assert len(rows) == 5 and "process_details_summary" in rows[0]
+
+    def test_empty_json_export_is_empty_array(self, tmp_path):
+        self._load(tmp_path, 3)
+        r = self._export(tmp_path, "empty.json", "json", filter_result="NO SUCH RESULT")
+        assert r["events_exported"] == 0
+        assert (tmp_path / "empty.json").read_text().strip() == "[]"
+
+    def test_empty_csv_export_is_header_only(self, tmp_path):
+        self._load(tmp_path, 3)
+        r = self._export(tmp_path, "empty.csv", "csv", filter_result="NO SUCH RESULT")
+        assert r["events_exported"] == 0
+        lines = (tmp_path / "empty.csv").read_text().strip().splitlines()
+        assert len(lines) == 1 and lines[0].startswith("event_index")
+
+
+# --- find_file_access merge ordering ---
+
+class TestFindFileAccessOrdering:
+    def test_returns_first_indices_ascending(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp import server, tools
+        path = str(tmp_path / "fa.xml")
+        _write_capture(path, 50, with_stack=False)  # every path contains "System32"
+        server.LOADED_DATA = load_procmon_xml(path, False, False)
+        res = _drive(tools.find_file_access("System32", limit=10, ctx=_DummyContext()))
+        idxs = [e["event_index"] for e in res]
+        assert idxs == list(range(10))  # first 10 by event index, ascending
+
+
+# --- Partial-parse must raise and not cache ---
+
+class TestPartialParseNoCache:
+    def test_truncated_xml_raises_and_does_not_cache(self, tmp_path):
+        from procmon_mcp import cache
+        from procmon_mcp.parser import load_procmon_xml
+        path = tmp_path / "trunc.xml"
+        path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n<procmon>\n<processlist>\n'
+            '<process><ProcessIndex>0</ProcessIndex><ProcessId>1</ProcessId>'
+            '<ProcessName>t.exe</ProcessName></process>\n</processlist>\n<eventlist>\n'
+            '<event><ProcessIndex>0</ProcessIndex><PID>1</PID>'
+            '<Time_of_Day>12:00:00.000000</Time_of_Day><Operation>CreateFile</Operation>'
+            '<Path>C:\\a</Path><Result>SUCCESS</Result><Process_Name>t.exe</Process_Name></event>\n'
+            '<event><PID>2</PID><Time_of_Day>12:00:01.0000'  # truncated mid-event
+        )
+        with pytest.raises(RuntimeError):
+            load_procmon_xml(str(path), True, True, use_cache=True)
+        cdir = cache.CACHE_DIR
+        pkls = os.listdir(cdir) if os.path.isdir(cdir) else []
+        assert not any(f.endswith(".pkl") for f in pkls)
+
+
+# --- Cache eviction ---
+
+class TestCacheEviction:
+    def test_evicts_lru_when_over_budget(self, tmp_path, monkeypatch):
+        from procmon_mcp import cache
+        from procmon_mcp.models import ProcmonLogData
+        monkeypatch.setattr(cache, "CACHE_DIR", str(tmp_path / "c"))
+        data = ProcmonLogData(loaded_filename="x", events=[{}])
+        base = {"size": 1, "mtime_ns": 1, "load_stack": True,
+                "load_extra": True, "version": cache.CACHE_VERSION}
+        key_a = dict(base, path="a")
+        key_b = dict(base, path="b")
+        assert cache.save(key_a, data)
+        assert cache.save(key_b, data)
+        # Mark A as least-recently-used and cap the dir to ~one entry.
+        os.utime(cache._cache_file(key_a), (1, 1))
+        cap = os.path.getsize(cache._cache_file(key_b)) + 16
+        monkeypatch.setenv("PROCMONMCP_CACHE_MAX_BYTES", str(cap))
+        cache._enforce_cache_limit()
+        names = set(os.listdir(cache.CACHE_DIR))
+        assert os.path.basename(cache._cache_file(key_b)) in names   # newest kept
+        assert os.path.basename(cache._cache_file(key_a)) not in names  # LRU evicted
+
+
+# --- XMLSyntaxError alias (stdlib has ParseError, not XMLSyntaxError) ---
+
+class TestXMLSyntaxErrorAlias:
+    def test_alias_is_real_exception_class(self):
+        from procmon_mcp import compat
+        assert isinstance(compat.XMLSyntaxError, type)
+        assert issubclass(compat.XMLSyntaxError, Exception)

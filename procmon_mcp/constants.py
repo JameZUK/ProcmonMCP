@@ -10,6 +10,9 @@ PROCMON_TIMESTAMP_FORMAT = "%H:%M:%S.%f"
 # Progress reporting thresholds
 PROGRESS_REPORT_INTERVAL = 250000  # Report progress every N events during loading/processing
 PROGRESS_REPORT_SECONDS = 5.0  # Also report progress every N seconds
+# Only read the wall clock once per this many iterations in hot scan loops, so
+# the time-based progress fallback doesn't cost a syscall on every event.
+CLOCK_CHECK_INTERVAL = 8192
 
 # Base date (epoch) for creating full timestamps from Time_of_Day.
 # The parser will advance this date if it detects a midnight rollover.

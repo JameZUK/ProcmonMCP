@@ -20,8 +20,13 @@ LXML_AVAILABLE = False
 try:
     from lxml import etree as ET_impl
     LXML_AVAILABLE = True
+    # lxml raises XMLSyntaxError on malformed XML.
+    XMLSyntaxError = ET_impl.XMLSyntaxError
 except ImportError:
     import xml.etree.ElementTree as ET_impl
+    # The stdlib ElementTree has no XMLSyntaxError; it raises ParseError. Alias it
+    # so callers can `except XMLSyntaxError` regardless of which backend is active.
+    XMLSyntaxError = ET_impl.ParseError
 
 # --- Memory Usage Reporting ---
 PSUTIL_AVAILABLE = False
