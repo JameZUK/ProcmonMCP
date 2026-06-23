@@ -18,7 +18,7 @@ from .constants import (
     IK_PROCESS_NAME, IK_OPERATION, IK_PATH, IK_RESULT, IK_CATEGORY,
     IK_STACK_PATH, IK_STACK_LOCATION,
 )
-from .helpers import find_text_func, _strip_namespace, _find_child_ignore_ns, _clear_elem, _format_bytes
+from .helpers import find_text_func, _strip_namespace, _find_child_ignore_ns, _clear_elem, _format_bytes, repair_mojibake
 from .models import StringInterner, StackFrame, ProcessInfo, ProcmonLogData
 from . import cache
 
@@ -233,7 +233,7 @@ def _parse_xml_stream_for_loading(
                             'seq': ProcessInfo._safe_text_to_int(find_text_func(elem, 'SequenceNumber')),
                             'tid': ProcessInfo._safe_text_to_int(find_text_func(elem, 'ThreadId')),
                             'ppid': ProcessInfo._safe_text_to_int(find_text_func(elem, 'ParentPID')),
-                            'detail': find_text_func(elem, 'Detail'),
+                            'detail': repair_mojibake(find_text_func(elem, 'Detail')),
                             'dur': None,
                         }
                         duration_text = find_text_func(elem, 'Duration')
@@ -244,7 +244,7 @@ def _parse_xml_stream_for_loading(
                                 pass
 
                         # Process name fallback logic
-                        process_name_str = find_text_func(elem, 'Process_Name')
+                        process_name_str = repair_mojibake(find_text_func(elem, 'Process_Name'))
                         if process_name_str is None:
                             process_index = ProcessInfo._safe_text_to_int(find_text_func(elem, 'ProcessIndex'))
                             if process_index is not None:
@@ -259,7 +259,7 @@ def _parse_xml_stream_for_loading(
                         # String interning
                         opt_event['pname_id'] = interners[IK_PROCESS_NAME].get_id(process_name_str)
                         opt_event['op_id'] = interners[IK_OPERATION].get_id(find_text_func(elem, 'Operation'))
-                        opt_event['path_id'] = interners[IK_PATH].get_id(find_text_func(elem, 'Path'))
+                        opt_event['path_id'] = interners[IK_PATH].get_id(repair_mojibake(find_text_func(elem, 'Path')))
                         opt_event['res_id'] = interners[IK_RESULT].get_id(find_text_func(elem, 'Result'))
                         opt_event['cat_id'] = interners[IK_CATEGORY].get_id(find_text_func(elem, 'Category'))
 

@@ -22,6 +22,7 @@ async def _iter_filtered_event_indices(
     ctx: Context,
     # Filters
     filter_process: Optional[str] = None,
+    filter_pid: Optional[int] = None,
     filter_operation: Optional[str] = None,
     filter_result: Optional[str] = None,
     filter_path_contains: Optional[str] = None,
@@ -153,6 +154,16 @@ async def _iter_filtered_event_indices(
             index_used = True
             if not candidate_indices:
                 await ctx.info(f"Filter Index: No events match Operation filter '{filter_operation}'.")
+                return
+        if filter_pid is not None:
+            this_pid_indices = set(log_data.pid_index.get(filter_pid, []))
+            if candidate_indices is None:
+                candidate_indices = this_pid_indices
+            else:
+                candidate_indices.intersection_update(this_pid_indices)
+            index_used = True
+            if not candidate_indices:
+                await ctx.info(f"Filter Index: No events match PID filter {filter_pid}.")
                 return
 
         # Determine iterator and total scan count

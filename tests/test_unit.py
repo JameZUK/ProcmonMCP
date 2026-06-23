@@ -1073,3 +1073,104 @@ class TestProcessLifetime:
         self._load(tmp_path)
         r = _drive(tools.get_process_lifetime(999, _DummyContext()))
         assert r == {"create_timestamp": None, "exit_timestamp": None}
+
+
+# --- Mojibake Repair Tests ---
+
+# Bytes as they appear in a Procmon XML export of the name "温度スイッチ.exe":
+# the real UTF-8 bytes were re-encoded (Latin-1 -> UTF-8) by the exporter, so a
+# correct UTF-8 parse yields mojibake. This is what the parser reads.
+_DOUBLE_ENCODED_BYTES = bytes.fromhex(
+    "c3a6c2b8c2a9c3a5c2bac2a6c3a3c282c2b9c3a3c282c2a4c3a3c283c283c3a3c283c2812e657865"
+)
+_MOJIBAKE = _DOUBLE_ENCODED_BYTES.decode("utf-8")
+_TRUE_NAME = "温度スイッチ.exe"
+
+
+class TestRepairMojibake:
+    def test_repairs_double_encoded(self):
+        assert procmon_mcp.repair_mojibake(_MOJIBAKE) == _TRUE_NAME
+
+    def test_ascii_unchanged(self):
+        assert procmon_mcp.repair_mojibake("svchost.exe") == "svchost.exe"
+
+    def test_correctly_encoded_latin1_name_preserved(self):
+        # café.exe is valid UTF-8; 'é' is not a valid standalone UTF-8 sequence,
+        # so the repair is a no-op (not a false positive).
+        assert procmon_mcp.repair_mojibake("café.exe") == "café.exe"
+
+    def test_native_cjk_preserved(self):
+        # Correctly-stored CJK has codepoints > U+00FF; not Latin-1-encodable, left as-is.
+        assert procmon_mcp.repair_mojibake("温度.exe") == "温度.exe"
+
+    def test_mixed_ascii_and_double_encoded(self):
+        assert procmon_mcp.repair_mojibake("C:\\Malware\\" + _MOJIBAKE) == "C:\\Malware\\" + _TRUE_NAME
+
+    def test_none_and_empty(self):
+        assert procmon_mcp.repair_mojibake(None) is None
+        assert procmon_mcp.repair_mojibake("") == ""
+
+
+class TestMojibakeParsing:
+    def _write(self, path):
+        # Placeholder NAME is replaced by the raw double-encoded bytes after encoding.
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n<procmon>\n<processlist>\n'
+            '<process><ProcessIndex>0</ProcessIndex><ProcessId>1112</ProcessId>'
+            '<ProcessName>NAME</ProcessName><ImagePath>C:\\Malware\\NAME</ImagePath></process>\n'
+            '</processlist>\n<eventlist>\n'
+            '<event><ProcessIndex>0</ProcessIndex><PID>1112</PID>'
+            '<Time_of_Day>12:00:00.000000</Time_of_Day><Operation>CreateFile</Operation>'
+            '<Path>C:\\Malware\\NAME</Path><Result>SUCCESS</Result>'
+            '<Process_Name>NAME</Process_Name></event>\n'
+            '</eventlist>\n</procmon>\n'
+        ).encode("utf-8").replace(b"NAME", _DOUBLE_ENCODED_BYTES)
+        with open(path, "wb") as f:
+            f.write(xml)
+
+    def test_double_encoded_names_repaired_on_load(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp.constants import IK_PROCESS_NAME, IK_PATH
+        path = str(tmp_path / "moji.xml")
+        self._write(path)
+        data = load_procmon_xml(path, load_stack=False, load_extra=False)
+
+        # Event-level interned process name and path are repaired.
+        ev_names = {data.get_string(IK_PROCESS_NAME, k) for k in data.pname_id_index}
+        assert _TRUE_NAME in ev_names
+        ev_paths = {data.get_string(IK_PATH, k) for k in data.path_id_index}
+        assert "C:\\Malware\\" + _TRUE_NAME in ev_paths
+
+        # Process-list (Pass 1) name and image path are repaired.
+        proc = data.processes_by_pid[1112]
+        assert proc.process_name == _TRUE_NAME
+        assert proc.image_path == "C:\\Malware\\" + _TRUE_NAME
+
+
+# --- filter_pid Tests ---
+
+class TestFilterByPid:
+    def _load(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        path = str(tmp_path / "pid.xml")
+        _write_network_capture(path)  # chrome PID 1000 (7 events), svchost PID 2000 (4)
+        return load_procmon_xml(path, load_stack=False, load_extra=False)
+
+    def test_filter_pid_isolates_process(self, tmp_path):
+        data = self._load(tmp_path)
+        res = _collect_filtered(data, filter_pid=1000)
+        assert len(res) == 7
+        assert all(data.events[i]["pid"] == 1000 for i in res)
+
+    def test_filter_pid_other_process(self, tmp_path):
+        data = self._load(tmp_path)
+        assert len(_collect_filtered(data, filter_pid=2000)) == 4
+
+    def test_filter_pid_absent_returns_none(self, tmp_path):
+        data = self._load(tmp_path)
+        assert _collect_filtered(data, filter_pid=9999) == []
+
+    def test_filter_pid_combined_with_operation(self, tmp_path):
+        data = self._load(tmp_path)
+        res = _collect_filtered(data, filter_pid=1000, filter_operation="TCP Send")
+        assert len(res) == 3  # chrome has 3 TCP Send events

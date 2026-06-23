@@ -278,7 +278,7 @@ under a second.
 | `get_metadata()` | Returns basic metadata (filename, type, event/process counts). |
 | `list_processes()` | Lists unique processes (PID, name, image path, parent PID) from the process list section. |
 | `get_process_details(pid)` | Returns detailed properties for a specific process by PID. |
-| `query_events(...)` | Queries events with flexible filters — by process, operation, result, path (contains/regex), detail (regex), timestamp range, and stack module path. Returns event summaries with index. |
+| `query_events(...)` | Queries events with flexible filters — by process, **PID** (`filter_pid`), operation, result, path (contains/regex), detail (regex), timestamp range, and stack module path. Returns event summaries with index. |
 | `get_event_details(event_index)` | Returns all properties for a specific event by its index. |
 | `get_event_stack_trace(event_index)` | Returns the call stack for a specific event (module path, location, address). |
 
@@ -394,6 +394,7 @@ For filters not backed by an index (e.g., regex, path contains, stack module pat
 - **Memory usage**: Whilst optimised with string interning, loading extremely large XML files (millions of events with stack traces) can consume significant RAM. Use `--no-stack-traces` and `--no-extra-data` for very large files.
 - **Loading time**: Parsing and optimising large XML files takes time, particularly compressed ones. Progress is reported during loading. Reloading an unchanged file is near-instant thanks to the [parsed-capture cache](#parsed-capture-cache); only the first parse pays the full cost.
 - **XML structure**: Relies on the standard Procmon XML export structure. Malformed or non-standard XML will likely cause parsing errors.
+- **Non-ASCII names**: Procmon's XML export double-encodes non-ASCII process/path names (e.g. Japanese filenames). ProcmonMCP detects and repairs this on load so names are readable and matchable by their true value; if a process name is still awkward to type exactly, filter by `filter_pid` instead.
 - **Stack traces**: Stack trace quality depends on what Procmon resolved and included in the XML export. Requires running Procmon with symbols configured correctly.
 - **Single file at a time**: Only one file can be loaded at any given time. Loading a new file replaces the previous data.
 

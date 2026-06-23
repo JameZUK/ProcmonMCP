@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 # Bump when the serialized structures or parser output change in an
 # incompatible way; old entries will then be ignored.
-CACHE_VERSION = 1
+# v2: parser now repairs double-encoded (mojibake) non-ASCII names.
+CACHE_VERSION = 2
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".procmonmcp", "cache")
 

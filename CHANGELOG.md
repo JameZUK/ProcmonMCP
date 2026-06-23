@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-06-23
+## [0.3.1] - 2026-06-23
+
+### Added
+- **`filter_pid`** on `query_events` and `export_query_results` — select a single
+  process by its numeric PID (index-backed). Useful when a process name is hard to
+  type exactly, e.g. non-ASCII names. (#21)
+
+### Fixed
+- **Non-ASCII process/path names** were unreadable mojibake (e.g.
+  `æ¸©åº¦ã¹ã¤ãã.exe` instead of `温度スイッチ.exe`) and couldn't be matched by
+  `filter_process`. Procmon's XML export double-encodes such text (UTF-8 bytes →
+  Latin-1 → UTF-8); the parser now repairs this on load for process names, paths,
+  image paths, command lines, owners, descriptions, and event detail. The repair
+  is conservative (only strings with the exact double-encoding fingerprint are
+  touched; ASCII and correctly-stored names are unchanged). The parsed-capture
+  cache version was bumped so existing caches re-parse. (#21)
 
 ### Added
 - **`close_file`** tool — closes (unloads) the currently loaded capture and frees
