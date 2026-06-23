@@ -1,0 +1,69 @@
+# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- **Parsed-capture cache** so reloading an unchanged file is near-instant — the
+  optimised in-memory structures are serialized to `~/.procmonmcp/cache/`, keyed
+  on the file's path/size/mtime, the load options, and a cache-version stamp.
+  Measured 29×–146× faster reloads on real captures. Adds the `clear_cache`
+  tool, a `no_cache` option (and `from_cache` in the response) on `load_file`,
+  and `--no-cache` / `--clear-cache` CLI flags. (#8)
+- **`list_network_connections`** — capture-wide network triage across all
+  processes. (#7)
+- **`get_network_top_talkers`** — ranks unique remote endpoints across the whole
+  capture by event count, with the distinct-process count per endpoint. (#9)
+- **Enriched network records** for `find_network_connections` /
+  `list_network_connections`: split host/ip/hostname/port, operations, inferred
+  directions (connect/send/receive), distinct results, event count, and
+  first/last-seen timestamps. (#9)
+- **Packaging**: `pyproject.toml` with a `procmon-mcp` console script and
+  `lxml` / `psutil` / `all` / `dev` optional extras; MIT `LICENSE`. (#4)
+- **CI**: GitHub Actions running the test suite on Python 3.10–3.13 with and
+  without lxml, plus an `sdk-smoke` job that installs the real MCP SDK and
+  imports the server. (#4, #6)
+- Substantially expanded unit tests (78 → 123), including a large-capture parser
+  regression, exact-match filter coverage, network-tool tests, and cache tests.
+
+### Changed
+- **BREAKING:** `find_network_connections` now returns enriched structured
+  records (`List[dict]`) ranked by event count, instead of a bare list of
+  `host:port` strings. (#9)
+- Network endpoint parsing now accepts resolved **service-name ports**
+  (`domain`, `https`, …) and DNS hostnames, not just numeric ports. (#10)
+- `requirements.txt` now lists only `mcp[cli]` as required; `lxml` and `psutil`
+  are documented as optional, matching the code's graceful fallbacks. (#4)
+
+### Fixed
+- **Critical:** event fields were read on the iterparse `start` event, which is
+  not guaranteed to have the element's children populated. On large captures
+  this silently dropped events or nulled `Operation`/`Path`/`Result` whenever an
+  event spanned a read-buffer boundary. Fields are now read on the `end` event.
+  (#4)
+- Exact-match filters (`filter_process` / `filter_operation` / `filter_result`)
+  returned **all** events instead of zero when the supplied value was absent from
+  the capture. (#4)
+- Server failed to import on current MCP SDKs because it passed `description=`
+  to `FastMCP`, which expects `instructions=`. (#5)
+- `query_events` no longer double-wraps already-meaningful errors;
+  `export_query_results` verifies a file is loaded before validating paths or
+  creating directories. (#4)
+
+### Security
+- Cache files are serialized with Python's `pickle` module and are read back
+  only from the user-owned `~/.procmonmcp/cache` directory (only this tool's own
+  output is deserialized). Documented in the README; do not point the cache at a
+  location other users can write to. (#8)
+
+## [0.1.0]
+
+- Initial modular `procmon_mcp` package: two-pass streaming XML parser with
+  string interning and process/operation/PID/path indices; MCP tools for
+  querying events, inspecting processes, timing/operation summaries, file and
+  network lookups, and CSV/JSON export; stdio / Streamable HTTP / SSE
+  transports; runtime `load_file`; and `~/.procmonmcp/config.json` preferences.
