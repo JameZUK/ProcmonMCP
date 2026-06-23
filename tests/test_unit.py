@@ -963,6 +963,42 @@ class TestCaptureCache:
         assert cache.compute_key(str(tmp_path / "nope.xml"), True, True) is None
 
 
+# --- close_file Tests ---
+
+class TestCloseFile:
+    def test_close_unloads_data(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp import server, tools
+        path = str(tmp_path / "c.xml")
+        _write_capture(path, 5, with_stack=False)
+        server.LOADED_DATA = load_procmon_xml(path, False, False)
+        assert server.LOADED_DATA.is_loaded()
+
+        r = _drive(tools.close_file(_DummyContext()))
+        assert r["success"] is True
+        assert r["was_loaded"] is True
+        assert r["closed_filename"] == "c.xml"
+        assert server.LOADED_DATA is None
+
+    def test_close_when_nothing_loaded(self, tmp_path):
+        from procmon_mcp import server, tools
+        server.LOADED_DATA = None
+        r = _drive(tools.close_file(_DummyContext()))
+        assert r["success"] is True
+        assert r["was_loaded"] is False
+
+    def test_analysis_tool_unavailable_after_close(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp import server, tools
+        path = str(tmp_path / "c2.xml")
+        _write_capture(path, 5, with_stack=False)
+        server.LOADED_DATA = load_procmon_xml(path, False, False)
+        _drive(tools.close_file(_DummyContext()))
+        # With nothing loaded, analysis tools must refuse via _check_loaded.
+        with pytest.raises(RuntimeError):
+            _drive(tools.list_processes(ctx=_DummyContext()))
+
+
 # --- Process Lifetime Tests ---
 
 # (pid, process_name, operation, time_of_day, path) — a parent (explorer) that

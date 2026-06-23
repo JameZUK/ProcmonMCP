@@ -55,6 +55,7 @@ async def get_status(ctx: Context) -> Dict[str, Any]:
             status["available_actions"] = [
                 "All analysis tools (query_events, list_processes, etc.)",
                 "load_file (to load a different file)",
+                "close_file (to unload the current file)",
             ]
 
             # Memory usage
@@ -195,6 +196,41 @@ async def load_file(
         raise RuntimeError(f"Error loading file: {e}")
     finally:
         server.LOADING_IN_PROGRESS = False
+
+
+@tool_decorator
+async def close_file(ctx: Context) -> Dict[str, Any]:
+    """
+    Closes (unloads) the currently loaded capture and frees its memory.
+
+    After closing, the analysis tools are unavailable until another file is
+    opened with load_file. This does not remove the on-disk parsed-capture cache
+    (use clear_cache for that), so re-opening the same file is still fast.
+    Returns whether a file was actually open and, if so, its name.
+    """
+    await ctx.info("[close_file] Closing currently loaded capture...")
+
+    if server.LOADING_IN_PROGRESS:
+        await ctx.error("[close_file] A file is currently being loaded; cannot close now.")
+        raise RuntimeError("A file load is in progress; please wait before closing.")
+
+    if not server.LOADED_DATA or not server.LOADED_DATA.is_loaded():
+        await ctx.info("[close_file] No file was loaded.")
+        return {
+            "success": True,
+            "was_loaded": False,
+            "message": "No file was loaded. Use 'load_file' to open a Procmon XML capture.",
+        }
+
+    closed_filename = server.LOADED_DATA.loaded_filename
+    server.LOADED_DATA = None
+    await ctx.info(f"[close_file] Closed '{closed_filename}'.")
+    return {
+        "success": True,
+        "was_loaded": True,
+        "closed_filename": closed_filename,
+        "message": f"Closed '{closed_filename}'. Use 'load_file' to open another capture.",
+    }
 
 
 @tool_decorator

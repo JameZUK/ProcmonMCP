@@ -266,7 +266,8 @@ under a second.
 | Tool | Description |
 |------|-------------|
 | `get_status()` | Returns the current server state — whether a file is loaded, loading progress, memory usage, and available actions. **Call this first.** |
-| `load_file(file_path, no_stack_traces?, no_extra_data?, no_cache?)` | Loads a Procmon XML file (.xml, .gz, .bz2, .xz) for analysis. Uses the parsed-capture cache for near-instant reloads (`from_cache` in the response says whether it was used). Provides progress feedback. Replaces any previously loaded data. |
+| `load_file(file_path, no_stack_traces?, no_extra_data?, no_cache?)` | Loads a Procmon XML file (.xml, .gz, .bz2, .xz) for analysis. Uses the parsed-capture cache for near-instant reloads (`from_cache` in the response says whether it was used). Set `no_cache: true` to bypass the cache. Provides progress feedback. Replaces any previously loaded data. |
+| `close_file()` | Closes (unloads) the currently loaded capture and frees its memory. Analysis tools are unavailable until another file is opened with `load_file`. Does not remove the on-disk cache. |
 | `clear_cache()` | Removes all on-disk parsed-capture caches. Reclaims disk space and forces a clean re-parse on the next load. Does not affect currently loaded data. |
 
 ### Data Retrieval Tools
