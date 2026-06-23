@@ -519,6 +519,23 @@ class TestParseNetworkEndpoint:
     def test_missing_port_returns_none(self):
         assert procmon_mcp.parse_network_endpoint("a -> 10.0.0.1") is None
 
+    def test_service_name_port_dns(self):
+        # Procmon resolves well-known ports to service names (e.g. 53 -> domain).
+        assert procmon_mcp.parse_network_endpoint(
+            "DESKTOP-VQV04L8.localdomain:59075 -> 192.168.249.2:domain") == "192.168.249.2:domain"
+
+    def test_service_name_port_https(self):
+        assert procmon_mcp.parse_network_endpoint(
+            "PC:1 -> server.corp:https") == "server.corp:https"
+
+    def test_service_name_port_hyphenated(self):
+        assert procmon_mcp.parse_network_endpoint(
+            "PC:1 -> 10.0.0.5:microsoft-ds") == "10.0.0.5:microsoft-ds"
+
+    def test_ipv6_with_service_name_port(self):
+        assert procmon_mcp.parse_network_endpoint(
+            "a:1 -> [2001:db8::1]:https") == "2001:db8::1:https"
+
 
 # --- Parser Integration Tests ---
 
