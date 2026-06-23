@@ -36,7 +36,8 @@ def main_execution(args):
             input_file_path = os.path.abspath(args.input_file)
             logger.info(f"Attempting to load and optimise file: {input_file_path}")
 
-            server.LOADED_DATA = load_procmon_xml(input_file_path, load_stacks, load_extra)
+            server.LOADED_DATA = load_procmon_xml(input_file_path, load_stacks, load_extra,
+                                                  use_cache=not args.no_cache)
 
             if not server.LOADED_DATA or not server.LOADED_DATA.is_loaded():
                 logger.critical(f"File loading failed for '{input_file_path}'. Check logs above for errors. Exiting.")
@@ -155,6 +156,10 @@ def main():
                         help="Do not parse or store stack traces to save memory.")
     parser.add_argument("--no-extra-data", action='store_true',
                         help="Do not store unknown fields found within <event> tags.")
+    parser.add_argument("--no-cache", action='store_true',
+                        help="Bypass the parsed-capture cache (always re-parse, and refresh the cache).")
+    parser.add_argument("--clear-cache", action='store_true',
+                        help="Remove all cached parsed captures, then exit.")
     parser.add_argument("--profile", action='store_true',
                         help="Enable profiling and print stats on exit.")
     parser.add_argument("--profile-output", type=str, default="procmon_profile.prof",
@@ -210,6 +215,13 @@ def main():
         logger.debug("Could not configure MCP/Uvicorn loggers.", exc_info=True)
     logger.info(f"Logging level set to: {logging.getLevelName(log_level)}")
     logger.info(f"Selective loading: Stacks={not args.no_stack_traces}, ExtraData={not args.no_extra_data}")
+
+    # Clear cache and exit, if requested.
+    if args.clear_cache:
+        from . import cache
+        removed = cache.clear()
+        logger.info(f"Removed {removed} cached capture(s) from {cache.CACHE_DIR}.")
+        sys.exit(0)
 
     # Dependency checks
     if not MCP_SDK_AVAILABLE:

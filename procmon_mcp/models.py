@@ -172,6 +172,9 @@ class ProcmonLogData:
     loaded_compression: Optional[str] = None
     load_stack_traces: bool = True
     load_extra_data: bool = True
+    # True when this object was deserialized from the on-disk cache rather than
+    # parsed from XML this run. Not part of the cached payload's identity.
+    loaded_from_cache: bool = False
 
     # Loaded Data
     processes_by_index: Dict[int, ProcessInfo] = dataclasses.field(default_factory=dict)

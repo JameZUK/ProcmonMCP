@@ -12,6 +12,18 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import procmon_mcp
 
+
+@pytest.fixture(autouse=True)
+def _isolate_capture_cache(tmp_path, monkeypatch):
+    """Point the parsed-capture cache at a per-test temp dir.
+
+    load_procmon_xml caches by default, so without this every test that loads a
+    capture would write into the user's real ~/.procmonmcp/cache. Tests that
+    exercise the cache directly may override CACHE_DIR again with their own path.
+    """
+    from procmon_mcp import cache
+    monkeypatch.setattr(cache, "CACHE_DIR", str(tmp_path / "_pmcache"))
+
 # --- StringInterner Tests ---
 
 class TestStringInterner:
@@ -867,3 +879,85 @@ class TestNetworkTools:
         server.LOADED_DATA = load_procmon_xml(path, load_stack=False, load_extra=False)
         assert _drive(tools.list_network_connections(ctx=self._ctx())) == []
         assert _drive(tools.get_network_top_talkers(ctx=self._ctx())) == []
+
+
+# --- Parsed-Capture Cache Tests ---
+
+class TestCaptureCache:
+    def _setup(self, tmp_path, monkeypatch):
+        from procmon_mcp import cache
+        monkeypatch.setattr(cache, "CACHE_DIR", str(tmp_path / "cache"))
+        path = str(tmp_path / "cap.xml")
+        _write_capture(path, 8, with_stack=True)
+        return cache, path
+
+    def _load(self, path, **kw):
+        from procmon_mcp.parser import load_procmon_xml
+        return load_procmon_xml(path, kw.get("load_stack", True), kw.get("load_extra", True),
+                                use_cache=kw.get("use_cache", True))
+
+    def test_first_load_parses_second_load_hits_cache(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, monkeypatch)
+        path = str(tmp_path / "cap.xml")
+        d1 = self._load(path)
+        assert d1.loaded_from_cache is False
+        d2 = self._load(path)
+        assert d2.loaded_from_cache is True
+        # Cached data matches the freshly parsed data.
+        assert len(d2.events) == len(d1.events) == 8
+        assert len(d2.processes_by_index) == len(d1.processes_by_index)
+        assert sum(len(v) for v in d2.pid_index.values()) == 8
+
+    def test_bypass_does_not_read_cache(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, monkeypatch)
+        path = str(tmp_path / "cap.xml")
+        self._load(path)  # populate cache
+        d = self._load(path, use_cache=False)
+        assert d.loaded_from_cache is False
+
+    def test_different_options_use_separate_cache(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, monkeypatch)
+        path = str(tmp_path / "cap.xml")
+        self._load(path, load_stack=True)            # cache for stacks=True
+        d = self._load(path, load_stack=False)        # different key -> miss
+        assert d.loaded_from_cache is False
+        # ...and that variant is now itself cached.
+        assert self._load(path, load_stack=False).loaded_from_cache is True
+
+    def test_mtime_change_invalidates(self, tmp_path, monkeypatch):
+        self._setup(tmp_path, monkeypatch)
+        path = str(tmp_path / "cap.xml")
+        self._load(path)
+        os.utime(path, (0, 0))  # change mtime
+        assert self._load(path).loaded_from_cache is False
+
+    def test_version_change_invalidates(self, tmp_path, monkeypatch):
+        cache, path = self._setup(tmp_path, monkeypatch)
+        self._load(path)
+        monkeypatch.setattr(cache, "CACHE_VERSION", cache.CACHE_VERSION + 1)
+        assert self._load(path).loaded_from_cache is False
+
+    def test_corrupt_cache_falls_back_to_parse(self, tmp_path, monkeypatch):
+        cache, path = self._setup(tmp_path, monkeypatch)
+        # Overwrite the cache file with non-deserializable bytes.
+        key = cache.compute_key(path, True, True)
+        cache_file = cache._cache_file(key)
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "wb") as f:
+            f.write(b"corrupt-not-valid")
+        d = self._load(path)
+        assert d.loaded_from_cache is False
+        assert len(d.events) == 8
+        # The bad entry is replaced, so the next load is a clean hit.
+        assert self._load(path).loaded_from_cache is True
+
+    def test_clear_removes_cache_files(self, tmp_path, monkeypatch):
+        cache, path = self._setup(tmp_path, monkeypatch)
+        self._load(path)
+        assert cache.clear() >= 1
+        assert self._load(path).loaded_from_cache is False
+
+    def test_compute_key_none_for_missing_file(self, tmp_path, monkeypatch):
+        from procmon_mcp import cache
+        monkeypatch.setattr(cache, "CACHE_DIR", str(tmp_path / "cache"))
+        assert cache.compute_key(str(tmp_path / "nope.xml"), True, True) is None

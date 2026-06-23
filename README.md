@@ -8,6 +8,7 @@ Process Monitor captures detailed system activity — file access, registry oper
 
 Key capabilities:
 - **Load files at runtime** — no need to restart the server to analyse a different capture
+- **Parsed-capture cache** — reloading an unchanged file is near-instant (parsing is skipped)
 - **String interning** for reduced memory footprint on large logs
 - **Indexed lookups** by process name, operation, PID, and file path for fast filtering
 - **Multiple transport protocols** — stdio (recommended), Streamable HTTP, and SSE (deprecated)
@@ -172,6 +173,8 @@ Inside a Claude Code session, you can also type `/mcp` to check the status of co
 | `--mcp-port <port>` | `8081` | Port number (HTTP transports only). |
 | `--no-stack-traces` | off | Skip loading stack traces to save memory. |
 | `--no-extra-data` | off | Skip loading unknown/extra event fields to save memory. |
+| `--no-cache` | off | Bypass the parsed-capture cache (always re-parse, and refresh the cache). |
+| `--clear-cache` | off | Remove all cached parsed captures, then exit. |
 | `--debug` | off | Enable verbose debug logging. |
 | `--log-file <path>` | *(console)* | Write logs to a file instead of the console. |
 | `--profile` | off | Enable cProfile profiling (for development). |
@@ -237,6 +240,25 @@ ProcmonMCP stores user preferences in `~/.procmonmcp/config.json`. This file is 
 
 No API keys or authentication tokens are required — ProcmonMCP is a purely local analysis tool.
 
+### Parsed-capture cache
+
+Parsing a large capture is expensive (tens of seconds to minutes). After a successful
+parse, ProcmonMCP serializes the optimised in-memory representation (events, interners,
+indices, process tables) to `~/.procmonmcp/cache/`, keyed on the source file's path,
+size, and modification time plus the load options. Reloading the same unchanged file is
+then served from the cache and is near-instant — in practice a 20s parse drops to well
+under a second.
+
+- The cache is invalidated automatically when the file changes (mtime/size) or when the
+  cache format version changes. Different `no_stack_traces`/`no_extra_data` options are
+  cached separately.
+- Bypass it with `--no-cache` (CLI) or `no_cache: true` (the `load_file` tool); the
+  `from_cache` field in the load response indicates whether the cache was used.
+- Clear it with `--clear-cache` (CLI) or the `clear_cache` tool.
+- **Security:** cache files are serialized with Python's `pickle` and are read back only
+  from your user-owned `~/.procmonmcp/cache` directory (only this tool's own output is
+  ever deserialized). Do not point the cache at a location other users can write to.
+
 ## Available MCP Tools
 
 ### Lifecycle Tools
@@ -244,7 +266,8 @@ No API keys or authentication tokens are required — ProcmonMCP is a purely loc
 | Tool | Description |
 |------|-------------|
 | `get_status()` | Returns the current server state — whether a file is loaded, loading progress, memory usage, and available actions. **Call this first.** |
-| `load_file(file_path, no_stack_traces?, no_extra_data?)` | Loads a Procmon XML file (.xml, .gz, .bz2, .xz) for analysis. Provides progress feedback. Replaces any previously loaded data. |
+| `load_file(file_path, no_stack_traces?, no_extra_data?, no_cache?)` | Loads a Procmon XML file (.xml, .gz, .bz2, .xz) for analysis. Uses the parsed-capture cache for near-instant reloads (`from_cache` in the response says whether it was used). Provides progress feedback. Replaces any previously loaded data. |
+| `clear_cache()` | Removes all on-disk parsed-capture caches. Reclaims disk space and forces a clean re-parse on the next load. Does not affect currently loaded data. |
 
 ### Data Retrieval Tools
 

@@ -20,6 +20,7 @@ from .constants import (
 )
 from .helpers import find_text_func, _strip_namespace, _find_child_ignore_ns, _clear_elem, _format_bytes
 from .models import StringInterner, StackFrame, ProcessInfo, ProcmonLogData
+from . import cache
 
 logger = logging.getLogger(__name__)
 
@@ -337,16 +338,31 @@ def _parse_xml_stream_for_loading(
         raise
 
 
-def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> ProcmonLogData:
+def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool,
+                     use_cache: bool = True) -> ProcmonLogData:
     """
     Loads XML file: Parses processes, then streams events, converting them
     to an optimized in-memory format using string interning. Stores results
     in a ProcmonLogData object. Builds indices.
+
+    If ``use_cache`` is True, an unchanged file previously parsed with the same
+    options is deserialized from the on-disk cache instead of being re-parsed,
+    and the freshly parsed result is written back to the cache.
     """
     if not os.path.exists(filename_abs):
         raise FileNotFoundError(f"Input file not found: {filename_abs}")
     if not os.path.isfile(filename_abs):
         raise ValueError(f"Input path is not a file: {filename_abs}")
+
+    # Try the parsed-capture cache before doing any expensive parsing.
+    cache_key = cache.compute_key(filename_abs, load_stack, load_extra) if use_cache else None
+    if cache_key is not None:
+        cached = cache.load(cache_key)
+        if cached is not None:
+            logger.info(f"Loaded '{cached.loaded_filename}' from cache: "
+                        f"{len(cached.events):,} events, {len(cached.processes_by_index)} processes "
+                        f"(skipped XML parsing).")
+            return cached
 
     log_data = ProcmonLogData(
         load_stack_traces=load_stack,
@@ -480,6 +496,11 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool) -> P
         if logger.isEnabledFor(logging.DEBUG):
             for name, interner in log_data.interners.items():
                 logger.debug(f"  Interner '{name}': {interner.next_id:,} unique strings.")
+
+        # Persist the parsed result so the next load of this file is near-instant.
+        if cache_key is not None:
+            if cache.save(cache_key, log_data):
+                logger.info("Saved parsed capture to cache for faster reloads.")
 
         return log_data
 
