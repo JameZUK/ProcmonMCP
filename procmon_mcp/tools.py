@@ -21,7 +21,7 @@ from . import server
 from .server import tool_decorator, _check_loaded
 from .filters import _iter_filtered_event_indices
 from .formatters import _get_formatted_event_details
-from .helpers import _format_bytes, parse_network_endpoint
+from .helpers import _format_bytes, parse_network_endpoint_parts, network_direction
 
 logger = logging.getLogger(__name__)
 
@@ -759,22 +759,121 @@ async def find_file_access(path_contains: str, limit: int = 100, *, ctx: Context
     return found_events
 
 
-@tool_decorator
-async def find_network_connections(process_name: str, *, ctx: Context) -> List[str]:
+def _format_ts(ts: Optional[float]) -> Optional[str]:
+    """Formats a Unix timestamp as a Procmon time-of-day string, or None."""
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).strftime(PROCMON_TIMESTAMP_FORMAT)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _network_op_ids(log_data) -> set:
+    """Returns the set of interned operation IDs for known network operations."""
+    return {
+        oid for oid in (log_data.get_id(IK_OPERATION, op) for op in NETWORK_OPERATIONS)
+        if oid is not None
+    }
+
+
+def _aggregate_network(log_data, indices, network_op_ids: set, group_by_process: bool) -> List[Dict[str, Any]]:
+    """Aggregates network events (by index) into enriched remote-endpoint records.
+
+    Each record carries the endpoint (host:port), split host/ip/hostname/port,
+    the operations and inferred directions seen, the distinct results, an event
+    count, and first/last-seen timestamps. When ``group_by_process`` is True the
+    grouping key is (process_name, pid, endpoint); otherwise it is the endpoint
+    alone (capture-wide rollup), with a process list/count attached.
     """
-    Finds unique remote network endpoints (IP:port or Hostname:port) accessed by a specific process.
+    agg: Dict[Any, Dict[str, Any]] = {}
+    for idx in indices:
+        event_dict = log_data.events[idx]
+        if event_dict.get('op_id') not in network_op_ids:
+            continue
+        parts = parse_network_endpoint_parts(log_data.get_string(IK_PATH, event_dict.get('path_id')))
+        if not parts:
+            continue
+        pname = log_data.get_string(IK_PROCESS_NAME, event_dict.get('pname_id'))
+        pid = event_dict.get('pid')
+        operation = log_data.get_string(IK_OPERATION, event_dict.get('op_id'))
+        result = log_data.get_string(IK_RESULT, event_dict.get('res_id'))
+        ts = event_dict.get('ts')
+        endpoint = parts['endpoint']
+        key = (pname, pid, endpoint) if group_by_process else endpoint
+
+        rec = agg.get(key)
+        if rec is None:
+            rec = {
+                'endpoint': endpoint, 'host': parts['host'], 'port': parts['port'],
+                'ip': parts['ip'], 'hostname': parts['hostname'], 'count': 0,
+                '_ops': set(), '_dirs': set(), '_results': set(),
+                '_first': ts, '_last': ts, '_procs': set(),
+            }
+            if group_by_process:
+                rec['process_name'] = pname
+                rec['pid'] = pid
+            agg[key] = rec
+
+        rec['count'] += 1
+        if operation:
+            rec['_ops'].add(operation)
+        direction = network_direction(operation)
+        if direction:
+            rec['_dirs'].add(direction)
+        if result:
+            rec['_results'].add(result)
+        if pname is not None or pid is not None:
+            rec['_procs'].add((pname, pid))
+        if ts is not None:
+            if rec['_first'] is None or ts < rec['_first']:
+                rec['_first'] = ts
+            if rec['_last'] is None or ts > rec['_last']:
+                rec['_last'] = ts
+
+    records: List[Dict[str, Any]] = []
+    for rec in agg.values():
+        first = rec.pop('_first')
+        last = rec.pop('_last')
+        rec['operations'] = sorted(rec.pop('_ops'))
+        rec['directions'] = sorted(rec.pop('_dirs'))
+        rec['results'] = sorted(rec.pop('_results'))
+        procs = rec.pop('_procs')
+        rec['first_seen_unix'] = first
+        rec['last_seen_unix'] = last
+        rec['first_seen'] = _format_ts(first)
+        rec['last_seen'] = _format_ts(last)
+        if not group_by_process:
+            rec['process_count'] = len(procs)
+            rec['processes'] = sorted(
+                f"{name} (PID {p})" if p is not None else str(name)
+                for name, p in procs if name is not None or p is not None
+            )
+        records.append(rec)
+    return records
+
+
+@tool_decorator
+async def find_network_connections(process_name: str, *, ctx: Context) -> List[Dict[str, Any]]:
+    """
+    Finds remote network endpoints accessed by a specific process, with enrichment.
     Uses a case-sensitive, exact match for the process name.
-    Scans events matching the process name for network operations (TCP/UDP Send/Receive/Connect) and extracts endpoints from the 'Path' field.
-    Returns a sorted list of unique endpoint strings.
+
+    Scans the process's network operations (TCP/UDP Connect/Send/Receive) and returns
+    one record per unique (PID, endpoint), each containing: endpoint (host:port), host,
+    ip, hostname, port, the operations and inferred directions (connect/send/receive)
+    seen, distinct results, an event count, and first/last-seen timestamps.
+    Records are sorted by event count (descending). Returns an empty list if the process
+    has no recognised network endpoints.
     """
     log_data = await _check_loaded(ctx, "find_network_connections")
     await ctx.info(f"[find_network_connections] Starting for process: '{process_name}'")
     if not process_name:
         await ctx.error("[find_network_connections] process_name filter cannot be empty.")
         raise ValueError("process_name filter is required.")
-    remote_endpoints = set()
+
     target_pname_id = log_data.get_id(IK_PROCESS_NAME, process_name)
-    network_op_ids = {log_data.get_id(IK_OPERATION, op) for op in NETWORK_OPERATIONS if log_data.get_id(IK_OPERATION, op) is not None}
+    network_op_ids = _network_op_ids(log_data)
 
     if target_pname_id is None:
         await ctx.warning(f"[find_network_connections] Process name '{process_name}' not found in loaded data.")
@@ -789,33 +888,10 @@ async def find_network_connections(process_name: str, *, ctx: Context) -> List[s
         return []
 
     await ctx.info(f"[find_network_connections] Scanning {len(indices_to_check):,} events for '{process_name}'...")
-    processed_count = 0
-    start_time = time.time()
-    last_progress_report_time = start_time
-
-    for idx in indices_to_check:
-        processed_count += 1
-        event_dict = log_data.events[idx]
-        op_id = event_dict.get('op_id')
-
-        if op_id in network_op_ids:
-            path_str = log_data.get_string(IK_PATH, event_dict.get('path_id'))
-            endpoint = parse_network_endpoint(path_str)
-            if endpoint:
-                remote_endpoints.add(endpoint)
-
-        current_time = time.time()
-        if processed_count % 50000 == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS):
-            elapsed = current_time - start_time
-            try:
-                await ctx.info(f"[find_network_connections] Scanned {processed_count:,}/{len(indices_to_check):,} events ({elapsed:.1f}s)")
-            except Exception:
-                pass
-            last_progress_report_time = current_time
-
-    sorted_endpoints = sorted(list(remote_endpoints))
-    await ctx.info(f"[find_network_connections] Completed. {len(sorted_endpoints)} unique endpoints for '{process_name}'.")
-    return sorted_endpoints
+    records = _aggregate_network(log_data, indices_to_check, network_op_ids, group_by_process=True)
+    records.sort(key=lambda r: (-r['count'], str(r['endpoint']), r.get('pid') or 0))
+    await ctx.info(f"[find_network_connections] Completed. {len(records)} unique endpoints for '{process_name}'.")
+    return records
 
 
 @tool_decorator
@@ -966,21 +1042,21 @@ async def export_query_results(
 @tool_decorator
 async def list_network_connections(limit: int = 200, *, ctx: Context) -> List[Dict[str, Any]]:
     """
-    Lists unique network connections across ALL processes in the loaded capture.
+    Lists network connections across ALL processes in the loaded capture, enriched.
 
-    Scans every network operation (TCP/UDP Connect/Send/Receive) and returns up to
-    `limit` unique records, each with the process name, PID, operation, and remote
-    endpoint (IP:port or Hostname:port). Use this for triage to see every endpoint the
-    capture touched before drilling into a single process with find_network_connections.
+    Scans every network operation (TCP/UDP Connect/Send/Receive) and returns one record
+    per unique (process_name, PID, endpoint), ranked by event count (descending) so the
+    busiest connections appear first. Each record includes: process_name, pid, endpoint
+    (host:port), host, ip, hostname, port, the operations and inferred directions
+    (connect/send/receive), distinct results, an event count, and first/last-seen
+    timestamps. At most `limit` records are returned (the top ones by count). Use this for
+    triage, then drill into a process with find_network_connections or rank remote
+    endpoints with get_network_top_talkers.
     """
     log_data = await _check_loaded(ctx, "list_network_connections")
     await ctx.info("[list_network_connections] Scanning all network events...")
 
-    network_op_ids = {
-        log_data.get_id(IK_OPERATION, op)
-        for op in NETWORK_OPERATIONS
-        if log_data.get_id(IK_OPERATION, op) is not None
-    }
+    network_op_ids = _network_op_ids(log_data)
     if not network_op_ids:
         await ctx.warning("[list_network_connections] No network operations found in interner.")
         return []
@@ -990,32 +1066,47 @@ async def list_network_connections(limit: int = 200, *, ctx: Context) -> List[Di
     candidate_indices: List[int] = []
     for op_id in network_op_ids:
         candidate_indices.extend(log_data.op_id_index.get(op_id, []))
-    candidate_indices.sort()
 
-    seen = set()
-    results: List[Dict[str, Any]] = []
-    for idx in candidate_indices:
-        event_dict = log_data.events[idx]
-        endpoint = parse_network_endpoint(log_data.get_string(IK_PATH, event_dict.get('path_id')))
-        if not endpoint:
-            continue
-        process_name = log_data.get_string(IK_PROCESS_NAME, event_dict.get('pname_id'))
-        operation = log_data.get_string(IK_OPERATION, event_dict.get('op_id'))
-        pid = event_dict.get('pid')
-        key = (process_name, pid, operation, endpoint)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append({
-            "process_name": process_name,
-            "pid": pid,
-            "operation": operation,
-            "endpoint": endpoint,
-        })
-        if len(results) >= limit:
-            await ctx.warning(f"[list_network_connections] Result limit ({limit}) reached; output truncated.")
-            break
+    records = _aggregate_network(log_data, candidate_indices, network_op_ids, group_by_process=True)
+    records.sort(key=lambda r: (-r['count'], str(r.get('process_name')), str(r['endpoint'])))
 
-    results.sort(key=lambda r: (str(r["process_name"]), str(r["endpoint"])))
-    await ctx.info(f"[list_network_connections] Completed. {len(results)} unique records.")
-    return results
+    total = len(records)
+    if total > limit:
+        await ctx.warning(f"[list_network_connections] {total} records; returning top {limit} by event count.")
+        records = records[:limit]
+    await ctx.info(f"[list_network_connections] Completed. {len(records)} of {total} unique connections.")
+    return records
+
+
+@tool_decorator
+async def get_network_top_talkers(limit: int = 50, *, ctx: Context) -> List[Dict[str, Any]]:
+    """
+    Ranks unique remote endpoints across the WHOLE capture by network-event count.
+
+    Aggregates all network operations (TCP/UDP Connect/Send/Receive) by remote endpoint
+    (ignoring which process), returning up to `limit` endpoints sorted by event count
+    (descending). Each record includes: endpoint (host:port), host, ip, hostname, port,
+    an event count, the number of distinct processes that touched it (process_count) and
+    their names (processes), the operations and inferred directions seen, distinct
+    results, and first/last-seen timestamps.
+    """
+    log_data = await _check_loaded(ctx, "get_network_top_talkers")
+    await ctx.info("[get_network_top_talkers] Ranking remote endpoints...")
+
+    network_op_ids = _network_op_ids(log_data)
+    if not network_op_ids:
+        await ctx.warning("[get_network_top_talkers] No network operations found in interner.")
+        return []
+
+    candidate_indices: List[int] = []
+    for op_id in network_op_ids:
+        candidate_indices.extend(log_data.op_id_index.get(op_id, []))
+
+    records = _aggregate_network(log_data, candidate_indices, network_op_ids, group_by_process=False)
+    records.sort(key=lambda r: (-r['count'], str(r['endpoint'])))
+
+    total = len(records)
+    if total > limit:
+        records = records[:limit]
+    await ctx.info(f"[get_network_top_talkers] Completed. Top {len(records)} of {total} unique endpoints.")
+    return records

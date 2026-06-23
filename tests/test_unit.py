@@ -537,6 +537,47 @@ class TestParseNetworkEndpoint:
             "a:1 -> [2001:db8::1]:https") == "2001:db8::1:https"
 
 
+class TestParseNetworkEndpointParts:
+    def test_ipv4_sets_ip_not_hostname(self):
+        parts = procmon_mcp.parse_network_endpoint_parts("a:1 -> 93.184.216.34:443")
+        assert parts["endpoint"] == "93.184.216.34:443"
+        assert parts["host"] == "93.184.216.34"
+        assert parts["port"] == "443"
+        assert parts["ip"] == "93.184.216.34"
+        assert parts["hostname"] is None
+
+    def test_hostname_sets_hostname_not_ip(self):
+        parts = procmon_mcp.parse_network_endpoint_parts("a:1 -> example.com:https")
+        assert parts["hostname"] == "example.com"
+        assert parts["ip"] is None
+        assert parts["port"] == "https"
+
+    def test_ipv6_is_ip(self):
+        parts = procmon_mcp.parse_network_endpoint_parts("a:1 -> [2001:db8::1]:443")
+        assert parts["ip"] == "2001:db8::1"
+        assert parts["hostname"] is None
+
+    def test_no_match_returns_none(self):
+        assert procmon_mcp.parse_network_endpoint_parts("C:\\x.dll") is None
+
+
+class TestNetworkDirection:
+    def test_connect(self):
+        assert procmon_mcp.network_direction("TCP Connect") == "connect"
+
+    def test_send(self):
+        assert procmon_mcp.network_direction("UDP Send") == "send"
+
+    def test_receive(self):
+        assert procmon_mcp.network_direction("TCP Receive") == "receive"
+
+    def test_unknown(self):
+        assert procmon_mcp.network_direction("CreateFile") is None
+
+    def test_none(self):
+        assert procmon_mcp.network_direction(None) is None
+
+
 # --- Parser Integration Tests ---
 
 def _write_capture(path, n_events, with_stack=True):
@@ -706,3 +747,123 @@ class TestFilterExactMatch:
         res = _collect_filtered(data, filter_operation="CreateFile",
                                 filter_result="ACCESS DENIED")
         assert res == []
+
+
+# --- Enriched Network Tools Tests ---
+
+# (process_index, pid, name, operation, remote, result)
+_NET_EVENTS = [
+    (0, 1000, "chrome.exe",  "TCP Connect", "93.184.216.34:443",      "SUCCESS"),
+    (0, 1000, "chrome.exe",  "TCP Send",    "93.184.216.34:443",      "SUCCESS"),
+    (0, 1000, "chrome.exe",  "TCP Send",    "93.184.216.34:443",      "SUCCESS"),
+    (0, 1000, "chrome.exe",  "TCP Send",    "93.184.216.34:443",      "SUCCESS"),
+    (0, 1000, "chrome.exe",  "TCP Receive", "93.184.216.34:443",      "SUCCESS"),
+    (0, 1000, "chrome.exe",  "TCP Receive", "93.184.216.34:443",      "SUCCESS"),
+    (0, 1000, "chrome.exe",  "TCP Connect", "cdn.example.com:https",  "SUCCESS"),
+    (1, 2000, "svchost.exe", "UDP Send",    "192.168.1.1:domain",     "SUCCESS"),
+    (1, 2000, "svchost.exe", "UDP Send",    "192.168.1.1:domain",     "SUCCESS"),
+    (1, 2000, "svchost.exe", "UDP Receive", "192.168.1.1:domain",     "SUCCESS"),
+    (1, 2000, "svchost.exe", "UDP Receive", "192.168.1.1:domain",     "SUCCESS"),
+]
+
+
+def _write_network_capture(path):
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n<procmon>\n<processlist>\n',
+        '<process><ProcessIndex>0</ProcessIndex><ProcessId>1000</ProcessId>'
+        '<ProcessName>chrome.exe</ProcessName><ImagePath>C:\\chrome.exe</ImagePath></process>\n',
+        '<process><ProcessIndex>1</ProcessIndex><ProcessId>2000</ProcessId>'
+        '<ProcessName>svchost.exe</ProcessName><ImagePath>C:\\svchost.exe</ImagePath></process>\n',
+        '</processlist>\n<eventlist>\n',
+    ]
+    for i, (pidx, pid, name, op, remote, result) in enumerate(_NET_EVENTS):
+        parts.append(
+            '<event><ProcessIndex>%d</ProcessIndex><PID>%d</PID>'
+            '<Time_of_Day>12:00:%02d.000000</Time_of_Day>'
+            '<Operation>%s</Operation><Path>LOCAL:55000 -&gt; %s</Path>'
+            '<Result>%s</Result><Process_Name>%s</Process_Name></event>\n'
+            % (pidx, pid, i, op, remote, result, name)
+        )
+    parts.append('</eventlist>\n</procmon>\n')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(''.join(parts))
+
+
+def _drive(coro):
+    return asyncio.run(coro)
+
+
+def _load_net(tmp_path):
+    from procmon_mcp.parser import load_procmon_xml
+    from procmon_mcp import server
+    path = str(tmp_path / "net.xml")
+    _write_network_capture(path)
+    data = load_procmon_xml(path, load_stack=False, load_extra=False)
+    server.LOADED_DATA = data
+    return data
+
+
+class TestNetworkTools:
+    def _ctx(self):
+        return _DummyContext()
+
+    def test_list_network_connections_enriched_and_ranked(self, tmp_path):
+        from procmon_mcp import tools
+        _load_net(tmp_path)
+        res = _drive(tools.list_network_connections(ctx=self._ctx()))
+        # Three unique (process, pid, endpoint) groups, ranked by count desc.
+        assert [r["endpoint"] for r in res] == [
+            "93.184.216.34:443", "192.168.1.1:domain", "cdn.example.com:https"]
+        top = res[0]
+        assert top["process_name"] == "chrome.exe" and top["pid"] == 1000
+        assert top["count"] == 6
+        assert top["directions"] == ["connect", "receive", "send"]
+        assert top["results"] == ["SUCCESS"]
+        assert top["ip"] == "93.184.216.34" and top["hostname"] is None
+        assert top["first_seen"] is not None and top["last_seen"] is not None
+
+    def test_hostname_surfaced_separately_from_ip(self, tmp_path):
+        from procmon_mcp import tools
+        _load_net(tmp_path)
+        res = _drive(tools.list_network_connections(ctx=self._ctx()))
+        host_rec = next(r for r in res if r["endpoint"] == "cdn.example.com:https")
+        assert host_rec["hostname"] == "cdn.example.com"
+        assert host_rec["ip"] is None
+        assert host_rec["port"] == "https"
+
+    def test_list_limit_keeps_top_by_count(self, tmp_path):
+        from procmon_mcp import tools
+        _load_net(tmp_path)
+        res = _drive(tools.list_network_connections(limit=1, ctx=self._ctx()))
+        assert len(res) == 1
+        assert res[0]["endpoint"] == "93.184.216.34:443"  # busiest
+
+    def test_find_network_connections_returns_records(self, tmp_path):
+        from procmon_mcp import tools
+        _load_net(tmp_path)
+        res = _drive(tools.find_network_connections("chrome.exe", ctx=self._ctx()))
+        endpoints = [r["endpoint"] for r in res]
+        assert endpoints == ["93.184.216.34:443", "cdn.example.com:https"]
+        assert res[0]["count"] == 6
+        assert res[0]["directions"] == ["connect", "receive", "send"]
+
+    def test_top_talkers_rollup_across_processes(self, tmp_path):
+        from procmon_mcp import tools
+        _load_net(tmp_path)
+        res = _drive(tools.get_network_top_talkers(ctx=self._ctx()))
+        assert [r["endpoint"] for r in res] == [
+            "93.184.216.34:443", "192.168.1.1:domain", "cdn.example.com:https"]
+        assert [r["count"] for r in res] == [6, 4, 1]
+        # Each rollup record reports how many distinct processes touched it.
+        assert res[0]["process_count"] == 1
+        assert res[0]["processes"] == ["chrome.exe (PID 1000)"]
+
+    def test_no_network_events_returns_empty(self, tmp_path):
+        from procmon_mcp import tools
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp import server
+        path = str(tmp_path / "nonet.xml")
+        _write_capture(path, 5, with_stack=False)  # CreateFile events only
+        server.LOADED_DATA = load_procmon_xml(path, load_stack=False, load_extra=False)
+        assert _drive(tools.list_network_connections(ctx=self._ctx())) == []
+        assert _drive(tools.get_network_top_talkers(ctx=self._ctx())) == []

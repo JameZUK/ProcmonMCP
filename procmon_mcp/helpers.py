@@ -1,8 +1,9 @@
 """XML helper functions, regex utilities, timestamp parsing, and formatting."""
 import re
 import logging
+import ipaddress
 from datetime import datetime, timezone, time as dt_time
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from .compat import ET_impl
 from .constants import PROCMON_TIMESTAMP_FORMAT, BASE_DATE, MAX_REGEX_LEN
@@ -103,17 +104,65 @@ def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
 _ENDPOINT_REGEX = re.compile(r".* -> \[?([A-Za-z0-9._:\-]+)\]?:([A-Za-z0-9\-]+)$")
 
 
-def parse_network_endpoint(path_str: Optional[str]) -> Optional[str]:
-    """Extracts the remote 'host:port' endpoint from a Procmon network Path field.
+def _host_is_ip(host: str) -> bool:
+    """True if `host` is a literal IPv4/IPv6 address rather than a hostname."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
 
-    Returns None if the path does not contain a recognisable remote endpoint.
+
+def parse_network_endpoint_parts(path_str: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parses a Procmon network Path field into structured remote-endpoint parts.
+
+    Returns a dict with keys ``endpoint`` (``host:port``), ``host``, ``port``,
+    ``ip`` (set when the host is a literal IP, else None), and ``hostname`` (set
+    when the host is a DNS name, else None). Returns None when the path has no
+    recognisable remote endpoint.
     """
     if not path_str:
         return None
     match = _ENDPOINT_REGEX.match(path_str)
     if not match:
         return None
-    return f"{match.group(1)}:{match.group(2)}"
+    host, port = match.group(1), match.group(2)
+    is_ip = _host_is_ip(host)
+    return {
+        "endpoint": f"{host}:{port}",
+        "host": host,
+        "port": port,
+        "ip": host if is_ip else None,
+        "hostname": None if is_ip else host,
+    }
+
+
+def parse_network_endpoint(path_str: Optional[str]) -> Optional[str]:
+    """Extracts the remote 'host:port' endpoint from a Procmon network Path field.
+
+    Returns None if the path does not contain a recognisable remote endpoint.
+    """
+    parts = parse_network_endpoint_parts(path_str)
+    return parts["endpoint"] if parts else None
+
+
+# Procmon network operations encode a direction in their name.
+def network_direction(operation: Optional[str]) -> Optional[str]:
+    """Infers the connection direction ('connect'/'send'/'receive') from an op name."""
+    if not operation:
+        return None
+    op = operation.lower()
+    if "connect" in op:
+        return "connect"
+    if "send" in op:
+        return "send"
+    if "receive" in op:
+        return "receive"
+    if "accept" in op:
+        return "accept"
+    if "disconnect" in op:
+        return "disconnect"
+    return None
 
 
 # --- Byte Formatting ---
