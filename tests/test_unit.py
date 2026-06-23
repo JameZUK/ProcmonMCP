@@ -961,3 +961,79 @@ class TestCaptureCache:
         from procmon_mcp import cache
         monkeypatch.setattr(cache, "CACHE_DIR", str(tmp_path / "cache"))
         assert cache.compute_key(str(tmp_path / "nope.xml"), True, True) is None
+
+
+# --- Process Lifetime Tests ---
+
+# (pid, process_name, operation, time_of_day, path) — a parent (explorer) that
+# started during the capture and creates a child, then both exit. The child's own
+# creation is a "Process Start" with the child's PID; the parent-side
+# "Process Create" carries the PARENT's PID.
+_LIFECYCLE_EVENTS = [
+    (100, "explorer.exe", "Process Start",  "12:00:00.000000", "C:\\explorer.exe"),
+    (100, "explorer.exe", "Process Create", "12:00:01.000000", "C:\\child.exe"),
+    (200, "child.exe",    "Process Start",  "12:00:02.000000", "C:\\child.exe"),
+    (200, "child.exe",    "CreateFile",     "12:00:03.000000", "C:\\data.bin"),
+    (200, "child.exe",    "Process Exit",   "12:00:04.000000", "C:\\child.exe"),
+    (100, "explorer.exe", "Process Exit",   "12:00:05.000000", "C:\\explorer.exe"),
+]
+
+
+def _write_lifecycle_capture(path):
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n<procmon>\n<processlist>\n',
+        '<process><ProcessIndex>0</ProcessIndex><ProcessId>100</ProcessId>'
+        '<ProcessName>explorer.exe</ProcessName><ImagePath>C:\\explorer.exe</ImagePath></process>\n',
+        '<process><ProcessIndex>1</ProcessIndex><ProcessId>200</ProcessId>'
+        '<ProcessName>child.exe</ProcessName><ImagePath>C:\\child.exe</ImagePath></process>\n',
+        '</processlist>\n<eventlist>\n',
+    ]
+    for pid, name, op, tod, p in _LIFECYCLE_EVENTS:
+        idx = 0 if pid == 100 else 1
+        parts.append(
+            '<event><ProcessIndex>%d</ProcessIndex><PID>%d</PID>'
+            '<Time_of_Day>%s</Time_of_Day><Operation>%s</Operation>'
+            '<Path>%s</Path><Result>SUCCESS</Result><Process_Name>%s</Process_Name></event>\n'
+            % (idx, pid, tod, op, p, name)
+        )
+    parts.append('</eventlist>\n</procmon>\n')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(''.join(parts))
+
+
+# 1970-01-01 epoch + HH:MM:SS, matching the parser's BASE_DATE.
+def _tod(h, m, s):
+    return h * 3600 + m * 60 + s
+
+
+class TestProcessLifetime:
+    def _load(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp import server
+        path = str(tmp_path / "life.xml")
+        _write_lifecycle_capture(path)
+        server.LOADED_DATA = load_procmon_xml(path, load_stack=False, load_extra=False)
+
+    def test_child_create_uses_process_start(self, tmp_path):
+        # Regression: the child has no "Process Create" with its own PID, only
+        # "Process Start". create_timestamp must come from that, not be None.
+        from procmon_mcp import tools
+        self._load(tmp_path)
+        r = _drive(tools.get_process_lifetime(200, _DummyContext()))
+        assert r["create_timestamp"] == _tod(12, 0, 2)
+        assert r["exit_timestamp"] == _tod(12, 0, 4)
+
+    def test_parent_prefers_own_start_over_child_create(self, tmp_path):
+        # explorer has both its own "Process Start" (12:00:00) and a parent-side
+        # "Process Create" of the child (12:00:01); the earliest (its start) wins.
+        from procmon_mcp import tools
+        self._load(tmp_path)
+        r = _drive(tools.get_process_lifetime(100, _DummyContext()))
+        assert r["create_timestamp"] == _tod(12, 0, 0)
+        assert r["exit_timestamp"] == _tod(12, 0, 5)
+
+    def test_unknown_pid_returns_nones(self, tmp_path):
+        from procmon_mcp import tools
+        self._load(tmp_path)
+        r = _drive(tools.get_process_lifetime(999, _DummyContext()))
+        assert r == {"create_timestamp": None, "exit_timestamp": None}
