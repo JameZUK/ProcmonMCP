@@ -20,9 +20,9 @@ _SERVER_DESC = (
 )
 
 if MCP_SDK_AVAILABLE:
-    mcp = FastMCP("ProcmonMCP", description=_SERVER_DESC)
+    mcp = FastMCP("ProcmonMCP", instructions=_SERVER_DESC)
 else:
-    mcp = FastMCP("ProcmonMCP (Mock)", description=_SERVER_DESC)
+    mcp = FastMCP("ProcmonMCP (Mock)", instructions=_SERVER_DESC)
 
 
 async def _check_loaded(ctx: Context, tool_name: str) -> ProcmonLogData:

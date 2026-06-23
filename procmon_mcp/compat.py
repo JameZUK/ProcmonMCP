@@ -62,9 +62,9 @@ except ImportError:
         log_level = "INFO"
 
     class MockMCP:
-        def __init__(self, name, description=""):
+        def __init__(self, name, instructions=""):
             self.name = name
-            self.description = description
+            self.instructions = instructions
             self.app = object()
             self.settings = MockSettings()
             self._run_called_with_transport = None
