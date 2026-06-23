@@ -97,7 +97,10 @@ def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
 # Procmon renders network Path fields as "<local> -> <remote>", where an
 # endpoint is "host:port", "ipv4:port", or "[ipv6]:port". The host class covers
 # IPv4/IPv6 literals as well as DNS hostnames (letters, digits, dot, hyphen).
-_ENDPOINT_REGEX = re.compile(r".* -> \[?([A-Za-z0-9._:\-]+)\]?:(\d+)")
+# The port may be numeric (443) OR a resolved service name (domain, https),
+# which Procmon emits for well-known ports unless "Show resolved network
+# addresses" is disabled.
+_ENDPOINT_REGEX = re.compile(r".* -> \[?([A-Za-z0-9._:\-]+)\]?:([A-Za-z0-9\-]+)$")
 
 
 def parse_network_endpoint(path_str: Optional[str]) -> Optional[str]:
