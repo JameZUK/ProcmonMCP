@@ -21,7 +21,7 @@ from . import server
 from .server import tool_decorator, _check_loaded
 from .filters import _iter_filtered_event_indices
 from .formatters import _get_formatted_event_details
-from .helpers import _format_bytes
+from .helpers import _format_bytes, parse_network_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -303,12 +303,12 @@ async def query_events(
         return filtered_event_summaries
 
     except (ValueError, TypeError, RuntimeError, re.error) as e:
+        # These are already meaningful client-facing errors (bad filter input,
+        # invalid regex, or an internal error surfaced by the filter iterator);
+        # re-raise as-is rather than double-wrapping.
         await ctx.error(f"[query_events] Failed: {e}")
         logger.debug("Query exception details:", exc_info=True)
-        if isinstance(e, (ValueError, TypeError, re.error)):
-            raise e
-        else:
-            raise RuntimeError(f"Internal error querying events: {e}") from e
+        raise
 
 
 @tool_decorator
@@ -789,7 +789,6 @@ async def find_network_connections(process_name: str, *, ctx: Context) -> List[s
         return []
 
     await ctx.info(f"[find_network_connections] Scanning {len(indices_to_check):,} events for '{process_name}'...")
-    endpoint_regex = re.compile(r".* -> \[?([a-fA-F0-9:.\-]+)\]?:(\d+)")
     processed_count = 0
     start_time = time.time()
     last_progress_report_time = start_time
@@ -801,10 +800,9 @@ async def find_network_connections(process_name: str, *, ctx: Context) -> List[s
 
         if op_id in network_op_ids:
             path_str = log_data.get_string(IK_PATH, event_dict.get('path_id'))
-            if path_str:
-                match = endpoint_regex.match(path_str)
-                if match:
-                    remote_endpoints.add(f"{match.group(1)}:{match.group(2)}")
+            endpoint = parse_network_endpoint(path_str)
+            if endpoint:
+                remote_endpoints.add(endpoint)
 
         current_time = time.time()
         if processed_count % 50000 == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS):
@@ -850,6 +848,9 @@ async def export_query_results(
     if not output_file:
         raise ValueError("Output file name cannot be empty.")
 
+    # Ensure data is loaded before validating paths or creating directories.
+    log_data = await _check_loaded(ctx, "export_query_results")
+
     # Path validation (hardened)
     try:
         allowed_dir = os.path.abspath(os.getcwd())
@@ -873,7 +874,6 @@ async def export_query_results(
         await ctx.error(f"Invalid output file path: {e}")
         raise e
 
-    log_data = await _check_loaded(ctx, "export_query_results")
     if not log_data.events:
         await ctx.info("[export_query_results] Completed. No events loaded to export.")
         return {"success": True, "output_path": abs_output_path, "events_exported": 0}

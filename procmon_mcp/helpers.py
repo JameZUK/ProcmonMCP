@@ -93,6 +93,26 @@ def _parse_timestamp_str(ts_str: Optional[str]) -> Optional[float]:
         return None
 
 
+# --- Network Endpoint Parsing ---
+# Procmon renders network Path fields as "<local> -> <remote>", where an
+# endpoint is "host:port", "ipv4:port", or "[ipv6]:port". The host class covers
+# IPv4/IPv6 literals as well as DNS hostnames (letters, digits, dot, hyphen).
+_ENDPOINT_REGEX = re.compile(r".* -> \[?([A-Za-z0-9._:\-]+)\]?:(\d+)")
+
+
+def parse_network_endpoint(path_str: Optional[str]) -> Optional[str]:
+    """Extracts the remote 'host:port' endpoint from a Procmon network Path field.
+
+    Returns None if the path does not contain a recognisable remote endpoint.
+    """
+    if not path_str:
+        return None
+    match = _ENDPOINT_REGEX.match(path_str)
+    if not match:
+        return None
+    return f"{match.group(1)}:{match.group(2)}"
+
+
 # --- Byte Formatting ---
 def _format_bytes(bytes_val: int) -> str:
     """Formats bytes into a human-readable string (KB, MB, GB)."""

@@ -18,7 +18,7 @@ from .constants import (
 from .helpers import (
     _compile_safe_regex, _strip_namespace, _find_child_ignore_ns,
     _find_text_ignore_ns, find_text_func, _clear_elem,
-    _parse_timestamp_str, _format_bytes,
+    _parse_timestamp_str, _format_bytes, parse_network_endpoint,
 )
 
 # Data models
