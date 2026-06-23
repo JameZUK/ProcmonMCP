@@ -267,7 +267,9 @@ No API keys or authentication tokens are required — ProcmonMCP is a purely loc
 | `get_timing_statistics(group_by)` | Calculates duration statistics grouped by process or operation. |
 | `get_process_lifetime(pid)` | Finds the Process Create and Process Exit timestamps for a given PID. |
 | `find_file_access(path_contains, limit?)` | Finds file system events matching a path substring (case-insensitive). |
-| `find_network_connections(process_name)` | Finds unique remote network endpoints accessed by a process. |
+| `find_network_connections(process_name)` | Returns enriched records for the remote endpoints a process accessed: endpoint, host/ip/hostname/port, operations, inferred directions (connect/send/receive), results, event count, and first/last-seen timestamps — ranked by count. |
+| `list_network_connections(limit?)` | Capture-wide network triage: one enriched record per (process, PID, endpoint) across all processes, ranked by event count. |
+| `get_network_top_talkers(limit?)` | Ranks unique remote endpoints across the whole capture by event count, with the count of distinct processes (and their names) that touched each. |
 
 ### Export Tools
 
@@ -328,7 +330,9 @@ Then in Cline, select MCP Servers and add:
 - "Get details for process PID 4568." *(Check command line, parent PID, image path)*
 - "Summarise operations for process `suspicious.exe`."
 - "Query events where filter_process is `suspicious.exe` and filter_operation is `RegSetValue`, limit 10."
-- "Find network connections for process `suspicious.exe`."
+- "Find network connections for process `suspicious.exe`." *(Enriched: directions, results, counts, first/last-seen)*
+- "List network connections across the whole capture." *(Capture-wide triage, busiest first)*
+- "Show the network top talkers." *(Rank remote endpoints by event count)*
 - "Find file access containing `temp\\suspicious_data`, limit 50."
 
 ### Looking for Persistence
