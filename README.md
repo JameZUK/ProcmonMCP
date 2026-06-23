@@ -39,6 +39,14 @@ cd ProcmonMCP
 pip install -r requirements.txt
 ```
 
+Or install the package itself (provides a `procmon-mcp` console script):
+
+```bash
+pip install .            # core only (mcp[cli])
+pip install ".[all]"     # core + optional lxml and psutil
+pip install -e ".[dev]"  # editable install with test tooling
+```
+
 ### Dependencies
 
 | Package | Required | Purpose |
@@ -364,3 +372,7 @@ For filters not backed by an index (e.g., regex, path contains, stack module pat
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests or open issues on [GitHub](https://github.com/JameZUK/ProcmonMCP).
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

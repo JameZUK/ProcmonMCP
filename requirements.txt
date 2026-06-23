@@ -1,3 +1,8 @@
+# Required
 mcp[cli]>=1.8.0
-lxml>=4.9.0
-psutil>=5.9.0
+
+# Optional (the server runs without these, with graceful fallbacks):
+#   lxml   - faster XML parsing; falls back to the stdlib ElementTree if absent
+#   psutil - memory-usage reporting after loading; silently skipped if absent
+# Install the optional extras with:  pip install lxml psutil
+# (or, from a checkout:  pip install -e ".[all]")
