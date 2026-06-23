@@ -1,5 +1,4 @@
 """Event detail formatting for ProcmonMCP."""
-import dataclasses
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
@@ -77,7 +76,7 @@ def _get_formatted_event_details(log_data: ProcmonLogData, event_index: int) -> 
         # Enriched process info
         process_obj = log_data.processes_by_pid.get(details.get('pid')) if details.get('pid') is not None else None
         if process_obj:
-            proc_details_dict = dataclasses.asdict(process_obj)
+            proc_details_dict = process_obj.to_dict()
             proc_details_dict.pop('process_index', None)
             proc_details_dict.pop('parent_process_index', None)
             details['process_details_summary'] = proc_details_dict

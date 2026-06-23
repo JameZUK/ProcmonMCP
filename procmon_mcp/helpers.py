@@ -10,16 +10,38 @@ from .constants import PROCMON_TIMESTAMP_FORMAT, BASE_DATE, MAX_REGEX_LEN
 
 logger = logging.getLogger(__name__)
 
+# Prefer Google RE2 (linear-time, immune to catastrophic backtracking) for
+# user-supplied filter regexes when available, so a pathological pattern can't
+# hang the server (ReDoS). Falls back to the stdlib `re` (length-capped) when
+# RE2 is not installed or cannot compile the pattern.
+try:
+    import re2 as _re2  # provided by the optional `google-re2` package
+    RE2_AVAILABLE = True
+except ImportError:
+    _re2 = None
+    RE2_AVAILABLE = False
+
 
 # --- Safe Regex Helper ---
-def _compile_safe_regex(pattern: Optional[str], name: str) -> Optional[re.Pattern]:
-    """Compile a regex pattern with length validation to mitigate ReDoS."""
+def _compile_safe_regex(pattern: Optional[str], name: str):
+    """Compile a user regex with ReDoS mitigation.
+
+    Enforces a maximum pattern length, then compiles with RE2 (linear-time) when
+    available. RE2 rejects a few constructs (back-references, look-around); on
+    such a pattern we fall back to stdlib `re` (still length-capped). Raises
+    ValueError on over-length patterns and re.error on invalid patterns.
+    """
     if pattern is None:
         return None
     if len(pattern) > MAX_REGEX_LEN:
         raise ValueError(
             f"Regex pattern for '{name}' exceeds maximum length of {MAX_REGEX_LEN} characters."
         )
+    if RE2_AVAILABLE:
+        try:
+            return _re2.compile(pattern, _re2.IGNORECASE)
+        except Exception as e:
+            logger.info(f"RE2 could not compile filter '{name}' ({e}); falling back to stdlib re.")
     return re.compile(pattern, re.IGNORECASE)
 
 

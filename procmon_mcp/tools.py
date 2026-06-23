@@ -4,8 +4,9 @@ import os
 import csv
 import json
 import time
+import heapq
+import asyncio
 import logging
-import dataclasses
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
@@ -13,6 +14,7 @@ from typing import List, Dict, Any, Optional
 from .compat import Context, PSUTIL_AVAILABLE
 from .constants import (
     PROCMON_TIMESTAMP_FORMAT, PROGRESS_REPORT_INTERVAL, PROGRESS_REPORT_SECONDS,
+    CLOCK_CHECK_INTERVAL,
     OP_PROCESS_EXIT, PROCESS_CREATE_OPERATIONS, NETWORK_OPERATIONS,
     IK_PROCESS_NAME, IK_OPERATION, IK_PATH, IK_RESULT, IK_CATEGORY,
     IK_STACK_PATH, IK_STACK_LOCATION,
@@ -24,6 +26,16 @@ from .formatters import _get_formatted_event_details
 from .helpers import _format_bytes, parse_network_endpoint_parts, network_direction
 
 logger = logging.getLogger(__name__)
+
+# Canonical column order for CSV export. Mirrors the keys produced by
+# _get_formatted_event_details so rows can be streamed without first collecting
+# every event to discover the header.
+_EXPORT_FIELDNAMES = [
+    'event_index', 'sequence_number', 'timestamp', 'timestamp_unix', 'process_name',
+    'pid', 'tid', 'parent_pid', 'operation', 'path', 'result', 'detail', 'duration',
+    'category', 'extra_data', 'stack_trace', 'user_sid', 'is_64bit_process',
+    'process_details_summary', 'completion_time', 'relative_time',
+]
 
 
 # ---- Lifecycle tools (load_file, get_status) ----
@@ -138,7 +150,11 @@ async def load_file(
                        f"(stacks={'yes' if load_stacks else 'no'}, extra={'yes' if load_extra else 'no'})...")
 
         start_time = time.time()
-        new_data = load_procmon_xml(abs_path, load_stacks, load_extra, use_cache=not no_cache)
+        # Parsing is CPU-bound and synchronous; run it off the event loop so the
+        # server stays responsive (e.g. to get_status) during a long load.
+        new_data = await asyncio.to_thread(
+            load_procmon_xml, abs_path, load_stacks, load_extra, use_cache=not no_cache
+        )
 
         if not new_data or not new_data.is_loaded():
             await ctx.error("[load_file] File loading failed. Check server logs for details.")
@@ -510,7 +526,7 @@ async def get_process_details(pid: int, ctx: Context) -> Dict[str, Any]:
             await ctx.error(f"[get_process_details] PID {pid} not found in process list.")
             raise ValueError(f"Process with PID {pid} not found in pre-loaded list.")
 
-        details = dataclasses.asdict(process_obj)
+        details = process_obj.to_dict()
         details.pop('process_index', None)
         details.pop('parent_process_index', None)
         details['modules_summary'] = "N/A (Module info not typically in XML process list)"
@@ -616,14 +632,15 @@ async def summarize_operations_by_process(process_name_filter: str, ctx: Context
         last_progress_report_time = start_time
 
         for i, idx in enumerate(indices_to_check):
-            current_time = time.time()
-            if i > 0 and (i % (PROGRESS_REPORT_INTERVAL * 4) == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS)):
-                elapsed = current_time - start_time
-                try:
-                    await ctx.info(f"[summarize_operations_by_process] Processed {i:,}/{len(indices_to_check):,} events ({elapsed:.1f}s)")
-                except Exception as progress_err:
-                    logger.warning(f"Failed to send progress update during summarize: {progress_err}")
-                last_progress_report_time = current_time
+            if i > 0 and i % CLOCK_CHECK_INTERVAL == 0:
+                current_time = time.time()
+                if i % (PROGRESS_REPORT_INTERVAL * 4) == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS):
+                    elapsed = current_time - start_time
+                    try:
+                        await ctx.info(f"[summarize_operations_by_process] Processed {i:,}/{len(indices_to_check):,} events ({elapsed:.1f}s)")
+                    except Exception as progress_err:
+                        logger.warning(f"Failed to send progress update during summarize: {progress_err}")
+                    last_progress_report_time = current_time
 
             event_dict = log_data.events[idx]
             event_count_for_process += 1
@@ -665,14 +682,15 @@ async def get_timing_statistics(group_by: str = "process", *, ctx: Context) -> D
         last_progress_report_time = start_time
 
         for i, event_dict in enumerate(log_data.events):
-            current_time = time.time()
-            if i > 0 and (i % (PROGRESS_REPORT_INTERVAL * 4) == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS)):
-                elapsed = current_time - start_time
-                try:
-                    await ctx.info(f"[get_timing_statistics] Processed {i:,}/{total_events:,} events ({elapsed:.1f}s)")
-                except Exception as progress_err:
-                    logger.warning(f"Failed to send progress update during timing stats: {progress_err}")
-                last_progress_report_time = current_time
+            if i > 0 and i % CLOCK_CHECK_INTERVAL == 0:
+                current_time = time.time()
+                if i % (PROGRESS_REPORT_INTERVAL * 4) == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS):
+                    elapsed = current_time - start_time
+                    try:
+                        await ctx.info(f"[get_timing_statistics] Processed {i:,}/{total_events:,} events ({elapsed:.1f}s)")
+                    except Exception as progress_err:
+                        logger.warning(f"Failed to send progress update during timing stats: {progress_err}")
+                    last_progress_report_time = current_time
 
             duration = event_dict.get('dur')
             if duration is None or not isinstance(duration, (float, int)) or duration <= 0:
@@ -808,15 +826,11 @@ async def find_file_access(path_contains: str, limit: int = 100, *, ctx: Context
 
     await ctx.info(f"[find_file_access] Found {len(matching_path_ids)} matching unique paths out of {len(log_data.path_id_index)}.")
 
-    # Phase 2: Collect events from matching paths, sorted by event index
-    # Merge-sort approach: collect all candidate indices, sort, then take up to limit
-    candidate_indices = []
-    for _, _, event_indices in matching_path_ids:
-        candidate_indices.extend(event_indices)
-    candidate_indices.sort()
-
-    # Phase 3: Build summaries up to limit
-    for idx in candidate_indices:
+    # Phase 2 + 3: Lazily merge the per-path index lists (already sorted ascending,
+    # and disjoint since each event has one path) and stop after `limit`. Avoids
+    # materializing and sorting every matching index when the substring is broad.
+    merged = heapq.merge(*(event_indices for _, _, event_indices in matching_path_ids))
+    for idx in merged:
         if count >= limit:
             break
         event_dict = log_data.events[idx]
@@ -1037,12 +1051,20 @@ async def export_query_results(
     if not log_data.events:
         await ctx.info("[export_query_results] Completed. No events loaded to export.")
         return {"success": True, "output_path": abs_output_path, "events_exported": 0}
-    events_to_export = []
     events_exported = 0
+    indices_processed = 0
     export_start_time = time.time()
+    fmt = output_format.lower()
+
+    async def _progress():
+        if indices_processed % 10000 == 0:
+            try:
+                await ctx.info(f"[export_query_results] Streamed {indices_processed:,} events...")
+            except Exception:
+                pass
 
     try:
-        await ctx.info("[export_query_results] Filtering events...")
+        await ctx.info("[export_query_results] Filtering and streaming events to file...")
         event_indices_iterator = _iter_filtered_event_indices(
             log_data=log_data, ctx=ctx,
             filter_process=filter_process, filter_pid=filter_pid, filter_operation=filter_operation,
@@ -1053,70 +1075,50 @@ async def export_query_results(
             filter_stack_module_path=filter_stack_module_path
         )
 
-        await ctx.info("Retrieving full details for matching events...")
-        detail_retrieval_start = time.time()
-        indices_processed = 0
-        async for event_idx in event_indices_iterator:
-            indices_processed += 1
-            details = _get_formatted_event_details(log_data, event_idx)
-            if details:
-                events_to_export.append(details)
-            else:
-                await ctx.warning(f"[export_query_results] Could not retrieve details for event index {event_idx}, skipping.")
-
-            if indices_processed % 10000 == 0:
-                try:
-                    await ctx.info(f"[export_query_results] Retrieved details for {indices_processed:,} events...")
-                except Exception:
-                    pass
-
-        await ctx.info(f"[export_query_results] Retrieved {len(events_to_export)} event details in {time.time() - detail_retrieval_start:.2f}s.")
-
-        if not events_to_export:
-            await ctx.info("[export_query_results] No matching events to export.")
-            if output_format.lower() == 'csv':
-                try:
-                    with open(abs_output_path, 'w', newline='', encoding='utf-8') as csvfile:
-                        fieldnames = ['event_index', 'sequence_number', 'timestamp', 'process_name', 'pid', 'tid', 'operation', 'path', 'result', 'detail', 'duration', 'category', 'parent_pid', 'extra_data', 'stack_trace', 'user_sid', 'is_64bit_process', 'process_details_summary']
-                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
-                        writer.writeheader()
-                    await ctx.info(f"Created empty CSV file with headers: {abs_output_path}")
-                except IOError as e:
-                    await ctx.error(f"Error writing empty CSV file '{abs_output_path}': {e}")
-            return {"success": True, "output_path": abs_output_path, "events_exported": 0}
-
-        if output_format.lower() == 'csv':
-            fieldnames = list(events_to_export[0].keys())
-            try:
-                with open(abs_output_path, 'w', newline='', encoding='utf-8') as csvfile:
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
-                    writer.writeheader()
-                    for row_dict in events_to_export:
-                        csv_row = dict(row_dict)
-                        if isinstance(csv_row.get('extra_data'), dict):
-                            csv_row['extra_data'] = json.dumps(csv_row['extra_data'])
-                        if isinstance(csv_row.get('stack_trace'), list):
-                            csv_row['stack_trace'] = json.dumps(csv_row['stack_trace'])
-                        if isinstance(csv_row.get('process_details_summary'), dict):
-                            csv_row['process_details_summary'] = json.dumps(csv_row['process_details_summary'])
-                        writer.writerow(csv_row)
-                        events_exported += 1
-            except IOError as e:
-                await ctx.error(f"Error writing CSV file '{abs_output_path}': {e}")
-                raise RuntimeError(f"Failed to write CSV file: {e}") from e
-        elif output_format.lower() == 'json':
-            try:
-                with open(abs_output_path, 'w', encoding='utf-8') as jsonfile:
-                    json.dump(events_to_export, jsonfile, indent=2)
-                    events_exported = len(events_to_export)
-            except IOError as e:
-                await ctx.error(f"Error writing JSON file '{abs_output_path}': {e}")
-                raise RuntimeError(f"Failed to write JSON file: {e}") from e
+        # Stream each matching event straight to disk so memory stays bounded
+        # regardless of how many events match.
+        if fmt == 'csv':
+            with open(abs_output_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=_EXPORT_FIELDNAMES, extrasaction='ignore')
+                writer.writeheader()
+                async for event_idx in event_indices_iterator:
+                    indices_processed += 1
+                    details = _get_formatted_event_details(log_data, event_idx)
+                    if not details:
+                        await ctx.warning(f"[export_query_results] Could not retrieve details for event index {event_idx}, skipping.")
+                        continue
+                    row = dict(details)
+                    for key in ('extra_data', 'stack_trace', 'process_details_summary'):
+                        if isinstance(row.get(key), (dict, list)):
+                            row[key] = json.dumps(row[key])
+                    writer.writerow(row)
+                    events_exported += 1
+                    await _progress()
+        else:  # json — write a streamed array
+            with open(abs_output_path, 'w', encoding='utf-8') as jsonfile:
+                jsonfile.write('[')
+                first = True
+                async for event_idx in event_indices_iterator:
+                    indices_processed += 1
+                    details = _get_formatted_event_details(log_data, event_idx)
+                    if not details:
+                        await ctx.warning(f"[export_query_results] Could not retrieve details for event index {event_idx}, skipping.")
+                        continue
+                    jsonfile.write('\n' if first else ',\n')
+                    jsonfile.write(json.dumps(details, indent=2))
+                    first = False
+                    events_exported += 1
+                    await _progress()
+                jsonfile.write('\n]' if not first else ']')
 
         export_elapsed = time.time() - export_start_time
-        await ctx.info(f"[export_query_results] Completed. Exported {events_exported} events to '{output_file}' ({output_format}, {export_elapsed:.2f}s).")
+        await ctx.info(f"[export_query_results] Completed. Exported {events_exported} events to '{output_file}' ({fmt}, {export_elapsed:.2f}s).")
         return {"success": True, "output_path": abs_output_path, "events_exported": events_exported}
 
+    except OSError as e:
+        await ctx.error(f"[export_query_results] Error writing '{abs_output_path}': {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Failed to write {fmt} file: {e}") from e
     except Exception as e:
         await ctx.error(f"[export_query_results] Failed: {e}")
         logger.debug("Exception details:", exc_info=True)

@@ -55,6 +55,7 @@ pip install -e ".[dev]"  # editable install with test tooling
 | `mcp[cli]>=1.8.0` | Yes | MCP SDK with CLI tools and Streamable HTTP support |
 | `lxml>=4.9.0` | Recommended | Faster XML parsing (falls back to stdlib `ElementTree` if absent) |
 | `psutil>=5.9.0` | Optional | Memory usage reporting after file loading |
+| `google-re2` | Optional | Linear-time, ReDoS-safe engine for user filter regexes (`pip install ".[re2]"`; falls back to stdlib `re`) |
 
 Install all at once:
 ```bash
@@ -254,7 +255,9 @@ under a second.
   cached separately.
 - Bypass it with `--no-cache` (CLI) or `no_cache: true` (the `load_file` tool); the
   `from_cache` field in the load response indicates whether the cache was used.
-- Clear it with `--clear-cache` (CLI) or the `clear_cache` tool.
+- Clear it with `--clear-cache` (CLI) or the `clear_cache` tool. The cache is
+  size-bounded with LRU eviction (default 5 GiB; override with the
+  `PROCMONMCP_CACHE_MAX_BYTES` environment variable).
 - **Security:** cache files are serialized with Python's `pickle` and are read back only
   from your user-owned `~/.procmonmcp/cache` directory (only this tool's own output is
   ever deserialized). Do not point the cache at a location other users can write to.

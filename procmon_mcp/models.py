@@ -112,6 +112,15 @@ class ProcessInfo:
     def user_sid(self):
         return self.owner
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Shallow dict of the dataclass fields.
+
+        Equivalent to dataclasses.asdict() here (all fields are scalars) but
+        avoids asdict's deep recursion/copy — meaningful when called per event
+        during large exports.
+        """
+        return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
     @staticmethod
     def _safe_text_to_int(text: Optional[str]) -> Optional[int]:
         """Safely converts text (decimal or hex '0x...') to int, returning None on failure."""

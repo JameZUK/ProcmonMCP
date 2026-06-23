@@ -10,11 +10,12 @@ import contextlib
 from datetime import datetime, timezone, timedelta, time as dt_time
 from typing import Dict, Any, Optional, Iterator, IO
 
-from .compat import ET_impl, LXML_AVAILABLE
+from .compat import ET_impl, LXML_AVAILABLE, XMLSyntaxError
 from .constants import (
     PROCMON_TIMESTAMP_FORMAT, PROGRESS_REPORT_INTERVAL, PROGRESS_REPORT_SECONDS,
+    CLOCK_CHECK_INTERVAL,
     BASE_DATE, ROLLOVER_THRESHOLD_SECONDS,
-    OP_PROCESS_CREATE, OP_PROCESS_EXIT, NETWORK_OPERATIONS,
+    OP_PROCESS_CREATE, OP_PROCESS_START, OP_PROCESS_EXIT, NETWORK_OPERATIONS,
     IK_PROCESS_NAME, IK_OPERATION, IK_PATH, IK_RESULT, IK_CATEGORY,
     IK_STACK_PATH, IK_STACK_LOCATION,
 )
@@ -94,7 +95,7 @@ def _parse_xml_processes_only(source_stream: IO[bytes]) -> Dict[int, ProcessInfo
                 logger.warning("Reached end of <procmon> while parsing processes.")
                 break
 
-    except ET_impl.XMLSyntaxError as e:
+    except XMLSyntaxError as e:
         logger.error(f"XML Parse Error during process parsing: {e}")
         raise
     except Exception as e:
@@ -302,21 +303,23 @@ def _parse_xml_stream_for_loading(
                         yield opt_event
                         yielded_count += 1
 
-                        # Progress reporting
-                        current_time = time.time()
-                        if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > PROGRESS_REPORT_SECONDS:
-                            elapsed_total = current_time - start_time
-                            rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
-                            percent_str = ""
-                            if raw_file_stream and total_size is not None and total_size > 0:
-                                try:
-                                    current_pos = raw_file_stream.tell()
-                                    percent = (current_pos / total_size) * 100
-                                    percent_str = f" ({percent:.1f}%)"
-                                except (OSError, AttributeError, TypeError, io.UnsupportedOperation) as tell_err:
-                                    logger.debug(f"Could not get raw stream position for progress: {tell_err}")
-                            logger.info(f"  [Pass 2] Yielded {yielded_count:,} events{percent_str}... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
-                            last_report_time = current_time
+                        # Progress reporting. Only read the wall clock periodically
+                        # (not every event) to keep the hot path cheap.
+                        if yielded_count % CLOCK_CHECK_INTERVAL == 0:
+                            current_time = time.time()
+                            if yielded_count % PROGRESS_REPORT_INTERVAL == 0 or (current_time - last_report_time) > PROGRESS_REPORT_SECONDS:
+                                elapsed_total = current_time - start_time
+                                rate = yielded_count / elapsed_total if elapsed_total > 0 else 0
+                                percent_str = ""
+                                if raw_file_stream and total_size is not None and total_size > 0:
+                                    try:
+                                        current_pos = raw_file_stream.tell()
+                                        percent = (current_pos / total_size) * 100
+                                        percent_str = f" ({percent:.1f}%)"
+                                    except (OSError, AttributeError, TypeError, io.UnsupportedOperation) as tell_err:
+                                        logger.debug(f"Could not get raw stream position for progress: {tell_err}")
+                                logger.info(f"  [Pass 2] Yielded {yielded_count:,} events{percent_str}... ({elapsed_total:.1f}s | {rate:,.0f} events/sec)")
+                                last_report_time = current_time
 
                     except Exception as event_parse_err:
                         logger.warning(f"Error parsing event #{event_count}: {event_parse_err}", exc_info=True)
@@ -330,7 +333,7 @@ def _parse_xml_stream_for_loading(
         elapsed = time.time() - start_time
         logger.info(f"Finished Pass 2: Processed {event_count:,} <event> elements, yielded {yielded_count:,}, skipped {skipped_count:,} ({elapsed:.2f}s).")
 
-    except ET_impl.XMLSyntaxError as e:
+    except XMLSyntaxError as e:
         logger.error(f"XML Parse Error during event loading stream: {e}")
         raise
     except Exception as e:
@@ -411,6 +414,7 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool,
     }
     # Pre-intern known operation strings
     log_data.interners[IK_OPERATION].get_id(OP_PROCESS_CREATE)
+    log_data.interners[IK_OPERATION].get_id(OP_PROCESS_START)
     log_data.interners[IK_OPERATION].get_id(OP_PROCESS_EXIT)
     for op in NETWORK_OPERATIONS:
         log_data.interners[IK_OPERATION].get_id(op)
@@ -456,6 +460,7 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool,
                 logger.info("[Loader] Starting consumption of event iterator and building indices...")
                 temp_event_list = []
                 consumed_count = 0
+                consumption_error: Optional[Exception] = None
                 indexing_start_time = time.time()
                 try:
                     for idx, opt_event in enumerate(event_iterator):
@@ -476,6 +481,7 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool,
                             log_data.path_id_index[path_id].append(idx)
 
                 except Exception as consume_err:
+                    consumption_error = consume_err
                     logger.error(f"[Loader] Error during iterator consumption/indexing after {consumed_count} events: {consume_err}", exc_info=True)
                 finally:
                     logger.info(f"[Loader] Finished consuming event iterator. Total events consumed: {consumed_count}. Final list length: {len(temp_event_list)}. Indexing time: {time.time() - indexing_start_time:.2f}s")
@@ -485,6 +491,14 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool,
         finally:
             if raw_f:
                 raw_f.close()
+
+        # A mid-stream parse error means the capture is only partially loaded.
+        # Fail loudly instead of returning a silently-truncated result — and,
+        # critically, do NOT cache the partial data below.
+        if consumption_error is not None:
+            raise RuntimeError(
+                f"Parsing failed after {consumed_count:,} events (capture is incomplete): {consumption_error}"
+            ) from consumption_error
 
         # Final Summary
         overall_end_time = time.time()
@@ -507,7 +521,7 @@ def load_procmon_xml(filename_abs: str, load_stack: bool, load_extra: bool,
     except (FileNotFoundError, ValueError) as e:
         logger.error(f"File error: {e}")
         raise
-    except ET_impl.XMLSyntaxError as e:
+    except XMLSyntaxError as e:
         logger.error(f"XML Syntax Error in {filename_abs}: {e}")
         raise RuntimeError(f"Invalid XML: {e}") from e
     except OSError as e:

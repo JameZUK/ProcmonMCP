@@ -1,13 +1,14 @@
 """Event filtering engine for ProcmonMCP."""
 import re
 import time
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Any, Tuple, Set, AsyncIterator
 
 from .compat import Context
 from .constants import (
-    PROCMON_TIMESTAMP_FORMAT, PROGRESS_REPORT_INTERVAL, PROGRESS_REPORT_SECONDS,
+    PROCMON_TIMESTAMP_FORMAT, PROGRESS_REPORT_SECONDS, CLOCK_CHECK_INTERVAL,
     MAX_FILTER_STR_LEN,
     IK_PROCESS_NAME, IK_OPERATION, IK_PATH, IK_RESULT, IK_STACK_PATH,
 )
@@ -180,19 +181,24 @@ async def _iter_filtered_event_indices(
         last_progress_report_time = start_time
 
         # Main filtering loop
+        report_interval = max(10000, total_to_scan // 20) if total_to_scan > 0 else 10000
         for idx in indices_to_check:
             event_dict = log_data.events[idx]
             processed_count += 1
 
-            # Progress reporting
-            current_time = time.time()
-            report_interval = max(10000, total_to_scan // 20) if total_to_scan > 0 else 10000
-            if processed_count % report_interval == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS):
-                try:
-                    await ctx.info(f" Filter scanned {processed_count:,}/{total_to_scan:,} candidate events... ({current_time - start_time:.1f}s)")
-                except Exception as progress_err:
-                    logger.warning(f"Failed to send progress update during filter: {progress_err}")
-                last_progress_report_time = current_time
+            # Progress reporting. Only read the wall clock periodically (not every
+            # event), and yield to the event loop so a long scan on an HTTP
+            # transport doesn't starve other requests.
+            if processed_count % CLOCK_CHECK_INTERVAL == 0:
+                current_time = time.time()
+                if processed_count % report_interval == 0 or (current_time - last_progress_report_time > PROGRESS_REPORT_SECONDS):
+                    try:
+                        await ctx.info(f" Filter scanned {processed_count:,}/{total_to_scan:,} candidate events... ({current_time - start_time:.1f}s)")
+                    except Exception as progress_err:
+                        logger.warning(f"Failed to send progress update during filter: {progress_err}")
+                    last_progress_report_time = current_time
+                else:
+                    await asyncio.sleep(0)
 
             # Apply filters sequentially (fail fast)
             if not index_used:

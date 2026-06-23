@@ -19,6 +19,23 @@ from . import tools  # noqa: F401 - force tool registration
 logger = logging.getLogger(__name__)
 
 
+def _configure_http_settings(args, label):
+    """Applies host/port/log-level to mcp.settings for the HTTP-style transports.
+
+    The MCP SDK's run() takes (transport, mount_path); host and port live on
+    mcp.settings, so both the SSE and Streamable HTTP paths configure them here.
+    """
+    if hasattr(server.mcp, 'settings'):
+        logger.info(f"Configuring MCP for {label}...")
+        server.mcp.settings.host = args.mcp_host
+        server.mcp.settings.port = args.mcp_port
+        log_level = logging.DEBUG if args.debug else logging.INFO
+        server.mcp.settings.log_level = logging.getLevelName(log_level).lower()
+        logger.info(f"  MCP Host: {server.mcp.settings.host}, Port: {server.mcp.settings.port}")
+    else:
+        logger.warning(f"MCP object lacks 'settings'; cannot configure {label} via arguments.")
+
+
 def main_execution(args):
     """Encapsulates the main loading and server run logic for profiling."""
     load_stacks = not args.no_stack_traces
@@ -92,31 +109,13 @@ def main_execution(args):
                 DeprecationWarning,
                 stacklevel=1,
             )
-            if hasattr(server.mcp, 'settings'):
-                logger.info("Configuring MCP for SSE transport (deprecated)...")
-                server.mcp.settings.host = args.mcp_host
-                server.mcp.settings.port = args.mcp_port
-                log_level = logging.DEBUG if args.debug else logging.INFO
-                mcp_log_level_name = logging.getLevelName(log_level)
-                server.mcp.settings.log_level = mcp_log_level_name.lower()
-                logger.info(f"  MCP Host: {server.mcp.settings.host}, Port: {server.mcp.settings.port}")
-            else:
-                logger.warning("MCP object lacks 'settings'; cannot configure SSE via arguments.")
+            _configure_http_settings(args, "SSE transport (deprecated)")
             logger.info(f"Starting MCP server with SSE transport on http://{args.mcp_host}:{args.mcp_port}")
             server.mcp.run(transport="sse")
             server_started = True
 
         elif transport == "streamable-http":
-            if hasattr(server.mcp, 'settings'):
-                logger.info("Configuring MCP for Streamable HTTP transport...")
-                server.mcp.settings.host = args.mcp_host
-                server.mcp.settings.port = args.mcp_port
-                log_level = logging.DEBUG if args.debug else logging.INFO
-                mcp_log_level_name = logging.getLevelName(log_level)
-                server.mcp.settings.log_level = mcp_log_level_name.lower()
-                logger.info(f"  MCP Host: {server.mcp.settings.host}, Port: {server.mcp.settings.port}")
-            else:
-                logger.warning("MCP object lacks 'settings'; cannot configure Streamable HTTP via arguments.")
+            _configure_http_settings(args, "Streamable HTTP transport")
             logger.info(f"Starting MCP server with Streamable HTTP transport on "
                         f"http://{args.mcp_host}:{args.mcp_port}/mcp")
             server.mcp.run(transport="streamable-http")

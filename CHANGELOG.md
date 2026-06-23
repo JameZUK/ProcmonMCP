@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-23
+
+Reliability/efficiency/stability hardening pass (code review).
+
+### Fixed
+- **A mid-stream parse error no longer reports success or caches a truncated
+  capture.** `load_procmon_xml` now raises on incomplete consumption and skips
+  the cache write, instead of returning partial events and persisting them. (#23)
+- **stdlib (no-lxml) error handling:** the parser caught `ET_impl.XMLSyntaxError`,
+  which does not exist on `xml.etree.ElementTree` (it has `ParseError`) — on
+  malformed XML this raised `AttributeError` and masked the real error. A
+  backend-correct `compat.XMLSyntaxError` alias is now used.
+
+### Changed
+- **Loading runs off the event loop** (`asyncio.to_thread`), so the server stays
+  responsive during a long parse on the HTTP/SSE transports. (#24)
+- **Parsed-capture cache is size-bounded** with LRU eviction (default 5 GiB,
+  override via `PROCMONMCP_CACHE_MAX_BYTES`); cache hits refresh recency. (#25)
+- **`export_query_results` streams rows to disk** instead of buffering every
+  matching event in memory, so exports are bounded-memory on large captures. (#26)
+- **User filter regexes use Google RE2 when available** (linear-time, ReDoS-safe),
+  falling back to stdlib `re` with the existing length cap. Install via the
+  optional `re2` extra. (#27)
+- **`find_file_access`** lazily heap-merges per-path index lists and stops at
+  `limit` instead of collecting and sorting every match. (#28)
+- Hot scan loops read the wall clock only periodically (`CLOCK_CHECK_INTERVAL`)
+  rather than every event. (#29)
+- Event-detail formatting uses a shallow `ProcessInfo.to_dict()` instead of
+  `dataclasses.asdict()` (no deep recursion per row). (#30)
+- Minor: factored the duplicated HTTP transport-settings block in the CLI;
+  pre-intern `Process Start`.
+
 ## [0.3.1] - 2026-06-23
 
 ### Added

@@ -38,6 +38,17 @@ CACHE_VERSION = 2
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".procmonmcp", "cache")
 
 
+def _cache_max_bytes() -> int:
+    """Total cache-directory budget in bytes (env-overridable; 0 disables eviction)."""
+    raw = os.environ.get("PROCMONMCP_CACHE_MAX_BYTES")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning(f"cache: invalid PROCMONMCP_CACHE_MAX_BYTES={raw!r}; using default.")
+    return 5 * 1024 ** 3  # 5 GiB default
+
+
 def compute_key(filename_abs: str, load_stack: bool, load_extra: bool) -> Optional[Dict[str, Any]]:
     """Builds the cache key (file identity + load options + version), or None.
 
@@ -76,8 +87,10 @@ def load(key: Optional[Dict[str, Any]]) -> Optional[ProcmonLogData]:
     except Exception as e:
         logger.warning(f"cache: failed to read '{path}': {e}; ignoring.")
         return None
-    # Validate the embedded header against the requested key (defense in depth
-    # against hash collisions or a stale/incompatible entry).
+    # Validate the embedded header against the requested key — guards against a
+    # stale/incompatible entry or a (vanishingly unlikely) hash collision. This
+    # is NOT a security control: pickle.load above already runs any embedded code,
+    # so the only safeguard against malicious pickles is the user-owned cache dir.
     if not isinstance(payload, dict) or payload.get("header") != key:
         logger.warning(f"cache: header mismatch in '{path}'; ignoring.")
         return None
@@ -85,8 +98,48 @@ def load(key: Optional[Dict[str, Any]]) -> Optional[ProcmonLogData]:
     if not isinstance(data, ProcmonLogData) or not data.is_loaded():
         logger.warning(f"cache: invalid payload in '{path}'; ignoring.")
         return None
+    # Refresh recency so least-recently-used entries are evicted first.
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
     data.loaded_from_cache = True
     return data
+
+
+def _enforce_cache_limit() -> None:
+    """Evict least-recently-used cache files until the dir is within budget."""
+    cap = _cache_max_bytes()
+    if cap <= 0:
+        return
+    try:
+        entries = []
+        total = 0
+        for name in os.listdir(CACHE_DIR):
+            if not name.endswith(".pkl"):
+                continue
+            fpath = os.path.join(CACHE_DIR, name)
+            try:
+                st = os.stat(fpath)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, fpath))
+            total += st.st_size
+        if total <= cap:
+            return
+        # Remove oldest first until within budget.
+        entries.sort()  # by mtime ascending (least recently used first)
+        for _mtime, size, fpath in entries:
+            if total <= cap:
+                break
+            try:
+                os.remove(fpath)
+                total -= size
+                logger.info(f"cache: evicted '{os.path.basename(fpath)}' to stay within budget.")
+            except OSError as e:
+                logger.warning(f"cache: could not evict '{fpath}': {e}")
+    except OSError as e:
+        logger.warning(f"cache: could not enforce size limit on '{CACHE_DIR}': {e}")
 
 
 def save(key: Optional[Dict[str, Any]], log_data: ProcmonLogData) -> bool:
@@ -107,6 +160,7 @@ def save(key: Optional[Dict[str, Any]], log_data: ProcmonLogData) -> bool:
         with open(tmp, "wb") as f:
             pickle.dump({"header": key, "data": log_data}, f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
+        _enforce_cache_limit()
         return True
     except Exception as e:
         logger.warning(f"cache: failed to write '{path}': {e}")
