@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`close_file`** tool — closes (unloads) the currently loaded capture and frees
+  its memory, so a client can explicitly release a file before opening another or
+  leave the server idle. Analysis tools refuse until another file is loaded; the
+  on-disk cache is left intact. `get_status` now lists `close_file` as an
+  available action while a file is loaded.
+
 ## [0.2.2] - 2026-06-23
 
 ### Fixed
