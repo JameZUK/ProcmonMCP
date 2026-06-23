@@ -961,3 +961,61 @@ async def export_query_results(
         await ctx.error(f"[export_query_results] Failed: {e}")
         logger.debug("Exception details:", exc_info=True)
         raise RuntimeError(f"Internal error exporting events: {e}")
+
+
+@tool_decorator
+async def list_network_connections(limit: int = 200, *, ctx: Context) -> List[Dict[str, Any]]:
+    """
+    Lists unique network connections across ALL processes in the loaded capture.
+
+    Scans every network operation (TCP/UDP Connect/Send/Receive) and returns up to
+    `limit` unique records, each with the process name, PID, operation, and remote
+    endpoint (IP:port or Hostname:port). Use this for triage to see every endpoint the
+    capture touched before drilling into a single process with find_network_connections.
+    """
+    log_data = await _check_loaded(ctx, "list_network_connections")
+    await ctx.info("[list_network_connections] Scanning all network events...")
+
+    network_op_ids = {
+        log_data.get_id(IK_OPERATION, op)
+        for op in NETWORK_OPERATIONS
+        if log_data.get_id(IK_OPERATION, op) is not None
+    }
+    if not network_op_ids:
+        await ctx.warning("[list_network_connections] No network operations found in interner.")
+        return []
+
+    # Gather only network-event indices via op_id_index, so this is O(network events)
+    # rather than O(total events).
+    candidate_indices: List[int] = []
+    for op_id in network_op_ids:
+        candidate_indices.extend(log_data.op_id_index.get(op_id, []))
+    candidate_indices.sort()
+
+    seen = set()
+    results: List[Dict[str, Any]] = []
+    for idx in candidate_indices:
+        event_dict = log_data.events[idx]
+        endpoint = parse_network_endpoint(log_data.get_string(IK_PATH, event_dict.get('path_id')))
+        if not endpoint:
+            continue
+        process_name = log_data.get_string(IK_PROCESS_NAME, event_dict.get('pname_id'))
+        operation = log_data.get_string(IK_OPERATION, event_dict.get('op_id'))
+        pid = event_dict.get('pid')
+        key = (process_name, pid, operation, endpoint)
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append({
+            "process_name": process_name,
+            "pid": pid,
+            "operation": operation,
+            "endpoint": endpoint,
+        })
+        if len(results) >= limit:
+            await ctx.warning(f"[list_network_connections] Result limit ({limit}) reached; output truncated.")
+            break
+
+    results.sort(key=lambda r: (str(r["process_name"]), str(r["endpoint"])))
+    await ctx.info(f"[list_network_connections] Completed. {len(results)} unique records.")
+    return results
