@@ -5,7 +5,7 @@ from collections import defaultdict
 from typing import List, Dict, Any, Optional
 
 from .compat import ET_impl
-from .helpers import find_text_func
+from .helpers import find_text_func, repair_mojibake
 
 logger = logging.getLogger(__name__)
 
@@ -154,13 +154,14 @@ class ProcessInfo:
         data['is_virtualized'] = cls._safe_text_to_bool(find_text_func(elem, 'IsVirtualized'))
         data['is_64bit'] = cls._safe_text_to_bool(find_text_func(elem, 'Is64bit'))
         data['integrity'] = find_text_func(elem, 'Integrity')
-        data['owner'] = find_text_func(elem, 'Owner')
-        data['process_name'] = find_text_func(elem, 'ProcessName')
-        data['image_path'] = find_text_func(elem, 'ImagePath')
-        data['command_line'] = find_text_func(elem, 'CommandLine')
-        data['company_name'] = find_text_func(elem, 'CompanyName')
+        # Repair names/paths double-encoded by Procmon's XML export (non-ASCII only).
+        data['owner'] = repair_mojibake(find_text_func(elem, 'Owner'))
+        data['process_name'] = repair_mojibake(find_text_func(elem, 'ProcessName'))
+        data['image_path'] = repair_mojibake(find_text_func(elem, 'ImagePath'))
+        data['command_line'] = repair_mojibake(find_text_func(elem, 'CommandLine'))
+        data['company_name'] = repair_mojibake(find_text_func(elem, 'CompanyName'))
         data['version'] = find_text_func(elem, 'Version')
-        data['description'] = find_text_func(elem, 'Description')
+        data['description'] = repair_mojibake(find_text_func(elem, 'Description'))
         return cls(**data)
 
 

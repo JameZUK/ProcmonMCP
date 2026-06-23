@@ -295,7 +295,8 @@ async def get_loaded_file_summary(ctx: Context) -> Dict[str, Any]:
 
 @tool_decorator
 async def query_events(
-    filter_process: Optional[str] = None, filter_operation: Optional[str] = None,
+    filter_process: Optional[str] = None, filter_pid: Optional[int] = None,
+    filter_operation: Optional[str] = None,
     filter_result: Optional[str] = None, filter_path_contains: Optional[str] = None,
     filter_process_contains: Optional[str] = None, filter_start_time: Optional[Any] = None,
     filter_end_time: Optional[Any] = None, filter_path_regex: Optional[str] = None,
@@ -306,12 +307,14 @@ async def query_events(
 ) -> List[Dict[str, Any]]:
     """
     Queries events from the optimized in-memory data, applying multiple filters (AND logic).
-    Uses indices for Process Name and Operation filters if available.
+    Uses indices for Process Name, PID, and Operation filters if available.
     Returns a list of event summaries (dictionary) for matching events, up to the specified limit.
     Each summary includes the event index, timestamp, process name, PID, operation, path, and result.
     Use 'get_event_details' with the 'event_index' from the summary to retrieve full event details.
 
     Filter Notes:
+    - filter_pid selects a single process by its numeric PID (exact). Useful when a process name
+      is hard to type exactly (e.g. non-ASCII names).
     - Exact match filters (filter_process, filter_operation, filter_result) use case-sensitive matching on the full string.
     - Contains filters (filter_path_contains, filter_process_contains, filter_stack_module_path) perform case-insensitive substring checks. They do NOT support OR logic via '|'.
     - Regex filters (filter_path_regex, filter_process_regex, filter_detail_regex) use Python's 're' module with IGNORECASE. Use these for complex patterns, including OR logic (e.g., "value1|value2"). Remember to escape special regex characters if matching literally (e.g., use '\\.' to match a period).
@@ -333,7 +336,7 @@ async def query_events(
     try:
         event_indices_iterator = _iter_filtered_event_indices(
             log_data=log_data, ctx=ctx,
-            filter_process=filter_process, filter_operation=filter_operation,
+            filter_process=filter_process, filter_pid=filter_pid, filter_operation=filter_operation,
             filter_result=filter_result, filter_path_contains=filter_path_contains,
             filter_process_contains=filter_process_contains, filter_start_time=filter_start_time,
             filter_end_time=filter_end_time, filter_path_regex=filter_path_regex,
@@ -978,7 +981,8 @@ async def find_network_connections(process_name: str, *, ctx: Context) -> List[D
 async def export_query_results(
     output_file: str,
     output_format: str = 'csv',
-    filter_process: Optional[str] = None, filter_operation: Optional[str] = None,
+    filter_process: Optional[str] = None, filter_pid: Optional[int] = None,
+    filter_operation: Optional[str] = None,
     filter_result: Optional[str] = None, filter_path_contains: Optional[str] = None,
     filter_process_contains: Optional[str] = None, filter_start_time: Optional[Any] = None,
     filter_end_time: Optional[Any] = None, filter_path_regex: Optional[str] = None,
@@ -1041,7 +1045,7 @@ async def export_query_results(
         await ctx.info("[export_query_results] Filtering events...")
         event_indices_iterator = _iter_filtered_event_indices(
             log_data=log_data, ctx=ctx,
-            filter_process=filter_process, filter_operation=filter_operation,
+            filter_process=filter_process, filter_pid=filter_pid, filter_operation=filter_operation,
             filter_result=filter_result, filter_path_contains=filter_path_contains,
             filter_process_contains=filter_process_contains, filter_start_time=filter_start_time,
             filter_end_time=filter_end_time, filter_path_regex=filter_path_regex,

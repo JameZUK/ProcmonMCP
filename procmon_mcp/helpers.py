@@ -61,6 +61,30 @@ def _find_text_ignore_ns(elem: ET_impl.Element, tag_name: str) -> Optional[str]:
 find_text_func = _find_text_ignore_ns
 
 
+def repair_mojibake(s: Optional[str]) -> Optional[str]:
+    """Repairs text double-encoded by Procmon's XML export.
+
+    Procmon exports non-ASCII names by taking the real UTF-8 bytes, treating each
+    byte as Latin-1, and UTF-8-encoding again. The result decodes to mojibake
+    (e.g. the bytes for ``温度スイッチ.exe`` come through as ``æ¸©åº¦…``). Undo it by
+    re-encoding the string as Latin-1 (recovering the original bytes) and decoding
+    those as UTF-8.
+
+    This is conservative: it only repairs strings whose every codepoint is in the
+    Latin-1 range AND whose Latin-1 bytes form valid (multi-byte) UTF-8 — the exact
+    fingerprint of the double-encoding. Pure-ASCII text and correctly-stored names
+    (e.g. ``café.exe``, whose ``é`` is not valid standalone UTF-8) are returned
+    unchanged.
+    """
+    if not s or s.isascii():
+        return s
+    try:
+        repaired = s.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+    return repaired if repaired != s else s
+
+
 def _clear_elem(elem: ET_impl.Element):
     """Helper to clear element memory using lxml/ET specific methods."""
     elem.clear()
