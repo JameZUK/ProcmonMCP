@@ -614,12 +614,32 @@ class TestParserIntegration:
 
 # --- Exact-Match Filter Tests ---
 
+class _DummyContext:
+    """Minimal MCP Context stand-in for driving tools/filters in tests.
+
+    Intentionally self-contained rather than imported from procmon_mcp.compat:
+    when the real MCP SDK is installed, compat.Context is the SDK Context, whose
+    info()/error() raise outside an active request. The tool code only needs
+    awaitable info/error/warning that record nothing.
+    """
+    def __init__(self):
+        self.messages = []
+
+    async def info(self, msg):
+        self.messages.append(("info", msg))
+
+    async def error(self, msg):
+        self.messages.append(("error", msg))
+
+    async def warning(self, msg):
+        self.messages.append(("warning", msg))
+
+
 def _collect_filtered(log_data, **filters):
     """Drain the async filter iterator into a list of event indices."""
-    from procmon_mcp.compat import Context
 
     async def _run():
-        ctx = Context()
+        ctx = _DummyContext()
         out = []
         async for idx in procmon_mcp._iter_filtered_event_indices(
                 log_data=log_data, ctx=ctx, **filters):
