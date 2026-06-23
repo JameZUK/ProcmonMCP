@@ -90,6 +90,7 @@ async def load_file(
     file_path: str,
     no_stack_traces: bool = False,
     no_extra_data: bool = False,
+    no_cache: bool = False,
     *,
     ctx: Context,
 ) -> Dict[str, Any]:
@@ -99,10 +100,15 @@ async def load_file(
 
     Provides progress feedback during loading via MCP notifications.
 
+    Loading an unchanged file that was parsed before (with the same options) is
+    served from an on-disk cache and is near-instant; the response's 'from_cache'
+    field indicates whether the cache was used.
+
     Args:
         file_path: Absolute or relative path to the Procmon XML file.
         no_stack_traces: If True, skip loading stack traces (saves memory for large files).
         no_extra_data: If True, skip loading extra/unknown event fields (saves memory).
+        no_cache: If True, bypass the parsed-capture cache (always re-parse, and refresh the cache).
     """
     from .parser import load_procmon_xml
     from .config import set_last_file
@@ -131,7 +137,7 @@ async def load_file(
                        f"(stacks={'yes' if load_stacks else 'no'}, extra={'yes' if load_extra else 'no'})...")
 
         start_time = time.time()
-        new_data = load_procmon_xml(abs_path, load_stacks, load_extra)
+        new_data = load_procmon_xml(abs_path, load_stacks, load_extra, use_cache=not no_cache)
 
         if not new_data or not new_data.is_loaded():
             await ctx.error("[load_file] File loading failed. Check server logs for details.")
@@ -145,6 +151,8 @@ async def load_file(
         # Save to config
         set_last_file(abs_path)
 
+        from_cache = bool(getattr(new_data, "loaded_from_cache", False))
+        source = "cache" if from_cache else "XML parse"
         result = {
             "success": True,
             "loaded_filename": new_data.loaded_filename,
@@ -152,6 +160,7 @@ async def load_file(
             "process_count": len(new_data.processes_by_index),
             "compression": new_data.loaded_compression,
             "load_time_seconds": round(elapsed, 2),
+            "from_cache": from_cache,
             "stack_traces_loaded": load_stacks,
             "extra_data_loaded": load_extra,
             "index_stats": {
@@ -162,7 +171,7 @@ async def load_file(
             },
             "message": f"Successfully loaded {len(new_data.events):,} events and "
                        f"{len(new_data.processes_by_index)} processes from "
-                       f"'{new_data.loaded_filename}' in {elapsed:.1f}s.",
+                       f"'{new_data.loaded_filename}' in {elapsed:.1f}s (via {source}).",
         }
 
         # Memory usage
@@ -186,6 +195,27 @@ async def load_file(
         raise RuntimeError(f"Error loading file: {e}")
     finally:
         server.LOADING_IN_PROGRESS = False
+
+
+@tool_decorator
+async def clear_cache(ctx: Context) -> Dict[str, Any]:
+    """
+    Removes all on-disk parsed-capture caches.
+
+    The cache stores previously parsed captures so reloading an unchanged file is
+    near-instant. Use this to reclaim disk space or to force a clean re-parse of
+    every file. Does not affect the currently loaded data.
+    """
+    from . import cache
+    await ctx.info("[clear_cache] Clearing parsed-capture cache...")
+    try:
+        removed = cache.clear()
+        await ctx.info(f"[clear_cache] Removed {removed} cached capture(s) from {cache.CACHE_DIR}.")
+        return {"success": True, "removed": removed, "cache_dir": cache.CACHE_DIR}
+    except Exception as e:
+        await ctx.error(f"[clear_cache] Failed: {e}")
+        logger.debug("Exception details:", exc_info=True)
+        raise RuntimeError(f"Internal error clearing cache: {e}")
 
 
 # ---- Analysis tools ----

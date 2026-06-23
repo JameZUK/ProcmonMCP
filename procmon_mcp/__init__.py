@@ -31,6 +31,9 @@ from .parser import load_procmon_xml
 # User configuration
 from .config import load_config, save_config, get_last_file, set_last_file
 
+# Parsed-capture cache
+from . import cache
+
 # Filtering and formatting
 from .filters import _iter_filtered_event_indices
 from .formatters import _get_formatted_event_details
