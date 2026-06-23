@@ -489,3 +489,123 @@ class TestConfig:
         config = load_config()
         assert config["last_file"] == "/tmp/x.xml"
         assert "unknown_key" not in config
+
+
+# --- Network Endpoint Parsing Tests ---
+
+class TestParseNetworkEndpoint:
+    def test_ipv4(self):
+        assert procmon_mcp.parse_network_endpoint(
+            "test.exe:1234 -> 93.184.216.34:443") == "93.184.216.34:443"
+
+    def test_ipv6_bracketed(self):
+        assert procmon_mcp.parse_network_endpoint(
+            "test.exe -> [fe80::1]:443") == "fe80::1:443"
+
+    def test_hostname(self):
+        assert procmon_mcp.parse_network_endpoint(
+            "host:5000 -> example-host.local:8080") == "example-host.local:8080"
+
+    def test_no_arrow_returns_none(self):
+        assert procmon_mcp.parse_network_endpoint("C:\\Windows\\file.dll") is None
+
+    def test_none_returns_none(self):
+        assert procmon_mcp.parse_network_endpoint(None) is None
+
+    def test_empty_returns_none(self):
+        assert procmon_mcp.parse_network_endpoint("") is None
+
+    def test_missing_port_returns_none(self):
+        assert procmon_mcp.parse_network_endpoint("a -> 10.0.0.1") is None
+
+
+# --- Parser Integration Tests ---
+
+def _write_capture(path, n_events, with_stack=True):
+    """Write a synthetic Procmon XML capture with n_events events.
+
+    The file is intentionally large enough that <event> elements span
+    iterparse read-buffer boundaries, which is the condition that previously
+    caused events to be silently dropped or have null fields.
+    """
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n<procmon>\n<processlist>\n',
+        '<process><ProcessIndex>0</ProcessIndex><ProcessId>1234</ProcessId>'
+        '<ParentProcessId>4</ParentProcessId><ProcessName>test.exe</ProcessName>'
+        '<ImagePath>C:\\test.exe</ImagePath></process>\n',
+        '</processlist>\n<eventlist>\n',
+    ]
+    for i in range(n_events):
+        stack = ''
+        if with_stack:
+            stack = ('<stack><frame><depth>0</depth><address>0x%x</address>'
+                     '<path>ntdll.dll</path><location>Nt+0x%x</location></frame></stack>' % (i, i))
+        parts.append(
+            '<event><ProcessIndex>0</ProcessIndex>'
+            '<Time_of_Day>12:00:%02d.000000</Time_of_Day>'
+            '<PID>1234</PID><Operation>CreateFile</Operation>'
+            '<Path>C:\\Windows\\System32\\file_%d.dll</Path><Result>SUCCESS</Result>'
+            '<Process_Name>test.exe</Process_Name>%s</event>\n' % (i % 60, i, stack)
+        )
+    parts.append('</eventlist>\n</procmon>\n')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(''.join(parts))
+
+
+class TestParserIntegration:
+    def test_small_capture_parses_all_fields(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        from procmon_mcp.constants import IK_OPERATION, IK_PATH, IK_RESULT, IK_PROCESS_NAME
+        path = str(tmp_path / "small.xml")
+        _write_capture(path, 3)
+        data = load_procmon_xml(path, load_stack=True, load_extra=True)
+        assert len(data.events) == 3
+        assert len(data.processes_by_index) == 1
+        e = data.events[0]
+        assert e['pid'] == 1234
+        assert data.get_string(IK_OPERATION, e['op_id']) == "CreateFile"
+        assert data.get_string(IK_RESULT, e['res_id']) == "SUCCESS"
+        assert data.get_string(IK_PROCESS_NAME, e['pname_id']) == "test.exe"
+        assert "System32" in data.get_string(IK_PATH, e['path_id'])
+
+    def test_large_capture_drops_no_events(self, tmp_path):
+        """Regression: events spanning read-buffer boundaries must not be lost.
+
+        Previously, reading child fields on the iterparse 'start' event silently
+        dropped events (and nulled later fields like Path/Result) whenever a
+        buffer boundary fell inside an <event>.
+        """
+        from procmon_mcp.parser import load_procmon_xml
+        n = 20000
+        path = str(tmp_path / "large.xml")
+        _write_capture(path, n, with_stack=True)
+        data = load_procmon_xml(path, load_stack=True, load_extra=True)
+        assert len(data.events) == n
+        # No event may have a missing core field.
+        for e in data.events:
+            assert e.get('pid') is not None
+            assert e.get('op_id') is not None
+            assert e.get('path_id') is not None
+            assert e.get('res_id') is not None
+            assert e.get('pname_id') is not None
+        # Every event carried a stack frame; all must be present.
+        assert sum(1 for e in data.events if 'stack' in e) == n
+
+    def test_large_capture_no_stack_flag(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        n = 20000
+        path = str(tmp_path / "large_nostack.xml")
+        _write_capture(path, n, with_stack=True)
+        data = load_procmon_xml(path, load_stack=False, load_extra=False)
+        assert len(data.events) == n
+        assert all('stack' not in e for e in data.events)
+
+    def test_indices_cover_all_events(self, tmp_path):
+        from procmon_mcp.parser import load_procmon_xml
+        n = 5000
+        path = str(tmp_path / "idx.xml")
+        _write_capture(path, n, with_stack=False)
+        data = load_procmon_xml(path, load_stack=False, load_extra=False)
+        # Every event index should appear exactly once in the PID index.
+        assert sum(len(v) for v in data.pid_index.values()) == n
+        assert sum(len(v) for v in data.pname_id_index.values()) == n
