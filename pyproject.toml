@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "procmon-mcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "Model Context Protocol (MCP) server for analysing Process Monitor (Procmon) XML log files."
 readme = "README.md"
 requires-python = ">=3.7"

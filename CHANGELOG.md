@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-23
+
+### Fixed
+- `--transport streamable-http` crashed immediately with
+  `FastMCP.run() got an unexpected keyword argument 'host'`. The MCP SDK's
+  `run()` signature is `run(transport, mount_path)`; host and port belong on
+  `mcp.settings`. The Streamable HTTP branch now configures host/port/log level
+  via `settings` (matching the SSE branch) before calling `run()`. `stdio`
+  (the default) was unaffected. (#17)
+
 ## [0.2.1] - 2026-06-23
 
 ### Fixed
