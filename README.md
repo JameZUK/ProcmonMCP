@@ -387,7 +387,7 @@ ProcmonMCP builds four indices during file loading for fast filtered lookups:
 |-------|---------|------------|
 | Process name (interned ID) | `query_events`, `count_events_by_process` | O(1) lookup |
 | Operation (interned ID) | `query_events`, `summarize_operations_by_process` | O(1) lookup |
-| PID | `get_process_lifetime` | O(1) lookup with set intersection |
+| PID | `query_events` (`filter_pid`), `get_process_lifetime` | O(1) lookup with set intersection |
 | File path (interned ID) | `find_file_access` | O(unique_paths) substring scan |
 
 For filters not backed by an index (e.g., regex, path contains, stack module path), ProcmonMCP falls back to a linear scan of all events. Use indexed filters first to narrow results, then apply more expensive filters.
