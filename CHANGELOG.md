@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-23
+
+### Fixed
+- `get_process_lifetime` returned `create_timestamp: null` for processes that
+  started during the capture. Procmon records a process's own start as a
+  `Process Start` event (with that PID), whereas `Process Create` is logged by
+  the parent (with the parent's PID), so matching only `Process Create` against
+  the requested PID never found the process's own creation. The tool now
+  considers both operations and uses the earliest, so a process's own
+  `Process Start` is used when present. (#14)
+
 ## [0.2.0] - 2026-06-23
 
 ### Added
