@@ -107,9 +107,19 @@ def main_execution(args):
             server_started = True
 
         elif transport == "streamable-http":
+            if hasattr(server.mcp, 'settings'):
+                logger.info("Configuring MCP for Streamable HTTP transport...")
+                server.mcp.settings.host = args.mcp_host
+                server.mcp.settings.port = args.mcp_port
+                log_level = logging.DEBUG if args.debug else logging.INFO
+                mcp_log_level_name = logging.getLevelName(log_level)
+                server.mcp.settings.log_level = mcp_log_level_name.lower()
+                logger.info(f"  MCP Host: {server.mcp.settings.host}, Port: {server.mcp.settings.port}")
+            else:
+                logger.warning("MCP object lacks 'settings'; cannot configure Streamable HTTP via arguments.")
             logger.info(f"Starting MCP server with Streamable HTTP transport on "
                         f"http://{args.mcp_host}:{args.mcp_port}/mcp")
-            server.mcp.run(transport="streamable-http", host=args.mcp_host, port=args.mcp_port)
+            server.mcp.run(transport="streamable-http")
             server_started = True
 
         else:
