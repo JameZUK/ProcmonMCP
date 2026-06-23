@@ -391,10 +391,14 @@ For filters not backed by an index (e.g., regex, path contains, stack module pat
 ## Limitations
 
 - **Memory usage**: Whilst optimised with string interning, loading extremely large XML files (millions of events with stack traces) can consume significant RAM. Use `--no-stack-traces` and `--no-extra-data` for very large files.
-- **Loading time**: Parsing and optimising large XML files takes time, particularly compressed ones. Progress is reported during loading.
+- **Loading time**: Parsing and optimising large XML files takes time, particularly compressed ones. Progress is reported during loading. Reloading an unchanged file is near-instant thanks to the [parsed-capture cache](#parsed-capture-cache); only the first parse pays the full cost.
 - **XML structure**: Relies on the standard Procmon XML export structure. Malformed or non-standard XML will likely cause parsing errors.
 - **Stack traces**: Stack trace quality depends on what Procmon resolved and included in the XML export. Requires running Procmon with symbols configured correctly.
 - **Single file at a time**: Only one file can be loaded at any given time. Loading a new file replaces the previous data.
+
+## Changelog
+
+Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
