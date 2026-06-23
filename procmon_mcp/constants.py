@@ -15,8 +15,14 @@ PROGRESS_REPORT_SECONDS = 5.0  # Also report progress every N seconds
 # The parser will advance this date if it detects a midnight rollover.
 BASE_DATE = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-# Known operation strings
+# Known operation strings.
+# Procmon emits two distinct lifecycle events: "Process Create" is logged by the
+# PARENT (with the parent's PID, path = the child's image), while "Process Start"
+# is the process's own start (with its own PID). To find a process's own creation
+# time we must consider both, matched against the target PID.
 OP_PROCESS_CREATE = "Process Create"
+OP_PROCESS_START = "Process Start"
+PROCESS_CREATE_OPERATIONS = (OP_PROCESS_CREATE, OP_PROCESS_START)
 OP_PROCESS_EXIT = "Process Exit"
 NETWORK_OPERATIONS = {"TCP Connect", "TCP Send", "TCP Receive", "UDP Send", "UDP Receive"}
 

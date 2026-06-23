@@ -13,7 +13,7 @@ from typing import List, Dict, Any, Optional
 from .compat import Context, PSUTIL_AVAILABLE
 from .constants import (
     PROCMON_TIMESTAMP_FORMAT, PROGRESS_REPORT_INTERVAL, PROGRESS_REPORT_SECONDS,
-    OP_PROCESS_CREATE, OP_PROCESS_EXIT, NETWORK_OPERATIONS,
+    OP_PROCESS_EXIT, PROCESS_CREATE_OPERATIONS, NETWORK_OPERATIONS,
     IK_PROCESS_NAME, IK_OPERATION, IK_PATH, IK_RESULT, IK_CATEGORY,
     IK_STACK_PATH, IK_STACK_LOCATION,
 )
@@ -683,15 +683,25 @@ async def get_timing_statistics(group_by: str = "process", *, ctx: Context) -> D
 @tool_decorator
 async def get_process_lifetime(pid: int, ctx: Context) -> Dict[str, Optional[float]]:
     """
-    Finds the first 'Process Create' and the last 'Process Exit' event timestamps (Unix float) for a given Process ID (PID).
+    Finds the process creation and the last 'Process Exit' event timestamps (Unix float) for a given Process ID (PID).
     Scans through the loaded events to find the relevant timestamps.
+
+    Procmon records a process's own start as a 'Process Start' event (with that
+    PID), whereas 'Process Create' is logged by the PARENT (with the parent's
+    PID). This tool considers both, matched against the requested PID, and uses
+    the earliest as the creation time — which is the process's own start when it
+    started during the capture.
+
     Returns a dictionary with 'create_timestamp' and 'exit_timestamp'. Values will be None if the corresponding event is not found.
     """
     log_data = await _check_loaded(ctx, "get_process_lifetime")
     await ctx.info(f"[get_process_lifetime] Starting for PID: {pid}")
     create_ts: Optional[float] = None
     exit_ts: Optional[float] = None
-    create_op_id = log_data.get_id(IK_OPERATION, OP_PROCESS_CREATE)
+    create_op_ids = [
+        oid for oid in (log_data.get_id(IK_OPERATION, op) for op in PROCESS_CREATE_OPERATIONS)
+        if oid is not None
+    ]
     exit_op_id = log_data.get_id(IK_OPERATION, OP_PROCESS_EXIT)
 
     if pid not in log_data.processes_by_pid:
@@ -705,11 +715,15 @@ async def get_process_lifetime(pid: int, ctx: Context) -> Dict[str, Optional[flo
         await ctx.info(f"[get_process_lifetime] PID {pid}: {result}")
         return result
 
-    if create_op_id is not None:
-        create_indices = log_data.op_id_index.get(create_op_id, [])
-        for idx in create_indices:
+    # Earliest "Process Start"/"Process Create" event belonging to this PID.
+    # op_id_index lists are in ascending event-index (time) order, so the first
+    # match for each op is that op's earliest; we then keep the minimum.
+    for create_op_id in create_op_ids:
+        for idx in log_data.op_id_index.get(create_op_id, []):
             if idx in pid_event_set:
-                create_ts = log_data.events[idx].get('ts')
+                ts = log_data.events[idx].get('ts')
+                if ts is not None and (create_ts is None or ts < create_ts):
+                    create_ts = ts
                 break
 
     if exit_op_id is not None:
