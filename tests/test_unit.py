@@ -2,6 +2,7 @@
 import sys
 import os
 import re
+import asyncio
 import pytest
 from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
@@ -609,3 +610,62 @@ class TestParserIntegration:
         # Every event index should appear exactly once in the PID index.
         assert sum(len(v) for v in data.pid_index.values()) == n
         assert sum(len(v) for v in data.pname_id_index.values()) == n
+
+
+# --- Exact-Match Filter Tests ---
+
+def _collect_filtered(log_data, **filters):
+    """Drain the async filter iterator into a list of event indices."""
+    from procmon_mcp.compat import Context
+
+    async def _run():
+        ctx = Context()
+        out = []
+        async for idx in procmon_mcp._iter_filtered_event_indices(
+                log_data=log_data, ctx=ctx, **filters):
+            out.append(idx)
+        return out
+
+    return asyncio.run(_run())
+
+
+class TestFilterExactMatch:
+    """Synthetic capture: N identical CreateFile / SUCCESS / test.exe events."""
+
+    def _load(self, tmp_path, n=10):
+        from procmon_mcp.parser import load_procmon_xml
+        path = str(tmp_path / "filt.xml")
+        _write_capture(path, n, with_stack=False)
+        return load_procmon_xml(path, load_stack=False, load_extra=False)
+
+    def test_present_operation_matches_all(self, tmp_path):
+        data = self._load(tmp_path)
+        assert len(_collect_filtered(data, filter_operation="CreateFile")) == 10
+
+    def test_present_result_matches_all(self, tmp_path):
+        data = self._load(tmp_path)
+        assert len(_collect_filtered(data, filter_result="SUCCESS")) == 10
+
+    def test_present_process_matches_all(self, tmp_path):
+        data = self._load(tmp_path)
+        assert len(_collect_filtered(data, filter_process="test.exe")) == 10
+
+    def test_absent_operation_matches_none(self, tmp_path):
+        # Regression: an absent exact-match value must yield 0, not every event.
+        data = self._load(tmp_path)
+        assert _collect_filtered(data, filter_operation="RegSetValue") == []
+
+    def test_absent_result_matches_none(self, tmp_path):
+        data = self._load(tmp_path)
+        assert _collect_filtered(data, filter_result="ACCESS DENIED") == []
+
+    def test_absent_process_matches_none(self, tmp_path):
+        data = self._load(tmp_path)
+        assert _collect_filtered(data, filter_process="nonexistent.exe") == []
+
+    def test_absent_value_does_not_leak_with_other_filters(self, tmp_path):
+        # Combining a present operation with an absent result still yields 0.
+        data = self._load(tmp_path)
+        res = _collect_filtered(data, filter_operation="CreateFile",
+                                filter_result="ACCESS DENIED")
+        assert res == []

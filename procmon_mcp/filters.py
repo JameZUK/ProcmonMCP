@@ -101,10 +101,33 @@ async def _iter_filtered_event_indices(
             await ctx.error(f"Invalid time filter: {e}")
             raise e
 
-        # Get interned IDs for exact match filters
-        process_id_filter = log_data.get_id(IK_PROCESS_NAME, filter_process) if filter_process else None
-        operation_id_filter = log_data.get_id(IK_OPERATION, filter_operation) if filter_operation else None
-        result_id_filter = log_data.get_id(IK_RESULT, filter_result) if filter_result else None
+        # Get interned IDs for exact match filters. A filter that was supplied
+        # but whose value is absent from the interner can match nothing, so we
+        # return immediately rather than silently dropping the filter (which
+        # would wrongly return every event).
+        if filter_process:
+            process_id_filter = log_data.get_id(IK_PROCESS_NAME, filter_process)
+            if process_id_filter is None:
+                await ctx.info(f"Filter: process '{filter_process}' not present in loaded data; no matches.")
+                return
+        else:
+            process_id_filter = None
+
+        if filter_operation:
+            operation_id_filter = log_data.get_id(IK_OPERATION, filter_operation)
+            if operation_id_filter is None:
+                await ctx.info(f"Filter: operation '{filter_operation}' not present in loaded data; no matches.")
+                return
+        else:
+            operation_id_filter = None
+
+        if filter_result:
+            result_id_filter = log_data.get_id(IK_RESULT, filter_result)
+            if result_id_filter is None:
+                await ctx.info(f"Filter: result '{filter_result}' not present in loaded data; no matches.")
+                return
+        else:
+            result_id_filter = None
 
         # Prepare case-insensitive substring filters
         filter_path_contains_lower = filter_path_contains.lower() if filter_path_contains else None
