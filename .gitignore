@@ -17,6 +17,11 @@ venv/
 # Exported data
 exports/
 
+# Local Procmon captures (may contain sensitive data — never commit)
+captures/
+*.PML
+*.pml
+
 # IDE
 .idea/
 .vscode/

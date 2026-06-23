@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "procmon-mcp"
+version = "0.1.0"
+description = "Model Context Protocol (MCP) server for analysing Process Monitor (Procmon) XML log files."
+readme = "README.md"
+requires-python = ">=3.7"
+license = { file = "LICENSE" }
+authors = [{ name = "JameZUK" }]
+keywords = ["mcp", "procmon", "process-monitor", "xml", "malware-analysis", "dfir"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "mcp[cli]>=1.8.0",
+]
+
+[project.optional-dependencies]
+# Faster XML parsing (falls back to the stdlib ElementTree if absent).
+lxml = ["lxml>=4.9.0"]
+# Memory-usage reporting after loading (silently skipped if absent).
+psutil = ["psutil>=5.9.0"]
+# Everything optional, for convenience.
+all = ["lxml>=4.9.0", "psutil>=5.9.0"]
+# Development/test tooling.
+dev = ["pytest>=7.0", "lxml>=4.9.0", "psutil>=5.9.0"]
+
+[project.urls]
+Homepage = "https://github.com/JameZUK/ProcmonMCP"
+Repository = "https://github.com/JameZUK/ProcmonMCP"
+Issues = "https://github.com/JameZUK/ProcmonMCP/issues"
+
+[project.scripts]
+procmon-mcp = "procmon_mcp.cli:main"
+
+[tool.setuptools]
+packages = ["procmon_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        # The unit tests exercise the package directly and do not require the
+        # MCP SDK (compat.py falls back to mock objects when it is absent).
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest lxml
+
+      - name: Run tests (with lxml)
+        run: pytest -q
+
+      - name: Run tests (stdlib ElementTree fallback)
+        run: |
+          pip uninstall -y lxml
+          pytest -q
