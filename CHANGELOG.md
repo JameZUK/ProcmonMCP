@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-23
+
 ### Added
 - **Parsed-capture cache** so reloading an unchanged file is near-instant — the
   optimised in-memory structures are serialized to `~/.procmonmcp/cache/`, keyed
