@@ -2,6 +2,8 @@
 
 ProcmonMCP is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows LLMs to autonomously analyse **Process Monitor (Procmon) XML log files**. It exposes a comprehensive set of analysis tools to any MCP-compatible client, including Claude Code, Claude Desktop, Cline, and others.
 
+As seen on [REMnux](https://docs.remnux.org/discover-the-tools/use+artificial+intelligence#procmonmcp)
+
 ## Overview
 
 Process Monitor captures detailed system activity — file access, registry operations, network connections, process creation, and more. ProcmonMCP parses these XML logs into an optimised in-memory representation and exposes them as MCP tools, enabling an LLM to investigate system behaviour without manual data wrangling.
