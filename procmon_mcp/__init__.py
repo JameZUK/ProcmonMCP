@@ -3,7 +3,7 @@
 # Core infrastructure
 from .compat import (
     LXML_AVAILABLE, PSUTIL_AVAILABLE, MCP_SDK_AVAILABLE,
-    ET_impl, FastMCP, Context,
+    ET_impl, MCPServer, FastMCP, Context,
 )
 from .constants import (
     LOG_FORMAT,

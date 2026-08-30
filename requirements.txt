@@ -1,5 +1,5 @@
 # Required
-mcp[cli]>=1.8.0
+mcp[cli]>=2.0.0
 
 # Optional (the server runs without these, with graceful fallbacks):
 #   lxml   - faster XML parsing; falls back to the stdlib ElementTree if absent

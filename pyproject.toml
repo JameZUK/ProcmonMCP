@@ -7,7 +7,7 @@ name = "procmon-mcp"
 version = "0.4.0"
 description = "Model Context Protocol (MCP) server for analysing Process Monitor (Procmon) XML log files."
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "JameZUK" }]
 keywords = ["mcp", "procmon", "process-monitor", "xml", "malware-analysis", "dfir"]
@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: System :: Monitoring",
 ]
 dependencies = [
-    "mcp[cli]>=1.8.0",
+    "mcp[cli]>=2.0.0",
 ]
 
 [project.optional-dependencies]

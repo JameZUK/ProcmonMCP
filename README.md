@@ -29,7 +29,7 @@ This project was inspired by the approach taken in [GhidraMCP](https://github.co
 
 ### Prerequisites
 
-- Python 3.7 or newer (developed and tested with 3.10+)
+- Python 3.10 or newer (required by the MCP SDK; developed and tested with 3.10-3.13)
 - `pip` (Python package installer)
 
 ### Install from source
@@ -52,15 +52,21 @@ pip install -e ".[dev]"  # editable install with test tooling
 
 | Package | Required | Purpose |
 |---------|----------|---------|
-| `mcp[cli]>=1.8.0` | Yes | MCP SDK with CLI tools and Streamable HTTP support |
+| `mcp[cli]>=2.0.0` | Yes | MCP SDK with CLI tools and Streamable HTTP support |
 | `lxml>=4.9.0` | Recommended | Faster XML parsing (falls back to stdlib `ElementTree` if absent) |
 | `psutil>=5.9.0` | Optional | Memory usage reporting after file loading |
 | `google-re2` | Optional | Linear-time, ReDoS-safe engine for user filter regexes (`pip install ".[re2]"`; falls back to stdlib `re`) |
 
 Install all at once:
 ```bash
-pip install "mcp[cli]>=1.8.0" lxml psutil
+pip install "mcp[cli]>=2.0.0" lxml psutil
 ```
+
+> **MCP SDK v2:** the SDK renamed `FastMCP` to `MCPServer` and moved it to
+> `mcp.server.mcpserver` in v2. ProcmonMCP targets v2, and still runs against
+> `mcp<2` via a compatibility fallback. If you previously installed with an
+> unpinned `mcp[cli]` and saw *"the MCP SDK could not be loaded"*, upgrade with
+> `pip install --upgrade "mcp[cli]>=2"`.
 
 ## Quick Start with Claude Code
 

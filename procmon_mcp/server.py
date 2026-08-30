@@ -1,11 +1,18 @@
 """MCP server setup and global state for ProcmonMCP."""
 import logging
+from importlib.metadata import PackageNotFoundError, version as _package_version
 from typing import Optional
 
-from .compat import FastMCP, Context, MCP_SDK_AVAILABLE
+from .compat import MCPServer, Context, MCP_SDK_AVAILABLE, MCP_SDK_V2
 from .models import ProcmonLogData
 
 logger = logging.getLogger(__name__)
+
+try:
+    _VERSION = _package_version("procmon-mcp")
+except PackageNotFoundError:
+    # Running from a source checkout that was never pip-installed.
+    _VERSION = ""
 
 # Global state: holds the single loaded ProcmonLogData instance after successful loading
 LOADED_DATA: Optional[ProcmonLogData] = None
@@ -19,10 +26,17 @@ _SERVER_DESC = (
     "Use get_status to check state, then load_file to open a Procmon XML capture."
 )
 
+# v2 advertises the server's own version to clients and defaults it to an empty
+# string. v1's FastMCP has no such parameter (it reported the SDK's version
+# instead), so this is passed only where it is accepted.
+_server_kwargs = {"instructions": _SERVER_DESC}
+if MCP_SDK_V2 and _VERSION:
+    _server_kwargs["version"] = _VERSION
+
 if MCP_SDK_AVAILABLE:
-    mcp = FastMCP("ProcmonMCP", instructions=_SERVER_DESC)
+    mcp = MCPServer("ProcmonMCP", **_server_kwargs)
 else:
-    mcp = FastMCP("ProcmonMCP (Mock)", instructions=_SERVER_DESC)
+    mcp = MCPServer("ProcmonMCP (Mock)", **_server_kwargs)
 
 
 async def _check_loaded(ctx: Context, tool_name: str) -> ProcmonLogData:
