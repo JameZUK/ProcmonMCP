@@ -41,6 +41,8 @@ This project was inspired by the approach taken in [GhidraMCP](https://github.co
 
 ## Installation
 
+Current release: **[v0.5.0](https://github.com/JameZUK/ProcmonMCP/releases/tag/v0.5.0)**, which requires MCP SDK v2 (`mcp[cli]>=2.0.0`). Earlier versions are listed on the [releases page](https://github.com/JameZUK/ProcmonMCP/releases); notable changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
 ### Prerequisites
 
 - Python 3.10 or newer (required by the MCP SDK; developed and tested with 3.10-3.13)
@@ -52,6 +54,14 @@ This project was inspired by the approach taken in [GhidraMCP](https://github.co
 git clone https://github.com/JameZUK/ProcmonMCP
 cd ProcmonMCP
 pip install -r requirements.txt
+```
+
+That tracks the latest state of the default branch. To pin the current release instead:
+
+```bash
+git clone --branch v0.5.0 --depth 1 https://github.com/JameZUK/ProcmonMCP
+cd ProcmonMCP
+pip install ".[all]"
 ```
 
 Or install the package itself (provides a `procmon-mcp` console script):
