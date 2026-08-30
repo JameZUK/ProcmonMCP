@@ -51,45 +51,84 @@ if not PSUTIL_AVAILABLE:
     logger.warning("To enable memory reporting, install psutil: pip install psutil")
 
 # --- MCP SDK Imports ---
+# SDK v2 renamed FastMCP to MCPServer and moved it from `mcp.server.fastmcp` to
+# `mcp.server.mcpserver`. The old module is gone entirely -- it is not a
+# deprecation shim -- so the import below is tried v2-first. v2 also dropped
+# host/port from `mcp.settings` in favour of run() keyword arguments, so callers
+# need to know which major version is live; MCP_SDK_V2 carries that.
+# https://py.sdk.modelcontextprotocol.io/migration/#fastmcp-renamed-to-mcpserver
+#
+# v2 is the version this project targets and declares as its dependency. The v1
+# branch is a safety net for environments already pinned to mcp<2, not a
+# supported configuration.
 MCP_SDK_AVAILABLE = False
+MCP_SDK_V2 = False
+MCP_IMPORT_ERROR = None
 try:
-    from mcp.server.fastmcp import FastMCP, Context
+    from mcp.server.mcpserver import MCPServer, Context
     MCP_SDK_AVAILABLE = True
-    logger.info("MCP SDK found.")
+    MCP_SDK_V2 = True
+    logger.info("MCP SDK found (v2 API: mcp.server.mcpserver.MCPServer).")
 except ImportError:
-    MCP_SDK_AVAILABLE = False
-    logger.error("MCP SDK (mcp[cli]) not found. Mock objects will be used for offline execution.")
-    logger.error("To run as a server, please install the SDK: pip install \"mcp[cli]\"")
+    try:
+        from mcp.server.fastmcp import FastMCP as MCPServer, Context
+        MCP_SDK_AVAILABLE = True
+        logger.info("MCP SDK found (v1 API: mcp.server.fastmcp.FastMCP).")
+        logger.warning("MCP SDK v1 is deprecated here; upgrade with: pip install --upgrade \"mcp[cli]>=2\"")
+    except ImportError:
+        # Distinguish "SDK absent" from "SDK present but neither API importable",
+        # so the CLI can report something the user can act on.
+        try:
+            import mcp  # noqa: F401
+            MCP_IMPORT_ERROR = (
+                "The 'mcp' package is installed, but neither the v2 "
+                "(mcp.server.mcpserver) nor the v1 (mcp.server.fastmcp) server API "
+                "could be imported from it."
+            )
+        except ImportError:
+            MCP_IMPORT_ERROR = "The 'mcp' package is not installed."
 
-    class MockSettings:
-        host = "127.0.0.1"
-        port = 8081
-        log_level = "INFO"
+        logger.error(f"MCP SDK unavailable: {MCP_IMPORT_ERROR}")
+        logger.error("Mock objects will be used for offline execution.")
+        logger.error("To run as a server, please install the SDK: pip install \"mcp[cli]>=2\"")
 
-    class MockMCP:
-        def __init__(self, name, instructions=""):
-            self.name = name
-            self.instructions = instructions
-            self.app = object()
-            self.settings = MockSettings()
-            self._run_called_with_transport = None
+        class MockSettings:
+            # Mirrors v2, where host/port are run() arguments rather than settings.
+            log_level = "INFO"
 
-        def tool(self):
-            return lambda func: func
+        class MockMCP:
+            """Offline stand-in for MCPServer, shaped like the v2 API."""
 
-        def run(self, transport: str = "stdio"):
-            logger.info(f"MockMCP '{self.name}' run method called with transport='{transport}'.")
-            logger.info(f"MockMCP settings - Host: {self.settings.host}, Port: {self.settings.port}")
-            self._run_called_with_transport = transport
+            def __init__(self, name, instructions=""):
+                self.name = name
+                self.instructions = instructions
+                self.app = object()
+                self.settings = MockSettings()
+                self._run_called_with_transport = None
+                self._run_called_with_kwargs = None
 
-    FastMCP = MockMCP
+            def tool(self):
+                return lambda func: func
 
-    class Context:
-        async def info(self, msg):
-            logger.info(f"(mock ctx): {msg}")
+            def run(self, transport: str = "stdio", **kwargs):
+                logger.info(f"MockMCP '{self.name}' run method called with transport='{transport}'.")
+                if kwargs:
+                    logger.info(f"MockMCP transport options: {kwargs}")
+                self._run_called_with_transport = transport
+                self._run_called_with_kwargs = kwargs
 
-        async def error(self, msg):
-            logger.error(f"(mock ctx): {msg}")
+        MCPServer = MockMCP
 
-        async def warning(self, msg):
-            logger.warning(f"(mock ctx): {msg}")
+        class Context:
+            async def info(self, msg):
+                logger.info(f"(mock ctx): {msg}")
+
+            async def error(self, msg):
+                logger.error(f"(mock ctx): {msg}")
+
+            async def warning(self, msg):
+                logger.warning(f"(mock ctx): {msg}")
+
+# Backward-compatible alias for the name this module exported before the v2
+# rename. Retained so `from procmon_mcp import FastMCP` keeps working.
+FastMCP = MCPServer

@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Support MCP SDK v2, which renamed `FastMCP` to `MCPServer`.** (#33)
+  The dependency was pinned only as `mcp[cli]>=1.8.0`, so a fresh install
+  resolved to mcp 2.x, where `mcp.server.fastmcp` no longer exists. `compat.py`
+  caught the resulting `ImportError`, fell back to mock objects, and the CLI
+  exited claiming the SDK was *"not installed"* when it was — just a version it
+  could not use. The SDK import is now tried v2-first
+  (`from mcp.server.mcpserver import MCPServer, Context`), falling back to the
+  v1 `FastMCP` path for environments pinned to `mcp<2`.
+- **Host and port were silently dropped on the HTTP transports under v2.**
+  v2 removed `host`/`port` from `mcp.settings`, so the old assignment raised
+  `ValueError: "Settings" object has no field "host"`; the existing
+  `hasattr(mcp, 'settings')` guard did not catch it, because `.settings` still
+  exists and only lost those two fields. Host and port are now passed as
+  `run()` keyword arguments on v2 and set on `settings` on v1.
+- **`requires-python` corrected to `>=3.10`.** It claimed `>=3.7`, but every
+  supported MCP SDK — v1 from 1.8.0 onward, and all of v2 — already requires
+  3.10 or newer.
+- **The startup failure message now distinguishes an absent SDK from an
+  unusable one**, reporting which import was attempted rather than telling
+  users to install a package they already have.
+
+### Changed
+- **`mcp[cli]>=2.0.0`** is now the declared dependency (was `>=1.8.0`). The v1
+  code path is retained as a compatibility fallback, not a supported
+  configuration; `compat.MCP_SDK_V2` reports which API is live.
+- **`compat` exports `MCPServer`**, with `FastMCP` kept as an alias so
+  `from procmon_mcp import FastMCP` keeps working.
+- **The server now advertises its own version** (`procmon-mcp`'s, e.g. `0.4.0`)
+  to clients on v2, which defaults the field to an empty string. v1's `FastMCP`
+  has no such parameter and continues to report the SDK's version.
+- **The manual test client (`tests/procmon-mcp-tester.py`) works on both
+  majors:** v2 dropped the `streamablehttp_client` spelling, so the client now
+  prefers `streamable_http_client` (present in both) and falls back for older
+  v1 SDKs.
+- **CI `sdk-smoke` runs against both SDK majors** (`mcp[cli]>=2` and
+  `mcp[cli]<2`) and now asserts the SDK was actually detected and that all
+  tools registered — the previous job would have passed while the server
+  silently degraded to mock objects.
+
 ## [0.4.0] - 2026-06-23
 
 Reliability/efficiency/stability hardening pass (code review).

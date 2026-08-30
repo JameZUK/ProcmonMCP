@@ -18,7 +18,15 @@ try:
     logger.info("MCP SDK components imported successfully.")
     HAS_STREAMABLE_HTTP = False
     try:
-        from mcp.client.streamable_http import streamablehttp_client
+        # SDK v2 dropped the unseparated `streamablehttp_client` spelling; the
+        # `streamable_http_client` name it kept is also present in recent v1
+        # releases, so prefer it and fall back for older v1 SDKs.
+        try:
+            from mcp.client.streamable_http import streamable_http_client
+        except ImportError:
+            from mcp.client.streamable_http import (
+                streamablehttp_client as streamable_http_client,
+            )
         HAS_STREAMABLE_HTTP = True
         logger.info("Streamable HTTP client available.")
     except ImportError:
@@ -452,12 +460,12 @@ async def main(host: str, port: int, transport: str):
 
         elif transport == "streamable-http":
             if not HAS_STREAMABLE_HTTP:
-                logger.error("Streamable HTTP client not available. Upgrade MCP SDK: pip install 'mcp[cli]>=1.8.0'")
+                logger.error("Streamable HTTP client not available. Upgrade MCP SDK: pip install 'mcp[cli]>=2'")
                 sys.exit(1)
             url = f"http://{host}:{port}/mcp"
             logger.info(f"Connecting via Streamable HTTP to: {url}...")
 
-            async with streamablehttp_client(url) as streams:
+            async with streamable_http_client(url) as streams:
                 logger.info("Streamable HTTP client connected.")
                 read_stream, write_stream = streams[0], streams[1]
                 async with ClientSession(read_stream, write_stream) as session:

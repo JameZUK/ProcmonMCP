@@ -8,7 +8,7 @@ import cProfile
 import pstats
 import warnings
 
-from .compat import MCP_SDK_AVAILABLE, PSUTIL_AVAILABLE
+from .compat import MCP_SDK_AVAILABLE, MCP_SDK_V2, MCP_IMPORT_ERROR, PSUTIL_AVAILABLE
 from .constants import LOG_FORMAT
 from .helpers import _format_bytes
 from .parser import load_procmon_xml
@@ -19,21 +19,33 @@ from . import tools  # noqa: F401 - force tool registration
 logger = logging.getLogger(__name__)
 
 
-def _configure_http_settings(args, label):
-    """Applies host/port/log-level to mcp.settings for the HTTP-style transports.
+def _http_transport_options(args, label):
+    """Returns the run() keyword arguments for the HTTP-style transports.
 
-    The MCP SDK's run() takes (transport, mount_path); host and port live on
-    mcp.settings, so both the SSE and Streamable HTTP paths configure them here.
+    SDK v2 takes host/port as run() keyword arguments and dropped them from
+    mcp.settings; v1 read them from mcp.settings and rejects them as kwargs.
+    Log level lives on settings in both (v2 lowercases it for uvicorn itself,
+    so the casing each version declares is safe to use).
     """
-    if hasattr(server.mcp, 'settings'):
-        logger.info(f"Configuring MCP for {label}...")
-        server.mcp.settings.host = args.mcp_host
-        server.mcp.settings.port = args.mcp_port
-        log_level = logging.DEBUG if args.debug else logging.INFO
-        server.mcp.settings.log_level = logging.getLevelName(log_level).lower()
-        logger.info(f"  MCP Host: {server.mcp.settings.host}, Port: {server.mcp.settings.port}")
+    logger.info(f"Configuring MCP for {label}...")
+    logger.info(f"  MCP Host: {args.mcp_host}, Port: {args.mcp_port}")
+
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    level_name = logging.getLevelName(log_level)
+    settings = getattr(server.mcp, 'settings', None)
+    if settings is not None:
+        settings.log_level = level_name if MCP_SDK_V2 else level_name.lower()
+
+    if MCP_SDK_V2:
+        return {"host": args.mcp_host, "port": args.mcp_port}
+
+    # v1: host and port are read off settings rather than passed to run().
+    if settings is not None:
+        settings.host = args.mcp_host
+        settings.port = args.mcp_port
     else:
         logger.warning(f"MCP object lacks 'settings'; cannot configure {label} via arguments.")
+    return {}
 
 
 def main_execution(args):
@@ -109,16 +121,16 @@ def main_execution(args):
                 DeprecationWarning,
                 stacklevel=1,
             )
-            _configure_http_settings(args, "SSE transport (deprecated)")
+            run_options = _http_transport_options(args, "SSE transport (deprecated)")
             logger.info(f"Starting MCP server with SSE transport on http://{args.mcp_host}:{args.mcp_port}")
-            server.mcp.run(transport="sse")
+            server.mcp.run(transport="sse", **run_options)
             server_started = True
 
         elif transport == "streamable-http":
-            _configure_http_settings(args, "Streamable HTTP transport")
+            run_options = _http_transport_options(args, "Streamable HTTP transport")
             logger.info(f"Starting MCP server with Streamable HTTP transport on "
                         f"http://{args.mcp_host}:{args.mcp_port}/mcp")
-            server.mcp.run(transport="streamable-http")
+            server.mcp.run(transport="streamable-http", **run_options)
             server_started = True
 
         else:
@@ -234,8 +246,10 @@ def main():
 
     # Dependency checks
     if not MCP_SDK_AVAILABLE:
-        logger.critical("CRITICAL: Model Context Protocol SDK (mcp[cli]) is not installed.")
-        logger.critical("Please install it: pip install \"mcp[cli]\"")
+        logger.critical("CRITICAL: The Model Context Protocol SDK could not be loaded.")
+        if MCP_IMPORT_ERROR:
+            logger.critical(f"  {MCP_IMPORT_ERROR}")
+        logger.critical("Please install it: pip install \"mcp[cli]>=2\"")
         sys.exit(1)
 
     # Profiling setup

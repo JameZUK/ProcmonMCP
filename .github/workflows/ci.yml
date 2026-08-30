@@ -37,10 +37,23 @@ jobs:
           pytest -q
 
   sdk-smoke:
-    # Installs the real MCP SDK so the server's import path (FastMCP
-    # construction) is exercised end-to-end. The mock-based 'test' job cannot
-    # catch SDK-signature regressions such as the FastMCP instructions= fix.
+    # Installs the real MCP SDK so the server's import path (MCPServer
+    # construction and tool registration) is exercised end-to-end. The
+    # mock-based 'test' job cannot catch SDK-signature regressions such as the
+    # v2 FastMCP -> MCPServer rename, which silently degraded the server to
+    # mock objects because compat.py caught the resulting ImportError.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # v2 is the declared dependency and what a fresh install resolves to.
+          - mcp-spec: "mcp[cli]>=2"
+            expect-v2: "true"
+          # v1 exercises the compat fallback for environments pinned to mcp<2.
+          - mcp-spec: "mcp[cli]<2"
+            expect-v2: "false"
+    name: sdk-smoke (${{ matrix.mcp-spec }})
     steps:
       - uses: actions/checkout@v4
 
@@ -49,14 +62,39 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install with the MCP SDK
+      - name: Install with the MCP SDK (${{ matrix.mcp-spec }})
+        # The second install pins the SDK major version under test. For the
+        # mcp<2 leg pip warns that it conflicts with the declared dependency
+        # and still downgrades, which is what this leg wants to exercise.
         run: |
           python -m pip install --upgrade pip
           pip install pytest lxml
           pip install ".[all]"
+          pip install "${{ matrix.mcp-spec }}"
 
-      - name: Import server (FastMCP construction smoke test)
-        run: python -c "import procmon_mcp.server as s; assert s.mcp is not None; print('server import OK')"
+      - name: Smoke test (MCPServer construction and tool registration)
+        env:
+          EXPECT_V2: ${{ matrix.expect-v2 }}
+        run: |
+          python - <<'EOF'
+          import os
+          from procmon_mcp.compat import MCP_SDK_AVAILABLE, MCP_SDK_V2, MCP_IMPORT_ERROR
+
+          # Checked before anything else is imported, so a silent degradation to
+          # mock objects reports itself rather than failing on a later import.
+          expect_v2 = os.environ["EXPECT_V2"] == "true"
+          assert MCP_SDK_AVAILABLE, f"MCP SDK installed but not detected: {MCP_IMPORT_ERROR}"
+          assert MCP_SDK_V2 is expect_v2, f"expected MCP_SDK_V2={expect_v2}, got {MCP_SDK_V2}"
+
+          import anyio
+          import procmon_mcp.server as s
+
+          assert s.mcp is not None, "server instance was not constructed"
+
+          tools = anyio.run(s.mcp.list_tools)
+          assert len(tools) >= 20, f"only {len(tools)} tools registered"
+          print(f"server import OK (v2={MCP_SDK_V2}, {len(tools)} tools)")
+          EOF
 
       - name: Run tests with the SDK present
         run: pytest -q
