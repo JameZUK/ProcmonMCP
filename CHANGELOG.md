@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-30
+
 ### Fixed
 - **Support MCP SDK v2, which renamed `FastMCP` to `MCPServer`.** (#33)
   The dependency was pinned only as `mcp[cli]>=1.8.0`, so a fresh install
