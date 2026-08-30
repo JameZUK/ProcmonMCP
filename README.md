@@ -2,7 +2,19 @@
 
 ProcmonMCP is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that allows LLMs to autonomously analyse **Process Monitor (Procmon) XML log files**. It exposes a comprehensive set of analysis tools to any MCP-compatible client, including Claude Code, Claude Desktop, Cline, and others.
 
-As seen on [REMnux](https://docs.remnux.org/discover-the-tools/use+artificial+intelligence#procmonmcp)
+<table>
+  <tr>
+    <td width="120" align="center">
+      <a href="https://docs.remnux.org/discover-the-tools/use+artificial+intelligence#procmonmcp">
+        <img src="https://avatars.githubusercontent.com/u/8752987?s=200&v=4" alt="REMnux logo" width="96">
+      </a>
+    </td>
+    <td>
+      <strong>Included in <a href="https://docs.remnux.org/discover-the-tools/use+artificial+intelligence#procmonmcp">REMnux</a></strong><br>
+      Ships in the REMnux&reg; malware-analysis distro, pre-configured for OpenCode as the <code>procmon</code> MCP server.
+    </td>
+  </tr>
+</table>
 
 ## Overview
 
